@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "feedback-gate": {
+      "command": "/Users/YOUR_USERNAME/cursor-extensions/feedback-gate/venv/bin/python",
+      "args": ["/Users/YOUR_USERNAME/cursor-extensions/feedback-gate/feedback_gate_mcp.py"],
+      "env": {
+        "PYTHONPATH": "/Users/YOUR_USERNAME/cursor-extensions/feedback-gate",
+        "PYTHONUNBUFFERED": "1",
+        "REVIEW_GATE_MODE": "cursor_integration"
+      }
+    }
+  }
+}
