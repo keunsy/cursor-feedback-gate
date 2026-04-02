@@ -282,10 +282,13 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
-# Review Gate V2 Specific Files
+# VSIX build artifacts
+*.vsix
+
+# Feedback Gate Specific Files
 
 # Temporary communication files
-/tmp/review_gate_*
+/tmp/feedback_gate_*
 /tmp/mcp_response*
 
 # Log files

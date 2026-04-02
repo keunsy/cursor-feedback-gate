@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Feedback Gate 2.0 - Advanced MCP Server with Cursor Integration
-Author: Lakshman Turlapati
-Provides popup chat, quick input, and file picker tools that automatically trigger Cursor extension.
+Feedback Gate - MCP Server with Cursor Integration
+Provides popup chat for AI agent feedback collection in Cursor IDE.
 
 Requirements:
-- mcp>=1.9.2 (latest stable version)
+- mcp>=1.9.2
 - Python 3.8+
 """
 
@@ -116,6 +115,26 @@ class FeedbackGateServer:
             if hasattr(handler, 'flush'):
                 handler.flush()
 
+    def _find_routing_file(self) -> Optional[Path]:
+        """Find the routing file for Feedback Gate.
+        
+        cursor-remote-control writes session-specific routing files and passes their path
+        via FEEDBACK_GATE_ROUTING_FILE env var. Only the MCP instance spawned by that
+        specific Agent CLI will have this env var, preventing cross-instance pollution.
+        
+        No legacy fallback — Cursor IDE MCP instances must not read stale routing files.
+        """
+        # Only set by cursor-remote-control for this specific Agent CLI session.
+        # No legacy fallback — prevents Cursor IDE MCP from being
+        # misidentified as remote mode when a stale routing file exists.
+        rf_env = os.environ.get("FEEDBACK_GATE_ROUTING_FILE", "")
+        if rf_env:
+            p = Path(rf_env)
+            if p.exists():
+                return p
+        
+        return None
+
     def _write_pid_file(self):
         """Write a PID-specific marker file so the extension can identify its MCP server instance.
         
@@ -205,7 +224,7 @@ class FeedbackGateServer:
             tools = [
                 Tool(
                     name="feedback_gate_chat",
-                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response for up to 30 minutes.",
+                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response for up to 72 hours. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -265,7 +284,7 @@ class FeedbackGateServer:
         context = args.get("context", "")
         mode = args.get("mode", "chat")
         urgent = args.get("urgent", False)
-        timeout = args.get("timeout", 1800)  # Default 30 minutes
+        timeout = args.get("timeout", 259200)  # Default 72 hours
         
         logger.info(f"🎯 UNIFIED Feedback Gate activated - Mode: {mode}")
         logger.info(f"📝 Title: {title}")
@@ -326,12 +345,100 @@ class FeedbackGateServer:
             response = f"ERROR: Failed to trigger unified Feedback Gate popup (Mode: {mode})"
             return [TextContent(type="text", text=response)]
 
+    # Track whether a feedback gate trigger is currently pending
+    _pending_trigger_id: str | None = None
+    _last_trigger_responded_at: float = 0
+    _heartbeat_count: int = 0
+
+    # Agent CLI has a hardcoded ~60s MCP tool timeout. In remote-control scenarios
+    # (cursor-remote-control) we must return before that deadline hits, otherwise
+    # Agent CLI receives -32001 and exits.  We use 50s as the wait ceiling so that
+    # there is comfortable margin.  For IDE usage the original 72h timeout applies.
+    _REMOTE_WAIT_SECONDS = 50
+
+    @staticmethod
+    def _build_heartbeat_message(count: int, elapsed_min: float) -> str:
+        """Build a varied heartbeat message so the Agent doesn't give up after
+        seeing the same text repeatedly.  The core instruction (re-call the tool)
+        stays identical; only the preamble rotates."""
+        preambles = [
+            "The user hasn't responded yet.",
+            f"Still waiting for the user's reply (~{elapsed_min:.0f} min elapsed).",
+            "No reply from the user so far — this is normal, they may be busy.",
+            f"Heartbeat #{count}: the feedback request is still active.",
+            "The user may take a while to respond — keep the channel open.",
+            f"~{elapsed_min:.0f} minutes have passed. The user is expected to reply eventually.",
+            "Continuing to hold for user feedback.",
+            f"Waiting cycle #{count}. The user has been notified and will reply when ready.",
+        ]
+        preamble = preambles[(count - 1) % len(preambles)]
+        return (
+            f"[WAITING] {preamble} "
+            "You MUST immediately call feedback_gate_chat again with the same message "
+            "to continue waiting. Do NOT end your response or summarize — just call "
+            "the tool again now."
+        )
+
     async def _handle_feedback_gate_chat(self, args: dict) -> list[TextContent]:
         """Handle Feedback Gate chat popup and wait for user input with 5 minute timeout"""
         message = args.get("message", "请提供你的反馈：")
         title = args.get("title", "Feedback Gate")
         context = args.get("context", "")
         urgent = args.get("urgent", False)
+        
+        is_remote = bool(self._find_routing_file())
+        
+        # If a previous trigger is still pending (no response yet), re-enter the
+        # wait loop instead of creating a new trigger.  This is critical for the
+        # remote-control flow: after we return WAITING due to the 50s ceiling the
+        # Agent will call feedback_gate_chat again and we resume waiting here.
+        if self._pending_trigger_id:
+            response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
+            if not response_file.exists():
+                if is_remote:
+                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id}")
+                    user_input = await self._wait_for_user_input(
+                        self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
+                    )
+                    if user_input:
+                        self._pending_trigger_id = None
+                        self._heartbeat_count = 0
+                        self._last_trigger_responded_at = time.time()
+                        logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
+                        return [TextContent(type="text", text=f"User Response: {user_input}")]
+                    else:
+                        self._heartbeat_count += 1
+                        elapsed_min = self._heartbeat_count * self._REMOTE_WAIT_SECONDS / 60
+                        logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                        return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                else:
+                    logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
+                    return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
+            self._last_trigger_responded_at = time.time()
+            self._pending_trigger_id = None
+        
+        # Brief cooldown: avoid rapid re-trigger right after receiving a response.
+        # Only 2 seconds — long enough to let Agent process feedback, short enough to
+        # allow a quick follow-up feedback gate in the same turn.
+        if self._last_trigger_responded_at and (time.time() - self._last_trigger_responded_at) < 2:
+            logger.info("⏭️ Feedback Gate skipped: brief cooldown after recent response")
+            return [TextContent(type="text", text="SKIP: Processing recent feedback. Will accept new feedback gate request shortly.")]
+        
+        # Model gate: only activate for specific model if FEEDBACK_GATE_MODEL is set
+        required_model = os.environ.get("FEEDBACK_GATE_MODEL", "")
+        if not required_model:
+            routing_file = self._find_routing_file()
+            if routing_file and routing_file.exists():
+                try:
+                    routing_data = json.loads(routing_file.read_text())
+                    required_model = routing_data.get("model", "")
+                except Exception:
+                    pass
+        if required_model:
+            current_model = os.environ.get("CURSOR_MODEL", "")
+            if current_model and current_model.lower() != required_model.lower():
+                logger.info(f"⏭️ Feedback Gate skipped: model={current_model}, required={required_model}")
+                return [TextContent(type="text", text=f"SKIP: Feedback Gate only enabled for model '{required_model}' (current: '{current_model}'). Continuing without user feedback.")]
         
         logger.info(f"💬 ACTIVATING Feedback Gate chat popup IMMEDIATELY for Cursor Agent")
         logger.info(f"📝 Title: {title}")
@@ -353,26 +460,49 @@ class FeedbackGateServer:
         })
         
         if success:
+            self._pending_trigger_id = trigger_id
+            self._heartbeat_count = 0
             logger.info(f"🔥 POPUP TRIGGERED IMMEDIATELY - waiting for user input (trigger_id: {trigger_id})")
             
-            # Wait for extension acknowledgement first
-            ack_received = await self._wait_for_extension_acknowledgement(trigger_id, timeout=30)
+            # Quick check: is the extension alive?
+            # The extension polls every 250ms and deletes trigger files immediately.
+            # If the trigger file still exists after 5s, no extension is running.
+            trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
+            extension_alive = False
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                if not trigger_file.exists():
+                    extension_alive = True
+                    break
+            
+            if not extension_alive:
+                logger.warning("⚠️ Trigger file not consumed — no Feedback Gate extension detected")
+                try:
+                    trigger_file.unlink(missing_ok=True)
+                    Path(get_temp_path("feedback_gate_trigger.json")).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return [TextContent(type="text", text="SKIP: Feedback Gate extension is not active (no GUI detected). Continuing without user feedback.")]
+            
+            # Wait for extension acknowledgement
+            ack_received = await self._wait_for_extension_acknowledgement(trigger_id, timeout=15)
             if ack_received:
                 logger.info("📨 Extension acknowledged popup activation")
             else:
-                logger.warning("⚠️ No extension acknowledgement received - popup may not have opened")
+                logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
-            logger.info("⏳ Waiting for user input for up to 30 minutes...")
-            user_input = await self._wait_for_user_input(trigger_id, timeout=1800)  # 30 MINUTE timeout
+            wait_timeout = self._REMOTE_WAIT_SECONDS if is_remote else 259200
+            logger.info(f"⏳ Waiting for user input (timeout={wait_timeout}s, remote={is_remote})...")
+            user_input = await self._wait_for_user_input(trigger_id, timeout=wait_timeout)
             
             if user_input:
-                # Return user input directly to MCP client
+                # Reset dedup state so the next feedback_gate_chat call goes through
+                self._pending_trigger_id = None
+                self._last_trigger_responded_at = time.time()
                 logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
                 
-                # Check for images in the last response data
                 response_content = [TextContent(type="text", text=f"User Response: {user_input}")]
                 
-                # If we have stored attachment data, include images
                 if hasattr(self, '_last_attachments') and self._last_attachments:
                     for attachment in self._last_attachments:
                         if attachment.get('mimeType', '').startswith('image/'):
@@ -389,9 +519,17 @@ class FeedbackGateServer:
                 
                 return response_content
             else:
-                response = f"TIMEOUT: No user input received for feedback gate within 30 minutes"
-                logger.warning("⚠️ Feedback Gate timed out waiting for user input after 30 minutes")
-                return [TextContent(type="text", text=response)]
+                if is_remote:
+                    self._heartbeat_count += 1
+                    elapsed_min = self._heartbeat_count * self._REMOTE_WAIT_SECONDS / 60
+                    logger.info(f"⏳ Remote wait timed out, returning WAITING (trigger {trigger_id} stays pending, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                    return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                else:
+                    self._pending_trigger_id = None
+                    self._last_trigger_responded_at = 0
+                    response = f"TIMEOUT: No user input received for feedback gate within 72 hours"
+                    logger.warning("⚠️ Feedback Gate timed out waiting for user input after 72 hours")
+                    return [TextContent(type="text", text=response)]
         else:
             response = f"ERROR: Failed to trigger Feedback Gate popup"
             logger.error("❌ Failed to trigger Feedback Gate popup")
@@ -689,82 +827,65 @@ class FeedbackGateServer:
         logger.warning(f"⏰ TIMEOUT waiting for extension acknowledgement (trigger_id: {trigger_id})")
         return False
 
-    async def _wait_for_user_input(self, trigger_id: str, timeout: int = 1800) -> Optional[str]:
-        """Wait for user input from the Cursor extension popup with frequent checks and multiple response patterns"""
-        response_patterns = [
-            Path(get_temp_path(f"feedback_gate_response_{trigger_id}.json")),
-            Path(get_temp_path("feedback_gate_response.json")),  # Fallback generic response
-            Path(get_temp_path(f"mcp_response_{trigger_id}.json")),  # Alternative pattern
-            Path(get_temp_path("mcp_response.json"))  # Generic MCP response
-        ]
+    async def _wait_for_user_input(self, trigger_id: str, timeout: int = 259200) -> Optional[str]:
+        """Wait for user input — only check the trigger-ID-specific response file.
         
-        logger.info(f"👁️ Monitoring for response files: {[str(p) for p in response_patterns]}")
+        Previously we also polled generic fallback files (feedback_gate_response.json,
+        mcp_response.json) which caused cross-session pollution and infinite mismatch loops.
+        Now we only watch the exact file that matches our trigger_id.
+        """
+        primary_response = Path(get_temp_path(f"feedback_gate_response_{trigger_id}.json"))
+        
+        logger.info(f"👁️ Monitoring response file: {primary_response}")
         logger.info(f"🔍 Trigger ID: {trigger_id}")
         
         start_time = time.time()
-        check_interval = 0.1  # Check every 100ms for faster response
+        check_interval = 0.25
         
         while time.time() - start_time < timeout:
             try:
-                # Check all possible response file patterns
-                for response_file in response_patterns:
-                    if response_file.exists():
-                        try:
-                            file_content = response_file.read_text().strip()
-                            logger.info(f"📄 Found response file {response_file}: {file_content[:200]}...")
+                if primary_response.exists():
+                    try:
+                        file_content = primary_response.read_text().strip()
+                        logger.info(f"📄 Found response file: {file_content[:200]}...")
+                        
+                        user_input = ""
+                        attachments = []
+                        
+                        if file_content.startswith('{'):
+                            data = json.loads(file_content)
+                            user_input = data.get("user_input", data.get("response", data.get("message", ""))).strip()
+                            attachments = data.get("attachments", [])
                             
-                            # Handle JSON format
-                            if file_content.startswith('{'):
-                                data = json.loads(file_content)
-                                user_input = data.get("user_input", data.get("response", data.get("message", ""))).strip()
-                                attachments = data.get("attachments", [])
-                                
-                                # Also check if trigger_id matches (if specified)
-                                response_trigger_id = data.get("trigger_id", "")
-                                if response_trigger_id and response_trigger_id != trigger_id:
-                                    logger.info(f"⚠️ Trigger ID mismatch: expected {trigger_id}, got {response_trigger_id}")
-                                    continue
-                                
-                                # Process attachments if present
-                                if attachments:
-                                    logger.info(f"📎 Found {len(attachments)} attachments")
-                                    # Store attachments for use in response
-                                    self._last_attachments = attachments
-                                    attachment_descriptions = []
-                                    for att in attachments:
-                                        if att.get('mimeType', '').startswith('image/'):
-                                            attachment_descriptions.append(f"Image: {att.get('fileName', 'unknown')}")
-                                    
-                                    if attachment_descriptions:
-                                        user_input += f"\n\nAttached: {', '.join(attachment_descriptions)}"
-                                else:
-                                    self._last_attachments = []
-                                    
-                            # Handle plain text format
+                            if attachments:
+                                logger.info(f"📎 Found {len(attachments)} attachments")
+                                self._last_attachments = attachments
+                                descs = [f"Image: {a.get('fileName', 'unknown')}" for a in attachments if a.get('mimeType', '').startswith('image/')]
+                                if descs:
+                                    user_input += f"\n\nAttached: {', '.join(descs)}"
                             else:
-                                user_input = file_content
-                                attachments = []
                                 self._last_attachments = []
+                        else:
+                            user_input = file_content
+                            self._last_attachments = []
+                        
+                        try:
+                            primary_response.unlink()
+                            logger.info(f"🧹 Response file cleaned up")
+                        except Exception as cleanup_error:
+                            logger.warning(f"⚠️ Cleanup error: {cleanup_error}")
+                        
+                        if user_input:
+                            logger.info(f"🎉 RECEIVED USER INPUT for trigger {trigger_id}: {user_input[:100]}...")
+                            return user_input
+                        else:
+                            logger.warning(f"⚠️ Empty user input in response file")
                             
-                            # Clean up response file immediately
-                            try:
-                                response_file.unlink()
-                                logger.info(f"🧹 Response file cleaned up: {response_file}")
-                            except Exception as cleanup_error:
-                                logger.warning(f"⚠️ Cleanup error: {cleanup_error}")
-                            
-                            if user_input:
-                                logger.info(f"🎉 RECEIVED USER INPUT for trigger {trigger_id}: {user_input[:100]}...")
-                                return user_input
-                            else:
-                                logger.warning(f"⚠️ Empty user input in file: {response_file}")
-                                
-                        except json.JSONDecodeError as e:
-                            logger.error(f"❌ JSON decode error in {response_file}: {e}")
-                        except Exception as e:
-                            logger.error(f"❌ Error processing response file {response_file}: {e}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ JSON decode error: {e}")
+                    except Exception as e:
+                        logger.error(f"❌ Error processing response file: {e}")
                 
-                # Check more frequently for faster response
                 await asyncio.sleep(check_interval)
                 
             except Exception as e:
@@ -782,6 +903,32 @@ class FeedbackGateServer:
             # Also write legacy trigger for backward compatibility
             legacy_trigger_file = Path(get_temp_path("feedback_gate_trigger.json"))
             
+            # Build routing info: try env vars first, then fall back to routing file.
+            # cursor-remote-control writes a session-specific routing file
+            # (feedback_gate_routing_{session}.json) so that IDE MCP instances don't
+            # accidentally pick up remote-control routing via the generic filename.
+            routing = {}
+            fg_chat_id = os.environ.get("FEEDBACK_GATE_CHAT_ID", "")
+            fg_platform = os.environ.get("FEEDBACK_GATE_PLATFORM", "")
+            fg_session = os.environ.get("FEEDBACK_GATE_SESSION", "")
+            if not fg_chat_id:
+                routing_file = self._find_routing_file()
+                if routing_file and routing_file.exists():
+                    try:
+                        routing_data = json.loads(routing_file.read_text())
+                        fg_chat_id = routing_data.get("chat_id", "")
+                        fg_platform = routing_data.get("platform", "") or fg_platform
+                        fg_session = routing_data.get("session", "") or fg_session
+                        logger.info(f"📋 Routing loaded from {routing_file.name}: chat_id={fg_chat_id[:10]}... platform={fg_platform} session={fg_session[:8] if fg_session else 'none'}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to read routing file: {e}")
+            if fg_chat_id:
+                routing["chat_id"] = fg_chat_id
+            if fg_platform:
+                routing["platform"] = fg_platform
+            if fg_session:
+                routing["session"] = fg_session
+            
             trigger_data = {
                 "timestamp": datetime.now().isoformat(),
                 "system": "feedback-gate-v2",
@@ -791,8 +938,10 @@ class FeedbackGateServer:
                 "ppid": os.getppid(),
                 "active_window": True,
                 "mcp_integration": True,
-                "immediate_activation": True
+                "immediate_activation": True,
             }
+            if routing:
+                trigger_data["routing"] = routing
             
             logger.info(f"🎯 CREATING PID-namespaced trigger file (PID: {self._server_pid})")
             
@@ -828,9 +977,6 @@ class FeedbackGateServer:
             logger.info(f"🔥 IMMEDIATE trigger created for Cursor: {trigger_file}")
             logger.info(f"📁 Trigger file path: {trigger_file.absolute()}")
             logger.info(f"📊 Trigger file size: {file_size} bytes")
-            
-            # Create multiple backup trigger files for reliability
-            await self._create_backup_triggers(data)
             
             await asyncio.sleep(0.05)
             
@@ -968,14 +1114,8 @@ class FeedbackGateServer:
         try:
             temp_files = [
                 get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"),
-                get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}_0.json"),
-                get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}_1.json"),
-                get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}_2.json"),
                 get_temp_path(f"feedback_gate_mcp_{self._server_pid}.pid"),
                 get_temp_path("feedback_gate_trigger.json"),
-                get_temp_path("feedback_gate_trigger_0.json"),
-                get_temp_path("feedback_gate_trigger_1.json"), 
-                get_temp_path("feedback_gate_trigger_2.json")
             ]
             for temp_file in temp_files:
                 if Path(temp_file).exists():

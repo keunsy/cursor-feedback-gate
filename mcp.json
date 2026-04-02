@@ -6,7 +6,7 @@
       "env": {
         "PYTHONPATH": "/Users/YOUR_USERNAME/cursor-extensions/feedback-gate",
         "PYTHONUNBUFFERED": "1",
-        "REVIEW_GATE_MODE": "cursor_integration"
+        "FEEDBACK_GATE_MODE": "cursor_integration"
       }
     }
   }

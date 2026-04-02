@@ -2,9 +2,9 @@
   "name": "cursor-feedback-gate",
   "displayName": "Feedback Gate",
   "description": "Feedback Gate - Agent 反馈关卡，MCP 集成 for Cursor IDE",
-  "version": "3.0.0",
-  "author": "chenrong",
-  "publisher": "chenrong",
+  "version": "1.0.0",
+  "author": "keunsy",
+  "publisher": "keunsy",
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.74.0"
@@ -38,15 +38,7 @@
         "category": "Feedback Gate"
       }
     ],
-    "keybindings": [
-      {
-        "command": "feedbackGate.openChat",
-        "key": "cmd+shift+r",
-        "mac": "cmd+shift+r",
-        "win": "ctrl+shift+r",
-        "linux": "ctrl+shift+r"
-      }
-    ],
+    "keybindings": [],
     "viewsContainers": {
       "panel": [
         {

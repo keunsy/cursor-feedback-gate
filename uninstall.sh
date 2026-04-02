@@ -1,121 +1,82 @@
 #!/bin/bash
 
-# Feedback Gate - Uninstaller Script
-# Author: Lakshman Turlapati
+# Feedback Gate - Uninstaller
 
 set -e
 
-# Enhanced colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 WHITE='\033[1;37m'
-CYAN='\033[0;36m'
-GRAY='\033[0;37m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Enhanced logging functions
-log_error() { echo -e "${RED}ERROR: $1${NC}"; }
-log_success() { echo -e "${GREEN}SUCCESS: $1${NC}"; }
-log_info() { echo -e "${YELLOW}INFO: $1${NC}"; }
-log_progress() { echo -e "${CYAN}PROGRESS: $1${NC}"; }
-log_warning() { echo -e "${YELLOW}WARNING: $1${NC}"; }
-log_step() { echo -e "${WHITE}$1${NC}"; }
-log_header() { echo -e "${BLUE}$1${NC}"; }
+log_error()    { echo -e "${RED}ERROR: $1${NC}"; }
+log_success()  { echo -e "${GREEN}SUCCESS: $1${NC}"; }
+log_info()     { echo -e "${YELLOW}INFO: $1${NC}"; }
+log_progress() { echo -e "${BLUE}PROGRESS: $1${NC}"; }
+log_step()     { echo -e "${WHITE}$1${NC}"; }
 
-log_header "Feedback Gate - Uninstaller"
-log_header "============================="
+echo -e "${BLUE}Feedback Gate - Uninstaller${NC}"
+echo -e "${BLUE}=============================${NC}"
 echo ""
 
-read -p "$(echo -e ${YELLOW}WARNING: Are you sure you want to uninstall Feedback Gate? [y/N]: ${NC})" -n 1 -r
+read -p "$(echo -e ${YELLOW}Uninstall Feedback Gate? [y/N]: ${NC})" -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    log_info "Uninstallation cancelled"
+    log_info "Cancelled"
     exit 0
 fi
 
-log_progress "Removing Feedback Gate..."
+INSTALL_DIR="$HOME/cursor-extensions/feedback-gate"
+MCP_FILE="$HOME/.cursor/mcp.json"
 
-# Remove installation directory
-FEEDBACK_GATE_DIR="$HOME/cursor-extensions/feedback-gate"
-if [[ -d "$FEEDBACK_GATE_DIR" ]]; then
-    rm -rf "$FEEDBACK_GATE_DIR"
-    log_success "Removed installation directory"
+# --- Remove installation directory ---
+if [[ -d "$INSTALL_DIR" ]]; then
+    rm -rf "$INSTALL_DIR"
+    log_success "Removed: $INSTALL_DIR"
+else
+    log_info "Installation directory not found, skipping"
 fi
 
-# Remove MCP configuration
-CURSOR_MCP_FILE="$HOME/.cursor/mcp.json"
-if [[ -f "$CURSOR_MCP_FILE" ]]; then
-    # Create backup
-    cp "$CURSOR_MCP_FILE" "$CURSOR_MCP_FILE.backup"
-    
-    # Remove feedback-gate entry (simple approach - remove entire config)
-    echo '{"mcpServers":{}}' > "$CURSOR_MCP_FILE"
-    log_success "Removed MCP configuration (backup created)"
+# --- Remove feedback-gate from MCP config (preserve other servers) ---
+if [[ -f "$MCP_FILE" ]]; then
+    cp "$MCP_FILE" "$MCP_FILE.backup.$(date +%Y%m%d_%H%M%S)"
+    python3 -c "
+import json, os
+config_file = '$MCP_FILE'
+try:
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    config.get('mcpServers', {}).pop('feedback-gate', None)
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+except:
+    pass
+" 2>/dev/null
+    log_success "Removed feedback-gate from MCP config (backup created)"
 fi
 
-# Remove global rule - Cross-platform directory detection
-if [[ "$(uname)" == "Darwin" ]]; then
-    CURSOR_RULES_DIR="$HOME/Library/Application Support/Cursor/User/rules"
-elif [[ "$(uname)" == "Linux" ]]; then
-    CURSOR_RULES_DIR="$HOME/.config/Cursor/User/rules"
-fi
-
-if [[ -n "$CURSOR_RULES_DIR" ]] && [[ -f "$CURSOR_RULES_DIR/FeedbackGate.mdc" ]]; then
-    rm "$CURSOR_RULES_DIR/FeedbackGate.mdc"
-    log_success "Removed global rule"
-fi
-
-# Clean up temp files from both old (/tmp) and new (system temp) locations
+# --- Clean up temp files ---
 rm -f /tmp/feedback_gate_* /tmp/mcp_response* 2>/dev/null || true
 TEMP_DIR=$(python3 -c 'import tempfile; print(tempfile.gettempdir())' 2>/dev/null || echo "/tmp")
 rm -f "$TEMP_DIR"/feedback_gate_* "$TEMP_DIR"/mcp_response* 2>/dev/null || true
 log_success "Cleaned up temporary files"
 
-# Try automated extension removal
-EXTENSION_REMOVED=false
-if command -v cursor &> /dev/null; then
-    log_progress "Attempting automated extension removal..."
-    if cursor --uninstall-extension feedback-gate >/dev/null 2>&1; then
-        log_success "Extension removed automatically via command line"
-        EXTENSION_REMOVED=true
+# --- Remove Cursor extension ---
+CURSOR_BIN="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+if [[ -x "$CURSOR_BIN" ]]; then
+    if "$CURSOR_BIN" --uninstall-extension keunsy.cursor-feedback-gate >/dev/null 2>&1; then
+        log_success "Extension removed automatically"
     else
-        log_warning "Automated removal failed, manual steps required"
+        echo ""
+        log_step "  Manual step: Open Cursor → Extensions → find 'Feedback Gate' → Uninstall"
     fi
-fi
-
-echo ""
-if [[ "$EXTENSION_REMOVED" == false ]]; then
-    log_header "Manual Steps Required:"
-    log_step "1. Open Cursor IDE"
-    log_step "2. Go to Extensions (Cmd+Shift+X or Ctrl+Shift+X)"
-    log_step "3. Find 'Feedback Gate' and uninstall it"
-    log_step "4. Restart Cursor"
+else
     echo ""
+    log_step "  Manual step: Open Cursor → Extensions → find 'Feedback Gate' → Uninstall"
 fi
 
-log_success "Feedback Gate uninstallation complete!"
-log_header "========================================="
 echo ""
-log_header "What was removed:"
-log_step "   - Installation directory: $FEEDBACK_GATE_DIR"
-log_step "   - MCP server configuration entry"
-log_step "   - Global rule file: $CURSOR_RULES_DIR/FeedbackGate.mdc"
-log_step "   - Temporary files from system directories"
-if [[ "$EXTENSION_REMOVED" == true ]]; then
-    log_step "   - Cursor extension (removed automatically)"
-else
-    log_step "   - Cursor extension (manual removal required)"
-fi
+log_success "Feedback Gate uninstalled!"
 echo ""
-log_header "What remains (if any):"
-log_step "   - SoX installation (keep if needed for other apps)"
-log_step "   - Python virtual environment dependencies"
-log_step "   - Configuration backups (preserved for safety)"
-echo ""
-if [[ "$EXTENSION_REMOVED" == false ]]; then
-    log_info "Extension must be removed manually from Cursor"
-else
-    log_success "All components removed successfully!"
-fi

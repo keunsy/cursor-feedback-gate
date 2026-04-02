@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Feedback Gate - 问题队列方案</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0e1117;
+  --surface: #161b22;
+  --surface2: #1c2333;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #1db99c;
+  --accent-dim: rgba(29, 185, 156, 0.15);
+  --orange: #f0883e;
+  --orange-dim: rgba(240, 136, 62, 0.15);
+  --blue: #58a6ff;
+  --blue-dim: rgba(88, 166, 255, 0.15);
+  --red: #f85149;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Noto Sans SC', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 40px 60px;
+  line-height: 1.7;
+}
+
+h1 {
+  font-size: 32px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--blue));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: 16px;
+  margin-bottom: 48px;
+}
+
+h2 {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 48px 0 24px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+h2 .num {
+  display: inline-block;
+  width: 28px;
+  height: 28px;
+  line-height: 28px;
+  text-align: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  margin-right: 10px;
+  vertical-align: middle;
+}
+
+/* Flow diagram */
+.flow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 32px 0;
+  overflow-x: auto;
+}
+
+.flow-step {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 20px;
+  min-width: 160px;
+  text-align: center;
+  position: relative;
+  transition: all 0.3s ease;
+}
+
+.flow-step:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(29, 185, 156, 0.1);
+}
+
+.flow-step .icon { font-size: 24px; margin-bottom: 6px; }
+.flow-step .label { font-size: 13px; font-weight: 600; }
+.flow-step .desc { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+.flow-arrow {
+  color: var(--text-dim);
+  font-size: 20px;
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+.flow-step.active { border-color: var(--accent); background: var(--accent-dim); }
+.flow-step.queue { border-color: var(--orange); background: var(--orange-dim); }
+
+/* Mockup panel */
+.mockup-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  margin: 24px 0;
+}
+
+.mockup {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.mockup-title {
+  background: var(--surface2);
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mockup-title .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.mockup-title .dot.green { background: var(--accent); }
+.mockup-title .dot.orange { background: var(--orange); }
+
+.mockup-body {
+  padding: 16px;
+  min-height: 200px;
+}
+
+/* Chat messages */
+.msg {
+  margin: 8px 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  max-width: 85%;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.msg.system {
+  background: var(--surface2);
+  color: var(--text-dim);
+  text-align: center;
+  max-width: 100%;
+  font-size: 12px;
+}
+
+.msg.agent {
+  background: var(--accent-dim);
+  border: 1px solid rgba(29, 185, 156, 0.2);
+}
+
+.msg.user {
+  background: var(--blue-dim);
+  border: 1px solid rgba(88, 166, 255, 0.2);
+  margin-left: auto;
+}
+
+/* Queue list */
+.queue-list {
+  margin: 8px 0;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border-radius: 8px;
+  margin: 4px 0;
+  font-size: 13px;
+  transition: all 0.2s;
+}
+
+.queue-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.queue-num {
+  width: 22px;
+  height: 22px;
+  line-height: 22px;
+  text-align: center;
+  border-radius: 50%;
+  background: var(--orange-dim);
+  color: var(--orange);
+  font-size: 11px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.queue-item.done .queue-num {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.queue-item.done { opacity: 0.5; text-decoration: line-through; }
+
+.queue-text { flex: 1; }
+
+.queue-action {
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+/* Input area */
+.input-area {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface2);
+}
+
+.input-field {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-queue {
+  background: var(--orange-dim);
+  color: var(--orange);
+  border: 1px solid rgba(240, 136, 62, 0.3);
+}
+
+.btn-queue.active {
+  background: var(--orange);
+  color: #fff;
+}
+
+/* Toggle */
+.mode-toggle {
+  display: flex;
+  gap: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+.mode-toggle button {
+  flex: 1;
+  padding: 8px 16px;
+  background: var(--surface2);
+  border: none;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.2s;
+}
+
+.mode-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mode-toggle button:last-child.active {
+  background: var(--orange);
+}
+
+/* Sequence diagram */
+.sequence {
+  margin: 24px 0;
+  padding: 24px;
+  background: var(--surface);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.seq-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+.seq-actor {
+  width: 80px;
+  text-align: center;
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.seq-arrow {
+  flex: 1;
+  height: 2px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.seq-arrow::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+
+.seq-arrow.right::before { background: linear-gradient(90deg, var(--accent), var(--blue)); }
+.seq-arrow.left::before { background: linear-gradient(90deg, var(--blue), var(--accent)); }
+.seq-arrow.right::after {
+  content: '→';
+  position: absolute;
+  right: -4px;
+  color: var(--blue);
+  font-size: 16px;
+}
+.seq-arrow.left::after {
+  content: '←';
+  position: absolute;
+  left: -4px;
+  color: var(--accent);
+  font-size: 16px;
+}
+
+.seq-label {
+  background: var(--surface2);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  z-index: 1;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.seq-divider {
+  border-top: 1px dashed var(--border);
+  margin: 12px 0;
+  text-align: center;
+  position: relative;
+}
+
+.seq-divider span {
+  background: var(--surface);
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  position: relative;
+  top: -8px;
+}
+
+/* Tech spec */
+.spec-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 4px 16px;
+  margin: 16px 0;
+  font-size: 13px;
+}
+
+.spec-key {
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+.spec-val { color: var(--text); }
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--surface2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.note {
+  background: var(--surface2);
+  border-left: 3px solid var(--accent);
+  padding: 12px 16px;
+  margin: 16px 0;
+  border-radius: 0 8px 8px 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+</style>
+</head>
+<body>
+
+<h1>Feedback Gate — 问题队列方案</h1>
+<p class="subtitle">让用户预先批量输入指令，Agent 自动按顺序消费</p>
+
+<!-- Section 1: Flow -->
+<h2><span class="num">1</span>整体流程</h2>
+
+<div class="flow">
+  <div class="flow-step">
+    <div class="icon">👤</div>
+    <div class="label">切换队列模式</div>
+    <div class="desc">点击面板按钮</div>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step queue">
+    <div class="icon">📝</div>
+    <div class="label">逐条输入指令</div>
+    <div class="desc">每次发送 = 入队一条</div>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step queue">
+    <div class="icon">📋</div>
+    <div class="label">队列蓄水</div>
+    <div class="desc">显示待处理列表</div>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step active">
+    <div class="icon">🤖</div>
+    <div class="label">Agent 调用 MCP</div>
+    <div class="desc">自动取队首指令</div>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step active">
+    <div class="icon">⚡</div>
+    <div class="label">处理 & 再次调用</div>
+    <div class="desc">取下一条，不弹窗</div>
+  </div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">
+    <div class="icon">📭</div>
+    <div class="label">队列清空</div>
+    <div class="desc">切回正常模式弹窗</div>
+  </div>
+</div>
+
+<!-- Section 2: UI Mockup -->
+<h2><span class="num">2</span>界面交互</h2>
+
+<div class="mockup-container">
+  <!-- Normal mode -->
+  <div class="mockup">
+    <div class="mockup-title">
+      <div class="dot green"></div>
+      正常模式 — 等待反馈
+    </div>
+    <div class="mockup-body">
+      <div class="msg agent">已完成代码重构。请检查 src/utils.ts 的变更。</div>
+      <div class="msg system">等待你的反馈...</div>
+      
+      <div class="mode-toggle">
+        <button class="active">💬 正常</button>
+        <button>📋 队列</button>
+      </div>
+    </div>
+    <div class="input-area">
+      <input class="input-field" placeholder="输入反馈..." value="看起来不错，继续优化性能">
+      <button class="btn btn-primary">发送</button>
+    </div>
+  </div>
+
+  <!-- Queue mode -->
+  <div class="mockup">
+    <div class="mockup-title">
+      <div class="dot orange"></div>
+      队列模式 — 批量指令
+    </div>
+    <div class="mockup-body">
+      <div class="msg system">📋 队列模式已开启 — 输入的指令将排队等待处理</div>
+      
+      <div class="queue-list">
+        <div class="queue-item done">
+          <span class="queue-num">✓</span>
+          <span class="queue-text">把 UserService 的缓存改为 Redis</span>
+          <span class="queue-action">已完成</span>
+        </div>
+        <div class="queue-item" style="border-left: 2px solid var(--orange);">
+          <span class="queue-num">2</span>
+          <span class="queue-text">添加 API 限流中间件</span>
+          <span class="queue-action" style="color: var(--orange);">处理中...</span>
+        </div>
+        <div class="queue-item">
+          <span class="queue-num">3</span>
+          <span class="queue-text">写单元测试覆盖 auth 模块</span>
+          <span class="queue-action">✕</span>
+        </div>
+        <div class="queue-item">
+          <span class="queue-num">4</span>
+          <span class="queue-text">优化数据库查询 N+1 问题</span>
+          <span class="queue-action">✕</span>
+        </div>
+      </div>
+      
+      <div class="mode-toggle">
+        <button>💬 正常</button>
+        <button class="active">📋 队列 (3)</button>
+      </div>
+    </div>
+    <div class="input-area">
+      <input class="input-field" placeholder="输入新指令加入队列...">
+      <button class="btn btn-queue active">+ 入队</button>
+    </div>
+  </div>
+</div>
+
+<!-- Section 3: Sequence -->
+<h2><span class="num">3</span>时序交互</h2>
+
+<div class="sequence">
+  <div class="seq-row">
+    <div class="seq-actor" style="color: var(--blue)">👤 用户</div>
+    <div style="flex:1"></div>
+    <div class="seq-actor" style="color: var(--orange)">📋 Extension</div>
+    <div style="flex:1"></div>
+    <div class="seq-actor" style="color: var(--accent)">🤖 MCP Server</div>
+    <div style="flex:1"></div>
+    <div class="seq-actor" style="color: var(--text-dim)">⚡ Agent</div>
+  </div>
+  
+  <div class="seq-divider"><span>用户预先填充队列</span></div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">切换队列模式</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">发送 "任务A"</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">发送 "任务B"</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-divider"><span>Agent 开始消费队列</span></div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow left"><span class="seq-label">feedback_gate_chat()</span></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow left"><span class="seq-label">写 trigger</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">队列非空→写 "任务A"</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">返回 "任务A"</span></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-divider"><span>Agent 处理完任务A，再次调用</span></div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow left"><span class="seq-label">feedback_gate_chat()</span></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">队列非空→写 "任务B"</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+
+  <div class="seq-divider"><span>队列清空后</span></div>
+
+  <div class="seq-row">
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+    <div class="seq-arrow right"><span class="seq-label">队列空→弹窗等待用户</span></div>
+    <div class="seq-actor"></div>
+    <div style="flex:1"></div>
+    <div class="seq-actor"></div>
+  </div>
+</div>
+
+<!-- Section 4: Tech Design -->
+<h2><span class="num">4</span>技术设计</h2>
+
+<h3 style="font-size: 16px; margin: 20px 0 12px; color: var(--orange);">存储</h3>
+<div class="spec-grid">
+  <div class="spec-key">队列文件</div>
+  <div class="spec-val"><code>/tmp/feedback_gate_queue_{pid}.json</code></div>
+  <div class="spec-key">格式</div>
+  <div class="spec-val"><code>{ "items": [{ "id": 1, "text": "...", "status": "pending" }] }</code></div>
+  <div class="spec-key">管理者</div>
+  <div class="spec-val">Extension 负责写入（用户入队）和读取消费（Agent trigger 时）</div>
+</div>
+
+<h3 style="font-size: 16px; margin: 20px 0 12px; color: var(--accent);">Extension 改动</h3>
+<div class="spec-grid">
+  <div class="spec-key">UI</div>
+  <div class="spec-val">底部面板加 正常/队列 模式切换按钮</div>
+  <div class="spec-key">队列模式 UI</div>
+  <div class="spec-val">显示队列列表（序号、内容、状态）+ 删除按钮</div>
+  <div class="spec-key">输入行为</div>
+  <div class="spec-val">队列模式下发送 = 追加到队列文件（不写 response）</div>
+  <div class="spec-key">trigger 处理</div>
+  <div class="spec-val">收到 trigger 时：队列非空 → 取队首写 response；空 → 弹窗</div>
+</div>
+
+<h3 style="font-size: 16px; margin: 20px 0 12px; color: var(--blue);">MCP Server 改动</h3>
+<div class="spec-grid">
+  <div class="spec-key">改动量</div>
+  <div class="spec-val">无需改动。队列逻辑完全在 Extension 端处理。MCP Server 只管 trigger → 等 response。</div>
+</div>
+
+<div class="note">
+  <strong>关键设计决策：</strong>队列管理完全在 Extension 端。Extension 收到 trigger 后检查队列文件，有内容就立即写 response 文件（不弹窗），没有才弹窗。MCP Server 无感知，无需修改。
+</div>
+
+<h3 style="font-size: 16px; margin: 20px 0 12px; color: var(--text-dim);">边界情况</h3>
+<div class="spec-grid">
+  <div class="spec-key">随时追加</div>
+  <div class="spec-val">Agent 处理过程中可继续往队列添加新指令</div>
+  <div class="spec-key">删除/重排</div>
+  <div class="spec-val">队列项支持删除（✕ 按钮），暂不支持拖拽重排</div>
+  <div class="spec-key">模式切换</div>
+  <div class="spec-val">从队列模式切回正常模式：队列内容保留，但下次 trigger 会弹窗</div>
+  <div class="spec-key">Cursor 重启</div>
+  <div class="spec-val">队列持久化在 /tmp 文件，重启后如果文件还在则恢复</div>
+</div>
+
+</body>
+</html>
