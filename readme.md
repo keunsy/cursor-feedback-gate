@@ -97,7 +97,7 @@ cursor-feedback-gate/
 
 ```bash
 # MCP 服务器日志
-tail -f /tmp/feedback_gate_v2.log
+tail -f /tmp/feedback_gate.log
 
 # 检查 MCP 配置
 cat ~/.cursor/mcp.json

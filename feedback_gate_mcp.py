@@ -53,20 +53,22 @@ def get_temp_path(filename: str) -> str:
     return os.path.join(temp_dir, filename)
 
 # Configure logging with immediate flush
-log_file_path = get_temp_path('feedback_gate_v2.log')
+log_file_path = get_temp_path('feedback_gate.log')
 
-# Create handlers separately to handle Windows file issues
+from logging.handlers import RotatingFileHandler
+
 handlers = []
 try:
-    # File handler - may fail on Windows if file is locked
-    file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+    file_handler = RotatingFileHandler(
+        log_file_path, mode='a', encoding='utf-8',
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=3,               # keep 3 rotated files
+    )
     file_handler.setLevel(logging.INFO)
     handlers.append(file_handler)
 except Exception as e:
-    # If file logging fails, just use stderr
     print(f"Warning: Could not create log file: {e}", file=sys.stderr)
 
-# Always add stderr handler
 stderr_handler = logging.StreamHandler(sys.stderr)
 stderr_handler.setLevel(logging.INFO)
 handlers.append(stderr_handler)
@@ -174,6 +176,8 @@ class FeedbackGateServer:
                 "feedback_gate_response.json",
                 "feedback_gate_ack_*.json",
                 "feedback_gate_queue_*.json",
+                "mcp_response_fg_*.json",
+                "mcp_response_*.json",
             ]:
                 for filepath in glob.glob(os.path.join(temp_dir, pattern)):
                     try:
@@ -593,14 +597,14 @@ class FeedbackGateServer:
                         return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
                 else:
                     logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
-                    return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
+                    return [TextContent(type="text", text="SKIP: A Feedback Gate popup is already open. You MUST call feedback_gate_chat again in 5 seconds to check for user response. Do NOT end your turn without calling feedback_gate_chat.")]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
         # allow a quick follow-up feedback gate in the same turn.
         if self._last_trigger_responded_at and (time.time() - self._last_trigger_responded_at) < 2:
             logger.info("⏭️ Feedback Gate skipped: brief cooldown after recent response")
-            return [TextContent(type="text", text="SKIP: Processing recent feedback. Will accept new feedback gate request shortly.")]
+            return [TextContent(type="text", text="SKIP: Processing recent feedback. You MUST call feedback_gate_chat again in 2 seconds. Do NOT end your turn.")]
         
         # Model gate: only activate for specific model if FEEDBACK_GATE_MODEL is set
         required_model = os.environ.get("FEEDBACK_GATE_MODEL", "")
@@ -711,12 +715,9 @@ class FeedbackGateServer:
         
         logger.info(f"🔍 CHECKING for user input (timeout: {timeout}s)")
         
-        # Check all possible response file patterns
         response_patterns = [
             os.path.join(tempfile.gettempdir(), "feedback_gate_response_*.json"),
             get_temp_path("feedback_gate_response.json"),
-            os.path.join(tempfile.gettempdir(), "mcp_response_*.json"),
-            get_temp_path("mcp_response.json")
         ]
         
         import glob
@@ -743,12 +744,17 @@ class FeedbackGateServer:
                                     user_input = file_content
                                 
                                 if user_input:
-                                    # Clean up response file
-                                    try:
-                                        response_file.unlink()
-                                        logger.info(f"🧹 Response file cleaned up: {response_file}")
-                                    except Exception as cleanup_error:
-                                        logger.warning(f"⚠️ Cleanup error: {cleanup_error}")
+                                    # Clean up all response file patterns written by the extension
+                                    cleanup_patterns = [
+                                        response_file,
+                                        Path(get_temp_path("feedback_gate_response.json")),
+                                    ]
+                                    for cf in cleanup_patterns:
+                                        try:
+                                            cf.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+                                    logger.info(f"🧹 Response files cleaned up for trigger {trigger_id}")
                                     
                                     logger.info(f"✅ RETRIEVED USER INPUT: {user_input[:100]}...")
                                     
@@ -1128,7 +1134,7 @@ class FeedbackGateServer:
                 logger.info(f"🎯 This is expected behavior - extension is working properly")
             
             # Check if extension might be watching
-            log_file = Path(get_temp_path("feedback_gate_v2.log"))
+            log_file = Path(get_temp_path("feedback_gate.log"))
             if log_file.exists():
                 logger.info(f"📝 MCP log file exists: {log_file}")
             else:

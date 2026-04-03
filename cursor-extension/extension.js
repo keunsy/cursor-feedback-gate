@@ -314,12 +314,9 @@ function logUserInput(inputText, eventType = 'MESSAGE', triggerId = null, attach
         
         // Write response file for MCP server integration if we have a trigger ID
         if (triggerId && eventType === 'MCP_RESPONSE') {
-            // Write multiple response file patterns for better compatibility
             const responsePatterns = [
                 getTempPath(`feedback_gate_response_${triggerId}.json`),
-                getTempPath('feedback_gate_response.json'),  // Fallback generic response
-                getTempPath(`mcp_response_${triggerId}.json`),  // Alternative pattern
-                getTempPath('mcp_response.json')  // Generic MCP response
+                getTempPath('feedback_gate_response.json'),
             ];
             
             const responseData = {
@@ -375,27 +372,36 @@ function startMcpStatusMonitoring(context) {
 
 function checkMcpStatus() {
     try {
-        // Check if MCP server log exists and is recent
-        const mcpLogPath = getTempPath('feedback_gate_v2.log');
-        if (fs.existsSync(mcpLogPath)) {
-            const stats = fs.statSync(mcpLogPath);
-            const now = Date.now();
-            const fileAge = now - stats.mtime.getTime();
-            
-            // Consider MCP active if log file was modified within last 30 seconds
-            const wasActive = mcpStatus;
-            mcpStatus = fileAge < 30000;
-            
-            if (wasActive !== mcpStatus) {
-                // Silent status change - only update UI
-                updateChatPanelStatus();
-            }
-        } else {
-            if (mcpStatus) {
-                mcpStatus = false;
-                updateChatPanelStatus();
+        const now = Date.now();
+        let active = false;
+
+        for (const logName of ['feedback_gate.log', 'feedback_gate_v2.log']) {
+            const logPath = getTempPath(logName);
+            if (fs.existsSync(logPath)) {
+                const age = now - fs.statSync(logPath).mtime.getTime();
+                if (age < 30000) { active = true; break; }
             }
         }
+
+        if (!active) {
+            try {
+                const dir = path.dirname(getTempPath('x'));
+                const prefix = 'feedback_gate_mcp_';
+                fs.readdirSync(dir).filter(f => f.startsWith(prefix) && f.endsWith('.pid')).forEach(f => {
+                    try {
+                        const data = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+                        if (data.pid) {
+                            process.kill(data.pid, 0);
+                            active = true;
+                        }
+                    } catch {}
+                });
+            } catch {}
+        }
+
+        const wasActive = mcpStatus;
+        mcpStatus = active;
+        if (wasActive !== mcpStatus) updateChatPanelStatus();
     } catch (error) {
         if (mcpStatus) {
             mcpStatus = false;
@@ -474,14 +480,12 @@ function discoverMcpPid() {
 }
 
 function startFeedbackGateIntegration(context) {
-    // Discover the MCP server PID for this instance
     boundMcpPid = discoverMcpPid();
     if (boundMcpPid) {
         console.log(`Feedback Gate bound to MCP PID: ${boundMcpPid}`);
     }
     
     const pollInterval = setInterval(() => {
-        // Re-discover PID periodically in case MCP server restarted
         if (!boundMcpPid) {
             boundMcpPid = discoverMcpPid();
             if (boundMcpPid) {
@@ -492,8 +496,6 @@ function startFeedbackGateIntegration(context) {
         if (boundMcpPid) {
             checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${boundMcpPid}.json`));
         }
-        
-        // Fallback: check legacy trigger file but only consume if PID matches
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
     }, 250);
     
@@ -507,7 +509,6 @@ function startFeedbackGateIntegration(context) {
         }
     });
     
-    // Immediate check on startup
     setTimeout(() => {
         boundMcpPid = discoverMcpPid();
         if (boundMcpPid) {
@@ -634,8 +635,6 @@ function checkTriggerFile(context, filePath) {
                         const responsePatterns = [
                             getTempPath(`feedback_gate_response_${qTriggerId}.json`),
                             getTempPath('feedback_gate_response.json'),
-                            getTempPath(`mcp_response_${qTriggerId}.json`),
-                            getTempPath('mcp_response.json')
                         ];
                         responsePatterns.forEach(f => {
                             try { fs.writeFileSync(f, responseJson); } catch (e) {}
@@ -1069,8 +1068,6 @@ function processQueueForPendingTrigger(directSend) {
         [
             getTempPath(`feedback_gate_response_${triggerId}.json`),
             getTempPath('feedback_gate_response.json'),
-            getTempPath(`mcp_response_${triggerId}.json`),
-            getTempPath('mcp_response.json')
         ].forEach(f => {
             try { fs.writeFileSync(f, responseJson); } catch (e) {}
         });
