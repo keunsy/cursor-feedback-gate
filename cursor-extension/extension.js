@@ -283,6 +283,21 @@ function logMessage(message) {
     }
 }
 
+function enrichFiles(files) {
+    return (files || []).map(f => {
+        try {
+            if (f.filePath && fs.existsSync(f.filePath)) {
+                const stats = fs.statSync(f.filePath);
+                if (stats.size <= 100 * 1024) {
+                    return { ...f, content: fs.readFileSync(f.filePath, 'utf8') };
+                }
+                return { ...f, content: `[File too large: ${(stats.size / 1024).toFixed(1)} KB]` };
+            }
+        } catch (e) { /* skip unreadable files */ }
+        return f;
+    });
+}
+
 function logUserInput(inputText, eventType = 'MESSAGE', triggerId = null, attachments = [], files = []) {
     const timestamp = new Date().toISOString();
     const logMsg = `[${timestamp}] ${eventType}: ${inputText}`;
@@ -307,19 +322,6 @@ function logUserInput(inputText, eventType = 'MESSAGE', triggerId = null, attach
                 getTempPath('mcp_response.json')  // Generic MCP response
             ];
             
-            const fileContents = files.map(f => {
-                try {
-                    if (f.filePath && fs.existsSync(f.filePath)) {
-                        const stats = fs.statSync(f.filePath);
-                        if (stats.size <= 100 * 1024) {
-                            return { ...f, content: fs.readFileSync(f.filePath, 'utf8') };
-                        }
-                        return { ...f, content: `[File too large: ${(stats.size / 1024).toFixed(1)} KB]` };
-                    }
-                } catch (e) { /* skip unreadable files */ }
-                return f;
-            });
-            
             const responseData = {
                 timestamp: timestamp,
                 trigger_id: triggerId,
@@ -327,7 +329,7 @@ function logUserInput(inputText, eventType = 'MESSAGE', triggerId = null, attach
                 response: inputText,
                 message: inputText,
                 attachments: attachments,
-                files: fileContents,
+                files: enrichFiles(files),
                 event_type: eventType,
                 source: 'feedback_gate_extension'
             };
@@ -623,7 +625,7 @@ function checkTriggerFile(context, filePath) {
                             response: queueItem.text,
                             message: queueItem.text,
                             attachments: queueItem.attachments || [],
-                            files: queueItem.files || [],
+                            files: enrichFiles(queueItem.files),
                             event_type: 'MCP_RESPONSE',
                             source: 'feedback_gate_queue',
                             queue_item_id: queueItem.id
@@ -1052,7 +1054,7 @@ function processQueueForPendingTrigger(directSend) {
         response: queueItem.text,
         message: queueItem.text,
         attachments: queueItem.attachments || [],
-        files: queueItem.files || [],
+        files: enrichFiles(queueItem.files),
         event_type: 'MCP_RESPONSE',
         source: directSend ? 'feedback_gate_direct' : 'feedback_gate_queue',
         queue_item_id: queueItem.id

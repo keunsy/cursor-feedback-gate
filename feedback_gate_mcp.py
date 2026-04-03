@@ -91,6 +91,7 @@ class FeedbackGateServer:
         self.shutdown_requested = False
         self.shutdown_reason = ""
         self._last_attachments = []
+        self._last_files = []
         self._whisper_model = None
         self._server_pid = os.getpid()
         
@@ -428,6 +429,82 @@ class FeedbackGateServer:
         self._heartbeat_count = 0
         self._last_trigger_responded_at = time.time() if responded else 0
 
+    def _read_and_consume_response(self, response_file: Path) -> str | None:
+        """Read a response JSON file, populate _last_attachments/_last_files, delete the file.
+        Returns user_input string or None if parsing failed."""
+        try:
+            file_content = response_file.read_text().strip()
+            if not file_content:
+                return None
+
+            user_input = ""
+            if file_content.startswith('{'):
+                data = json.loads(file_content)
+                user_input = data.get("user_input", data.get("response", data.get("message", ""))).strip()
+                attachments = data.get("attachments", [])
+                files = data.get("files", [])
+
+                if attachments:
+                    self._last_attachments = attachments
+                    descs = [f"Image: {a.get('fileName', 'unknown')}" for a in attachments if a.get('mimeType', '').startswith('image/')]
+                    if descs:
+                        user_input += f"\n\nAttached: {', '.join(descs)}"
+                else:
+                    self._last_attachments = []
+
+                if files:
+                    self._last_files = files
+                    file_descs = [f"File: {f.get('fileName', 'unknown')} ({f.get('filePath', '')})" for f in files]
+                    if file_descs:
+                        user_input += f"\n\nAttached files:\n" + "\n".join(file_descs)
+                else:
+                    self._last_files = []
+            else:
+                user_input = file_content
+                self._last_attachments = []
+                self._last_files = []
+
+            response_file.unlink(missing_ok=True)
+            return user_input if user_input else None
+        except Exception as e:
+            logger.error(f"❌ Error reading response file {response_file}: {e}")
+            return None
+
+    def _append_media_to_response(self, response_content: list):
+        """Append attachments (images) and file references to a response, then clear state."""
+        if self._last_attachments:
+            for attachment in self._last_attachments:
+                if attachment.get('mimeType', '').startswith('image/'):
+                    try:
+                        response_content.append(ImageContent(
+                            type="image",
+                            data=attachment['base64Data'],
+                            mimeType=attachment['mimeType']
+                        ))
+                        logger.info(f"📸 Added image to response: {attachment.get('fileName', 'unknown')}")
+                    except Exception as e:
+                        logger.error(f"❌ Error adding image to response: {e}")
+            self._last_attachments = []
+
+        if self._last_files:
+            for file_ref in self._last_files:
+                name = file_ref.get('fileName', 'unknown')
+                fpath = file_ref.get('filePath', '')
+                content = file_ref.get('content', '')
+                if content and content not in ('[TOO_LARGE_FOR_QUEUE]', '') and not content.startswith('[File too large'):
+                    response_content.append(TextContent(
+                        type="text",
+                        text=f"--- File: {name} ({fpath}) ---\n{content}"
+                    ))
+                    logger.info(f"📁 Added file content to response: {name}")
+                elif fpath:
+                    response_content.append(TextContent(
+                        type="text",
+                        text=f"--- File reference: {name} ({fpath}) ---"
+                    ))
+                    logger.info(f"📁 Added file reference to response: {name}")
+            self._last_files = []
+
     # Agent CLI has a hardcoded ~60s MCP tool timeout. In remote-control scenarios
     # (cursor-remote-control) we must return before that deadline hits, otherwise
     # Agent CLI receives -32001 and exits.  We use 50s as the wait ceiling so that
@@ -478,30 +555,39 @@ class FeedbackGateServer:
                 self._clear_trigger_state(responded=False)
             else:
                 response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
-                if not response_file.exists():
-                    if is_remote:
-                        logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id}")
-                        user_input = await self._wait_for_user_input(
-                            self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
-                        )
-                        if user_input:
-                            self._clear_trigger_state(responded=True)
-                            logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
-                            return [TextContent(type="text", text=f"User Response: {user_input}")]
-                        else:
-                            self._heartbeat_count += 1
-                            elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
-                            elapsed_min = elapsed_total / 60
-                            if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
-                                self._clear_trigger_state(responded=False)
-                                logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
-                                return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
-                            logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
-                            return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                if response_file.exists():
+                    ready_input = self._read_and_consume_response(response_file)
+                    if ready_input:
+                        self._clear_trigger_state(responded=True)
+                        logger.info(f"✅ Found ready response for pending trigger: {ready_input[:100]}...")
+                        result = [TextContent(type="text", text=f"User Response: {ready_input}")]
+                        self._append_media_to_response(result)
+                        return result
+                    self._clear_trigger_state(responded=False)
+                elif is_remote:
+                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id}")
+                    user_input = await self._wait_for_user_input(
+                        self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
+                    )
+                    if user_input:
+                        self._clear_trigger_state(responded=True)
+                        logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
+                        result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                        self._append_media_to_response(result)
+                        return result
                     else:
-                        logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
-                        return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
-                self._clear_trigger_state(responded=True)
+                        self._heartbeat_count += 1
+                        elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
+                        elapsed_min = elapsed_total / 60
+                        if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
+                            self._clear_trigger_state(responded=False)
+                            logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
+                            return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
+                        logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                        return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                else:
+                    logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
+                    return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
@@ -589,19 +675,7 @@ class FeedbackGateServer:
                 
                 response_content = [TextContent(type="text", text=f"User Response: {user_input}")]
                 
-                if hasattr(self, '_last_attachments') and self._last_attachments:
-                    for attachment in self._last_attachments:
-                        if attachment.get('mimeType', '').startswith('image/'):
-                            try:
-                                image_content = ImageContent(
-                                    type="image",
-                                    data=attachment['base64Data'],
-                                    mimeType=attachment['mimeType']
-                                )
-                                response_content.append(image_content)
-                                logger.info(f"📸 Added image to response: {attachment.get('fileName', 'unknown')}")
-                            except Exception as e:
-                                logger.error(f"❌ Error adding image to response: {e}")
+                self._append_media_to_response(response_content)
                 
                 return response_content
             else:
@@ -935,46 +1009,12 @@ class FeedbackGateServer:
         while time.time() - start_time < timeout:
             try:
                 if primary_response.exists():
-                    try:
-                        file_content = primary_response.read_text().strip()
-                        logger.info(f"📄 Found response file: {file_content[:200]}...")
-                        
-                        user_input = ""
-                        attachments = []
-                        
-                        if file_content.startswith('{'):
-                            data = json.loads(file_content)
-                            user_input = data.get("user_input", data.get("response", data.get("message", ""))).strip()
-                            attachments = data.get("attachments", [])
-                            
-                            if attachments:
-                                logger.info(f"📎 Found {len(attachments)} attachments")
-                                self._last_attachments = attachments
-                                descs = [f"Image: {a.get('fileName', 'unknown')}" for a in attachments if a.get('mimeType', '').startswith('image/')]
-                                if descs:
-                                    user_input += f"\n\nAttached: {', '.join(descs)}"
-                            else:
-                                self._last_attachments = []
-                        else:
-                            user_input = file_content
-                            self._last_attachments = []
-                        
-                        try:
-                            primary_response.unlink()
-                            logger.info(f"🧹 Response file cleaned up")
-                        except Exception as cleanup_error:
-                            logger.warning(f"⚠️ Cleanup error: {cleanup_error}")
-                        
-                        if user_input:
-                            logger.info(f"🎉 RECEIVED USER INPUT for trigger {trigger_id}: {user_input[:100]}...")
-                            return user_input
-                        else:
-                            logger.warning(f"⚠️ Empty user input in response file")
-                            
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ JSON decode error: {e}")
-                    except Exception as e:
-                        logger.error(f"❌ Error processing response file: {e}")
+                    user_input = self._read_and_consume_response(primary_response)
+                    if user_input:
+                        logger.info(f"🎉 RECEIVED USER INPUT for trigger {trigger_id}: {user_input[:100]}...")
+                        return user_input
+                    else:
+                        logger.warning(f"⚠️ Empty or unreadable response file for trigger {trigger_id}")
                 
                 await asyncio.sleep(check_interval)
                 

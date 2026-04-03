@@ -66,8 +66,13 @@ function generateId() {
 
 function enqueueMessage(text, attachments, files) {
     const safeAttachments = (attachments || []).map(att => {
-        if (att.data && att.data.length > 500000) {
-            return { ...att, data: '[TOO_LARGE_FOR_QUEUE]', originalSize: att.data.length };
+        const largeField = att.base64Data || att.dataUrl || att.data;
+        if (largeField && largeField.length > 500000) {
+            const cleaned = { ...att, originalSize: largeField.length };
+            if (att.base64Data) cleaned.base64Data = '[TOO_LARGE_FOR_QUEUE]';
+            if (att.dataUrl) cleaned.dataUrl = '[TOO_LARGE_FOR_QUEUE]';
+            if (att.data) cleaned.data = '[TOO_LARGE_FOR_QUEUE]';
+            return cleaned;
         }
         return att;
     });

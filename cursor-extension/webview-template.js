@@ -509,19 +509,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             background: var(--vscode-editor-background);
         }
         
-        .queue-container.empty .queue-list { display: none; }
-        .queue-container.empty .queue-header { display: none; }
+        .queue-container.empty { display: none; }
         
-        .queue-empty-hint {
-            display: none;
-            font-size: 11px;
-            opacity: 0.4;
-            text-align: center;
-            padding: 8px 12px;
-            font-style: italic;
-        }
         
-        .queue-container.empty .queue-empty-hint { display: block; }
         
         .queue-header {
             font-size: 11px;
@@ -818,9 +808,13 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             hideTyping();
         }
         
+        let _sendLock = false;
         function sendMessage() {
             const text = messageInput.value.trim();
             if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
+            if (_sendLock) return;
+            _sendLock = true;
+            setTimeout(() => { _sendLock = false; }, 300);
             
             vscode.postMessage({
                 command: 'send',
@@ -835,6 +829,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             attachedImages = [];
             attachedFiles = [];
             document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
+            document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
             adjustTextareaHeight();
             
             toggleMicIcon();
@@ -1016,7 +1011,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             document.body.classList.remove('drag-over');
             messageInput.classList.remove('paste-highlight');
             
-            // Try to get VS Code file URIs (from explorer tree drag)
             const uriList = e.dataTransfer.getData('text/uri-list');
             const plainText = e.dataTransfer.getData('text/plain');
             
@@ -1331,12 +1325,13 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             const pendingItems = items.filter(it => it.status === 'pending');
             queueList.innerHTML = items.map((item, i) => {
                 const isPending = item.status === 'pending';
+                const pi = isPending ? pendingItems.findIndex(p => p.id === item.id) : -1;
                 return \`
                 <div class="queue-item" data-queue-id="\${item.id}">
                     \${isPending && pendingItems.length > 1 ? \`
                         <span class="queue-item-arrows">
-                            <button class="queue-arrow" \${i === 0 ? 'disabled' : ''} onclick="moveQueueItemUp(\${item.id})" title="上移">▲</button>
-                            <button class="queue-arrow" \${i === pendingItems.length - 1 ? 'disabled' : ''} onclick="moveQueueItemDown(\${item.id})" title="下移">▼</button>
+                            <button class="queue-arrow" \${pi === 0 ? 'disabled' : ''} onclick="moveQueueItemUp(\${item.id})" title="上移">▲</button>
+                            <button class="queue-arrow" \${pi === pendingItems.length - 1 ? 'disabled' : ''} onclick="moveQueueItemDown(\${item.id})" title="下移">▼</button>
                         </span>
                     \` : ''}
                     <span class="queue-item-num">\${i + 1}</span>
