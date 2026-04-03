@@ -79,7 +79,7 @@ class FeedbackGatePanelProvider {
                         enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
                         logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                         if (currentTriggerData && currentTriggerData.trigger_id) {
-                            processQueueForPendingTrigger();
+                            processQueueForPendingTrigger(true);
                         }
                         break;
                     }
@@ -940,7 +940,7 @@ function openFeedbackGatePopup(context, options = {}) {
                     enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
                     logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                     if (currentTriggerData && currentTriggerData.trigger_id) {
-                        processQueueForPendingTrigger();
+                        processQueueForPendingTrigger(true);
                     }
                     break;
                 case 'removeQueueItem':
@@ -1035,7 +1035,7 @@ function openFeedbackGatePopup(context, options = {}) {
 }
 
 
-function processQueueForPendingTrigger() {
+function processQueueForPendingTrigger(directSend) {
     if (!currentTriggerData || !currentTriggerData.trigger_id) return;
     if (getPendingQueueCount() === 0) return;
 
@@ -1054,7 +1054,7 @@ function processQueueForPendingTrigger() {
         attachments: queueItem.attachments || [],
         files: queueItem.files || [],
         event_type: 'MCP_RESPONSE',
-        source: 'feedback_gate_queue',
+        source: directSend ? 'feedback_gate_direct' : 'feedback_gate_queue',
         queue_item_id: queueItem.id
     };
     const responseJson = JSON.stringify(responseData, null, 2);
@@ -1071,9 +1071,13 @@ function processQueueForPendingTrigger() {
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
     postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user' });
-    postToWebview({ command: 'addMessage', text: '⚡ 已从队列发送给 Agent', type: 'system', plain: true });
-
-    handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
+    if (directSend) {
+        handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
+    } else {
+        postToWebview({ command: 'addMessage', text: '⚡ 已从队列发送给 Agent', type: 'system', plain: true });
+        currentTriggerData = null;
+        setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+    }
 }
 
 function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, specialHandling) {

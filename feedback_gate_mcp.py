@@ -94,6 +94,9 @@ class FeedbackGateServer:
         self._whisper_model = None
         self._server_pid = os.getpid()
         
+        # Clean up stale files from dead MCP instances before writing our own PID
+        self._cleanup_stale_files()
+        
         # Write PID file so the extension can discover which MCP server belongs to it
         self._write_pid_file()
         
@@ -134,6 +137,40 @@ class FeedbackGateServer:
                 return p
         
         return None
+
+    def _cleanup_stale_files(self):
+        """Remove PID files, trigger files, and response files from dead MCP instances."""
+        temp_dir = get_temp_path("")
+        cleaned = 0
+        try:
+            for pattern in [
+                "feedback_gate_mcp_*.pid",
+                "feedback_gate_trigger_pid*.json",
+                "feedback_gate_trigger.json",
+                "feedback_gate_response_*.json",
+                "feedback_gate_response.json",
+                "feedback_gate_ack_*.json",
+                "feedback_gate_queue_*.json",
+            ]:
+                for filepath in glob.glob(os.path.join(temp_dir, pattern)):
+                    try:
+                        if pattern.endswith(".pid"):
+                            data = json.loads(Path(filepath).read_text())
+                            pid = data.get("pid")
+                            if pid and pid != self._server_pid:
+                                try:
+                                    os.kill(pid, 0)
+                                    continue
+                                except OSError:
+                                    pass
+                        Path(filepath).unlink()
+                        cleaned += 1
+                    except Exception:
+                        pass
+            if cleaned:
+                logger.info(f"🧹 Startup cleanup: removed {cleaned} stale files from {temp_dir}")
+        except Exception as e:
+            logger.warning(f"⚠️ Startup cleanup error: {e}")
 
     def _write_pid_file(self):
         """Write a PID-specific marker file so the extension can identify its MCP server instance.
@@ -268,13 +305,16 @@ class FeedbackGateServer:
                     return await self._handle_feedback_gate_chat(arguments)
                 else:
                     logger.error(f"❌ Unknown tool: {name}")
-                    # Wait before returning error
-                    await asyncio.sleep(1.0)  # Wait 1 second before error response
+                    await asyncio.sleep(1.0)
                     raise ValueError(f"Unknown tool: {name}")
             except Exception as e:
                 logger.error(f"💥 Tool call error for {name}: {e}")
-                # Wait before returning error
-                await asyncio.sleep(1.0)  # Wait 1 second before error response
+                if self._pending_trigger_id:
+                    logger.warning(f"🧹 Clearing pending trigger {self._pending_trigger_id} due to exception")
+                    self._pending_trigger_id = None
+                    self._pending_trigger_created_at = 0
+                    self._heartbeat_count = 0
+                await asyncio.sleep(1.0)
                 return [TextContent(type="text", text=f"ERROR: Tool {name} failed: {str(e)}")]
 
     async def _handle_unified_feedback_gate(self, args: dict) -> list[TextContent]:
@@ -498,6 +538,8 @@ class FeedbackGateServer:
             
             if not extension_alive:
                 logger.warning("⚠️ Trigger file not consumed — no Feedback Gate extension detected")
+                self._pending_trigger_id = None
+                self._pending_trigger_created_at = 0
                 try:
                     trigger_file.unlink(missing_ok=True)
                     Path(get_temp_path("feedback_gate_trigger.json")).unlink(missing_ok=True)
