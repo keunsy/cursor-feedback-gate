@@ -73,7 +73,9 @@ if [[ "$OS" == "linux" ]]; then
     dpkg -s python3-venv >/dev/null 2>&1 || sudo apt-get install -y python3-venv
 fi
 
-python3 -m venv "$INSTALL_DIR/venv"
+if [[ ! -d "$INSTALL_DIR/venv" ]]; then
+    python3 -m venv "$INSTALL_DIR/venv"
+fi
 source "$INSTALL_DIR/venv/bin/activate"
 pip install --upgrade pip -q
 
@@ -152,8 +154,12 @@ if [[ -n "$VSIX_FILE" ]]; then
     cp "$VSIX_FILE" "$INSTALL_DIR/"
 
     INSTALLED=false
-    CURSOR_BIN="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
-    if [[ -x "$CURSOR_BIN" ]]; then
+    if [[ "$OS" == "macos" ]]; then
+        CURSOR_BIN="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+    else
+        CURSOR_BIN=$(command -v cursor 2>/dev/null || echo "")
+    fi
+    if [[ -n "$CURSOR_BIN" && -x "$CURSOR_BIN" ]]; then
         if "$CURSOR_BIN" --install-extension "$VSIX_FILE" --force >/dev/null 2>&1; then
             log_success "Extension installed automatically"
             INSTALLED=true
@@ -171,11 +177,7 @@ fi
 
 # --- Install Cursor Rule ---
 if [[ -f "$SCRIPT_DIR/FeedbackGate.mdc" ]]; then
-    if [[ "$OS" == "macos" ]]; then
-        CURSOR_RULES_DIR="$HOME/Library/Application Support/Cursor/User/rules"
-    else
-        CURSOR_RULES_DIR="$HOME/.config/Cursor/User/rules"
-    fi
+    CURSOR_RULES_DIR="$HOME/.cursor/rules"
     mkdir -p "$CURSOR_RULES_DIR"
     cp "$SCRIPT_DIR/FeedbackGate.mdc" "$CURSOR_RULES_DIR/"
     log_success "Rule installed to: $CURSOR_RULES_DIR/FeedbackGate.mdc"

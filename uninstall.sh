@@ -63,9 +63,20 @@ TEMP_DIR=$(python3 -c 'import tempfile; print(tempfile.gettempdir())' 2>/dev/nul
 rm -f "$TEMP_DIR"/feedback_gate_* "$TEMP_DIR"/mcp_response* 2>/dev/null || true
 log_success "Cleaned up temporary files"
 
+# --- Remove Cursor Rule ---
+CURSOR_RULES_DIR="$HOME/.cursor/rules"
+if [[ -f "$CURSOR_RULES_DIR/FeedbackGate.mdc" ]]; then
+    rm -f "$CURSOR_RULES_DIR/FeedbackGate.mdc"
+    log_success "Removed rule: $CURSOR_RULES_DIR/FeedbackGate.mdc"
+fi
+
 # --- Remove Cursor extension ---
-CURSOR_BIN="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
-if [[ -x "$CURSOR_BIN" ]]; then
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    CURSOR_BIN="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+else
+    CURSOR_BIN=$(command -v cursor 2>/dev/null || echo "")
+fi
+if [[ -n "$CURSOR_BIN" && -x "$CURSOR_BIN" ]]; then
     if "$CURSOR_BIN" --uninstall-extension keunsy.cursor-feedback-gate >/dev/null 2>&1; then
         log_success "Extension removed automatically"
     else
