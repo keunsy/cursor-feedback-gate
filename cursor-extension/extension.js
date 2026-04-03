@@ -664,6 +664,11 @@ function checkTriggerFile(context, filePath) {
                             type: 'system',
                             plain: true
                         });
+                    } else {
+                        // No trigger ID — recover the queue item to pending
+                        queueItem.status = 'pending';
+                        delete queueItem.processingAt;
+                        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id`);
                     }
                     try { fs.unlinkSync(filePath); } catch {}
                     console.log(`Feedback Gate: auto-consumed queue item "${queueItem.text}"`);
@@ -1047,27 +1052,31 @@ function processQueueForPendingTrigger(directSend) {
     const triggerId = currentTriggerData.trigger_id;
     const toolType = currentTriggerData.tool;
 
-    const responseData = {
-        timestamp: new Date().toISOString(),
-        trigger_id: triggerId,
-        user_input: queueItem.text,
-        response: queueItem.text,
-        message: queueItem.text,
-        attachments: queueItem.attachments || [],
-        files: enrichFiles(queueItem.files),
-        event_type: 'MCP_RESPONSE',
-        source: directSend ? 'feedback_gate_direct' : 'feedback_gate_queue',
-        queue_item_id: queueItem.id
-    };
-    const responseJson = JSON.stringify(responseData, null, 2);
-    [
-        getTempPath(`feedback_gate_response_${triggerId}.json`),
-        getTempPath('feedback_gate_response.json'),
-        getTempPath(`mcp_response_${triggerId}.json`),
-        getTempPath('mcp_response.json')
-    ].forEach(f => {
-        try { fs.writeFileSync(f, responseJson); } catch (e) {}
-    });
+    try {
+        const responseData = {
+            timestamp: new Date().toISOString(),
+            trigger_id: triggerId,
+            user_input: queueItem.text,
+            response: queueItem.text,
+            message: queueItem.text,
+            attachments: queueItem.attachments || [],
+            files: enrichFiles(queueItem.files),
+            event_type: 'MCP_RESPONSE',
+            source: directSend ? 'feedback_gate_direct' : 'feedback_gate_queue',
+            queue_item_id: queueItem.id
+        };
+        const responseJson = JSON.stringify(responseData, null, 2);
+        [
+            getTempPath(`feedback_gate_response_${triggerId}.json`),
+            getTempPath('feedback_gate_response.json'),
+            getTempPath(`mcp_response_${triggerId}.json`),
+            getTempPath('mcp_response.json')
+        ].forEach(f => {
+            try { fs.writeFileSync(f, responseJson); } catch (e) {}
+        });
+    } catch (e) {
+        console.log(`Feedback Gate: processQueue response write error: ${e.message}`);
+    }
 
     markQueueItemDone(queueItem.id);
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);

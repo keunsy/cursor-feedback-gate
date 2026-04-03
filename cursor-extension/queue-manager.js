@@ -103,7 +103,7 @@ function dequeueMessage() {
 }
 
 function recoverStaleProcessing() {
-    const STALE_MS = 60000;
+    const STALE_MS = 10000;
     let changed = false;
     messageQueue.forEach(m => {
         if (m.status === 'processing' && m.processingAt && (Date.now() - m.processingAt > STALE_MS)) {
@@ -169,6 +169,7 @@ function reorderQueue(orderedIds) {
 }
 
 function getPendingQueueCount() {
+    recoverStaleProcessing();
     return messageQueue.filter(m => m.status === 'pending').length;
 }
 
