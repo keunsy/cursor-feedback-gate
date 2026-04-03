@@ -43,38 +43,64 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         .review-header {
             flex-shrink: 0;
-            padding: 16px 20px 12px 20px;
+            padding: 10px 16px;
             border-bottom: 1px solid var(--vscode-panel-border);
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 10px;
             background: var(--vscode-editor-background);
         }
         
         .review-title {
-            font-size: 18px;
+            font-size: 15px;
             font-weight: 600;
             color: var(--vscode-foreground);
+            letter-spacing: 0.3px;
         }
         
         .review-author {
-            font-size: 12px;
-            opacity: 0.7;
+            font-size: 11px;
+            opacity: 0.45;
+        }
+        
+        .status-capsule {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px 3px 8px;
+            border-radius: 12px;
+            background: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.2);
             margin-left: auto;
+            transition: all 0.3s ease;
+        }
+        
+        .status-capsule.active {
+            background: rgba(76, 175, 80, 0.1);
+            border-color: rgba(76, 175, 80, 0.25);
+        }
+        
+        .status-capsule.inactive {
+            background: rgba(128, 128, 128, 0.08);
+            border-color: rgba(128, 128, 128, 0.15);
         }
         
         .status-indicator {
-            width: 8px;
-            height: 8px;
+            width: 7px;
+            height: 7px;
             border-radius: 50%;
-            background: var(--vscode-charts-orange);
+            background: rgba(59, 130, 246, 0.8);
             animation: pulse 2s infinite;
             transition: background-color 0.3s ease;
-            margin-right: 4px;
         }
         
         .status-indicator.active {
             background: var(--vscode-charts-green);
+        }
+        
+        .status-indicator.inactive {
+            background: rgba(128, 128, 128, 0.5);
+            animation: none;
         }
         
         @keyframes pulse {
@@ -244,7 +270,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .input-wrapper.agent-active:focus-within {
-            box-shadow: 0 0 0 2px rgba(255, 165, 0, 0.4), 0 0 8px rgba(255, 165, 0, 0.2);
+            box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.5), 0 0 8px rgba(76, 175, 80, 0.25);
         }
         
         .message-input {
@@ -382,8 +408,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         .mcp-status {
             font-size: 11px;
-            opacity: 0.6;
-            margin-left: 4px;
+            opacity: 0.85;
+            white-space: nowrap;
         }
         
         /* Drag and drop styling */
@@ -620,9 +646,11 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
     <div class="review-container">
         <div class="review-header">
             <div class="review-title">${title}</div>
-            <div class="status-indicator" id="statusIndicator"></div>
-            <div class="mcp-status" id="mcpStatus">等待 Agent 调用</div>
             <div class="review-author">by keunsy</div>
+            <div class="status-capsule" id="statusCapsule">
+                <div class="status-indicator" id="statusIndicator"></div>
+                <div class="mcp-status" id="mcpStatus">等待 Agent 调用</div>
+            </div>
         </div>
         
         <div class="messages-container" id="messages">
@@ -644,7 +672,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 <span class="queue-badge" id="queueBadge">0</span>
             </div>
             <div id="queueList"></div>
-            <div class="queue-empty-hint">Agent 未在等待时，发送的消息会自动排队</div>
         </div>
         
         <div class="input-container" id="inputContainer">
@@ -671,6 +698,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         const micIcon = document.getElementById('micIcon');
         const typingIndicator = document.getElementById('typingIndicator');
         const statusIndicator = document.getElementById('statusIndicator');
+        const statusCapsule = document.getElementById('statusCapsule');
         const mcpStatus = document.getElementById('mcpStatus');
         const inputContainer = document.getElementById('inputContainer');
         const inputWrapper = document.getElementById('inputWrapper');
@@ -689,7 +717,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             mcpActive = active;
             
             if (active && hasPendingTrigger) {
-                statusIndicator.classList.add('active');
+                statusIndicator.className = 'status-indicator active';
+                statusCapsule.className = 'status-capsule active';
                 mcpStatus.textContent = 'Agent 等待回复';
                 inputContainer.classList.remove('disabled');
                 inputWrapper.classList.add('agent-active');
@@ -698,7 +727,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 attachButton.disabled = false;
                 messageInput.placeholder = 'Cursor Agent 正在等待你的回复…';
             } else if (active) {
-                statusIndicator.classList.remove('active');
+                statusIndicator.className = 'status-indicator';
+                statusCapsule.className = 'status-capsule';
                 mcpStatus.textContent = '等待 Agent 调用';
                 inputContainer.classList.remove('disabled');
                 inputWrapper.classList.remove('agent-active');
@@ -707,7 +737,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 attachButton.disabled = false;
                 messageInput.placeholder = '输入消息将自动加入队列…';
             } else {
-                statusIndicator.classList.remove('active');
+                statusIndicator.className = 'status-indicator inactive';
+                statusCapsule.className = 'status-capsule inactive';
                 mcpStatus.textContent = 'MCP 未激活';
                 inputContainer.classList.add('disabled');
                 inputWrapper.classList.remove('agent-active');
