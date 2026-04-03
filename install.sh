@@ -129,7 +129,8 @@ VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/d
 if [[ -z "$VSIX_FILE" ]]; then
     log "未找到 .vsix，正在构建扩展..."
     if command -v npx &> /dev/null; then
-        (cd "$SCRIPT_DIR/cursor-extension" && npx @vscode/vsce package --no-dependencies 2>/dev/null)
+        rm -f "$SCRIPT_DIR/cursor-extension/"*.vsix 2>/dev/null || true
+        (cd "$SCRIPT_DIR/cursor-extension" && npx @vscode/vsce package --no-dependencies)
         VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/dev/null)
         if [[ -n "$VSIX_FILE" ]]; then
             ok "扩展构建成功: $(basename "$VSIX_FILE")"
