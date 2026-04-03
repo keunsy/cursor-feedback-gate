@@ -139,9 +139,31 @@ class FeedbackGateServer:
         return None
 
     def _cleanup_stale_files(self):
-        """Remove PID files, trigger files, and response files from dead MCP instances."""
+        """Remove temp files from dead MCP instances only.
+        
+        For files containing a PID (in filename or content), verify the process
+        is dead before deleting.  For generic files without PID info, only delete
+        if the file is older than 10 minutes to avoid racing with live instances.
+        """
         temp_dir = get_temp_path("")
         cleaned = 0
+        stale_threshold = time.time() - 600  # 10 minutes
+        
+        def _extract_pid_from_filename(filepath):
+            """Extract PID from filenames like feedback_gate_trigger_pid12345.json"""
+            import re
+            m = re.search(r'_pid(\d+)', os.path.basename(filepath))
+            return int(m.group(1)) if m else None
+        
+        def _is_pid_alive(pid):
+            if pid is None or pid == self._server_pid:
+                return True
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+        
         try:
             for pattern in [
                 "feedback_gate_mcp_*.pid",
@@ -156,13 +178,17 @@ class FeedbackGateServer:
                     try:
                         if pattern.endswith(".pid"):
                             data = json.loads(Path(filepath).read_text())
-                            pid = data.get("pid")
-                            if pid and pid != self._server_pid:
-                                try:
-                                    os.kill(pid, 0)
+                            if _is_pid_alive(data.get("pid")):
+                                continue
+                        else:
+                            pid_in_name = _extract_pid_from_filename(filepath)
+                            if pid_in_name is not None:
+                                if _is_pid_alive(pid_in_name):
                                     continue
-                                except OSError:
-                                    pass
+                            else:
+                                mtime = os.path.getmtime(filepath)
+                                if mtime > stale_threshold:
+                                    continue
                         Path(filepath).unlink()
                         cleaned += 1
                     except Exception:
@@ -311,9 +337,7 @@ class FeedbackGateServer:
                 logger.error(f"💥 Tool call error for {name}: {e}")
                 if self._pending_trigger_id:
                     logger.warning(f"🧹 Clearing pending trigger {self._pending_trigger_id} due to exception")
-                    self._pending_trigger_id = None
-                    self._pending_trigger_created_at = 0
-                    self._heartbeat_count = 0
+                    self._clear_trigger_state(responded=False)
                 await asyncio.sleep(1.0)
                 return [TextContent(type="text", text=f"ERROR: Tool {name} failed: {str(e)}")]
 
@@ -392,6 +416,18 @@ class FeedbackGateServer:
     _heartbeat_count: int = 0
     _STALE_TRIGGER_SECONDS: int = 300  # 5 min — auto-clear stuck triggers
 
+    def _clear_trigger_state(self, responded: bool = False):
+        """Reset all trigger tracking fields consistently.
+        
+        Args:
+            responded: True if user actually responded (sets cooldown),
+                      False if timeout/error/stale (no cooldown).
+        """
+        self._pending_trigger_id = None
+        self._pending_trigger_created_at = 0
+        self._heartbeat_count = 0
+        self._last_trigger_responded_at = time.time() if responded else 0
+
     # Agent CLI has a hardcoded ~60s MCP tool timeout. In remote-control scenarios
     # (cursor-remote-control) we must return before that deadline hits, otherwise
     # Agent CLI receives -32001 and exits.  We use 50s as the wait ceiling so that
@@ -439,9 +475,7 @@ class FeedbackGateServer:
             stale_age = time.time() - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
             if stale_age > self._STALE_TRIGGER_SECONDS:
                 logger.warning(f"🧹 Clearing stale pending trigger {self._pending_trigger_id} (age: {stale_age:.0f}s)")
-                self._pending_trigger_id = None
-                self._pending_trigger_created_at = 0
-                self._heartbeat_count = 0
+                self._clear_trigger_state(responded=False)
             else:
                 response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
                 if not response_file.exists():
@@ -451,10 +485,7 @@ class FeedbackGateServer:
                             self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
                         )
                         if user_input:
-                            self._pending_trigger_id = None
-                            self._pending_trigger_created_at = 0
-                            self._heartbeat_count = 0
-                            self._last_trigger_responded_at = time.time()
+                            self._clear_trigger_state(responded=True)
                             logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
                             return [TextContent(type="text", text=f"User Response: {user_input}")]
                         else:
@@ -462,10 +493,7 @@ class FeedbackGateServer:
                             elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
                             elapsed_min = elapsed_total / 60
                             if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
-                                self._pending_trigger_id = None
-                                self._pending_trigger_created_at = 0
-                                self._heartbeat_count = 0
-                                self._last_trigger_responded_at = 0
+                                self._clear_trigger_state(responded=False)
                                 logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
                                 return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
                             logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
@@ -473,9 +501,7 @@ class FeedbackGateServer:
                     else:
                         logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
                         return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
-                self._last_trigger_responded_at = time.time()
-                self._pending_trigger_id = None
-                self._pending_trigger_created_at = 0
+                self._clear_trigger_state(responded=True)
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
@@ -538,8 +564,7 @@ class FeedbackGateServer:
             
             if not extension_alive:
                 logger.warning("⚠️ Trigger file not consumed — no Feedback Gate extension detected")
-                self._pending_trigger_id = None
-                self._pending_trigger_created_at = 0
+                self._clear_trigger_state(responded=False)
                 try:
                     trigger_file.unlink(missing_ok=True)
                     Path(get_temp_path("feedback_gate_trigger.json")).unlink(missing_ok=True)
@@ -559,9 +584,7 @@ class FeedbackGateServer:
             user_input = await self._wait_for_user_input(trigger_id, timeout=wait_timeout)
             
             if user_input:
-                # Reset dedup state so the next feedback_gate_chat call goes through
-                self._pending_trigger_id = None
-                self._last_trigger_responded_at = time.time()
+                self._clear_trigger_state(responded=True)
                 logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
                 
                 response_content = [TextContent(type="text", text=f"User Response: {user_input}")]
@@ -587,16 +610,13 @@ class FeedbackGateServer:
                     elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
                     elapsed_min = elapsed_total / 60
                     if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
-                        self._pending_trigger_id = None
-                        self._heartbeat_count = 0
-                        self._last_trigger_responded_at = 0
+                        self._clear_trigger_state(responded=False)
                         logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
                         return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
                     logger.info(f"⏳ Remote wait timed out, returning WAITING (trigger {trigger_id} stays pending, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
                     return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
                 else:
-                    self._pending_trigger_id = None
-                    self._last_trigger_responded_at = 0
+                    self._clear_trigger_state(responded=False)
                     response = f"TIMEOUT: No user input received for feedback gate within 72 hours"
                     logger.warning("⚠️ Feedback Gate timed out waiting for user input after 72 hours")
                     return [TextContent(type="text", text=response)]

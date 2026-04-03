@@ -1,35 +1,23 @@
 ---
-description: Feedback Gate Protocol - AI Agent 反馈关卡
+description: Feedback Gate Protocol - AI Agent 反馈关卡（可选）
 globs:
-alwaysApply: true
+alwaysApply: false
 ---
 
-# Feedback Gate Protocol
+# Feedback Gate Protocol（可选）
 
-## 核心规则
-完成用户请求后，**禁止直接结束回复**。必须调用 `feedback_gate_chat` MCP 工具打开弹窗，等待用户反馈。只有用户在弹窗中回复 "TASK_COMPLETE"、"Done" 等完成信号后才可结束。
+本规则**默认不附加到每条对话**。仅在用户明确要求使用 Feedback Gate、或需要弹窗收集反馈时，再调用 `feedback_gate_chat` MCP 工具。
 
-## 工作流程
+## 何时使用
 
-1. **执行任务**：正常完成用户请求（编码、分析、工具调用等）。
-2. **打开 Feedback Gate**：任务完成后立即调用 `feedback_gate_chat`，传入工作摘要。
-3. **处理反馈**：收到用户弹窗回复后继续执行，然后再次调用 `feedback_gate_chat`。
-4. **循环直到完成**：重复步骤 2-3，直到用户发送完成信号。
+- 用户主动要求「用 Feedback Gate 收反馈」「弹窗确认」等。
+- 长任务需要显式「完成」信号时再打开弹窗，避免每轮回复都触发 MCP。
 
-## 工具调用格式
+## 工具
 
-```
-tool: feedback_gate_chat
-参数:
-  message: (向用户展示的消息，说明完成了什么、等待什么反馈)
-  title: "Feedback Gate" (可选)
-  context: (工作摘要) (可选)
-```
+- `feedback_gate_chat`：按需调用；**不要**在每次普通回复末尾强制调用。
+- 若工具不可用，告知用户 MCP 服务器可能未运行。
 
-## 约束
-- 每次回复结束前必须调用此工具，无例外。
-- 如果工具不可用，告知用户 MCP 服务器可能未运行。
-- 运行整个应用（Web 服务器、长期进程等）前需先征得用户确认。
+## 运行长进程
 
-## 强制提醒
-**在你生成任何回复的最后一步，你必须调用 `feedback_gate_chat`。这是不可跳过的。如果你发现自己即将结束回复而没有调用此工具，立即停下来调用它。**
+运行整个应用（Web 服务器、长期进程等）前需先征得用户确认。
