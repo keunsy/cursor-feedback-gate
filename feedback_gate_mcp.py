@@ -347,8 +347,10 @@ class FeedbackGateServer:
 
     # Track whether a feedback gate trigger is currently pending
     _pending_trigger_id: str | None = None
+    _pending_trigger_created_at: float = 0
     _last_trigger_responded_at: float = 0
     _heartbeat_count: int = 0
+    _STALE_TRIGGER_SECONDS: int = 300  # 5 min — auto-clear stuck triggers
 
     # Agent CLI has a hardcoded ~60s MCP tool timeout. In remote-control scenarios
     # (cursor-remote-control) we must return before that deadline hits, otherwise
@@ -394,36 +396,46 @@ class FeedbackGateServer:
         # remote-control flow: after we return WAITING due to the 50s ceiling the
         # Agent will call feedback_gate_chat again and we resume waiting here.
         if self._pending_trigger_id:
-            response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
-            if not response_file.exists():
-                if is_remote:
-                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id}")
-                    user_input = await self._wait_for_user_input(
-                        self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
-                    )
-                    if user_input:
-                        self._pending_trigger_id = None
-                        self._heartbeat_count = 0
-                        self._last_trigger_responded_at = time.time()
-                        logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
-                        return [TextContent(type="text", text=f"User Response: {user_input}")]
-                    else:
-                        self._heartbeat_count += 1
-                        elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
-                        elapsed_min = elapsed_total / 60
-                        if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
+            stale_age = time.time() - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
+            if stale_age > self._STALE_TRIGGER_SECONDS:
+                logger.warning(f"🧹 Clearing stale pending trigger {self._pending_trigger_id} (age: {stale_age:.0f}s)")
+                self._pending_trigger_id = None
+                self._pending_trigger_created_at = 0
+                self._heartbeat_count = 0
+            else:
+                response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
+                if not response_file.exists():
+                    if is_remote:
+                        logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id}")
+                        user_input = await self._wait_for_user_input(
+                            self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
+                        )
+                        if user_input:
                             self._pending_trigger_id = None
+                            self._pending_trigger_created_at = 0
                             self._heartbeat_count = 0
-                            self._last_trigger_responded_at = 0
-                            logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
-                            return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
-                        logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
-                        return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
-                else:
-                    logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
-                    return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
-            self._last_trigger_responded_at = time.time()
-            self._pending_trigger_id = None
+                            self._last_trigger_responded_at = time.time()
+                            logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
+                            return [TextContent(type="text", text=f"User Response: {user_input}")]
+                        else:
+                            self._heartbeat_count += 1
+                            elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
+                            elapsed_min = elapsed_total / 60
+                            if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
+                                self._pending_trigger_id = None
+                                self._pending_trigger_created_at = 0
+                                self._heartbeat_count = 0
+                                self._last_trigger_responded_at = 0
+                                logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
+                                return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
+                            logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                            return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                    else:
+                        logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
+                        return [TextContent(type="text", text="SKIP: A Feedback Gate request is already pending. Continuing without duplicate notification.")]
+                self._last_trigger_responded_at = time.time()
+                self._pending_trigger_id = None
+                self._pending_trigger_created_at = 0
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
@@ -469,6 +481,7 @@ class FeedbackGateServer:
         
         if success:
             self._pending_trigger_id = trigger_id
+            self._pending_trigger_created_at = time.time()
             self._heartbeat_count = 0
             logger.info(f"🔥 POPUP TRIGGERED IMMEDIATELY - waiting for user input (trigger_id: {trigger_id})")
             
