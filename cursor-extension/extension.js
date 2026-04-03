@@ -76,13 +76,10 @@ class FeedbackGatePanelProvider {
                 const currentTriggerId = (currentTriggerData && currentTriggerData.trigger_id) || null;
                 switch (webviewMessage.command) {
                     case 'send': {
+                        enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
+                        logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                         if (currentTriggerData && currentTriggerData.trigger_id) {
-                            const eventType = this._mcpIntegration ? 'MCP_RESPONSE' : 'FEEDBACK_SUBMITTED';
-                            logUserInput(webviewMessage.text, eventType, currentTriggerId, webviewMessage.attachments || [], webviewMessage.files || []);
-                            handleFeedbackMessage(webviewMessage.text, webviewMessage.attachments, currentTriggerId, this._mcpIntegration, this._currentSpecialHandling);
-                        } else {
-                            const item = enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
-                            logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
+                            processQueueForPendingTrigger();
                         }
                         break;
                     }
@@ -940,13 +937,10 @@ function openFeedbackGatePopup(context, options = {}) {
             
             switch (webviewMessage.command) {
                 case 'send':
+                    enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
+                    logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                     if (currentTriggerData && currentTriggerData.trigger_id) {
-                        const eventType = mcpIntegration ? 'MCP_RESPONSE' : 'FEEDBACK_SUBMITTED';
-                        logUserInput(webviewMessage.text, eventType, currentTriggerId, webviewMessage.attachments || [], webviewMessage.files || []);
-                        handleFeedbackMessage(webviewMessage.text, webviewMessage.attachments, currentTriggerId, mcpIntegration, specialHandling);
-                    } else {
-                        enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
-                        logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
+                        processQueueForPendingTrigger();
                     }
                     break;
                 case 'removeQueueItem':
@@ -1040,6 +1034,47 @@ function openFeedbackGatePopup(context, options = {}) {
     }
 }
 
+
+function processQueueForPendingTrigger() {
+    if (!currentTriggerData || !currentTriggerData.trigger_id) return;
+    if (getPendingQueueCount() === 0) return;
+
+    const queueItem = dequeueMessage();
+    if (!queueItem) return;
+
+    const triggerId = currentTriggerData.trigger_id;
+    const toolType = currentTriggerData.tool;
+
+    const responseData = {
+        timestamp: new Date().toISOString(),
+        trigger_id: triggerId,
+        user_input: queueItem.text,
+        response: queueItem.text,
+        message: queueItem.text,
+        attachments: queueItem.attachments || [],
+        files: queueItem.files || [],
+        event_type: 'MCP_RESPONSE',
+        source: 'feedback_gate_queue',
+        queue_item_id: queueItem.id
+    };
+    const responseJson = JSON.stringify(responseData, null, 2);
+    [
+        getTempPath(`feedback_gate_response_${triggerId}.json`),
+        getTempPath('feedback_gate_response.json'),
+        getTempPath(`mcp_response_${triggerId}.json`),
+        getTempPath('mcp_response.json')
+    ].forEach(f => {
+        try { fs.writeFileSync(f, responseJson); } catch (e) {}
+    });
+
+    markQueueItemDone(queueItem.id);
+    logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
+
+    postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user' });
+    postToWebview({ command: 'addMessage', text: '⚡ 已从队列发送给 Agent', type: 'system', plain: true });
+
+    handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
+}
 
 function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, specialHandling) {
     currentTriggerData = null;

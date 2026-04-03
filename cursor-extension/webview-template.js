@@ -213,10 +213,14 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .mic-icon.active {
-            color: #ff6b35;
+            color: rgba(255, 255, 255, 0.55);
             opacity: 1;
             pointer-events: auto;
             cursor: pointer;
+        }
+        
+        .mic-icon.active:hover {
+            color: rgba(255, 255, 255, 0.85);
         }
         
         .mic-icon.recording {
@@ -225,7 +229,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .mic-icon.processing {
-            color: #ff6b35;
+            color: rgba(255, 255, 255, 0.55);
             animation: spin 1s linear infinite;
         }
         
@@ -323,17 +327,25 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             display: flex;
             align-items: center;
             justify-content: center;
-            transition: all 0.2s ease;
-            font-size: 14px;
+            transition: all 0.15s ease;
+            padding: 0;
+            flex-shrink: 0;
+        }
+        
+        .send-button svg {
+            width: 16px;
+            height: 16px;
+            stroke: currentColor;
+            stroke-width: 2;
+            fill: none;
         }
         
         .send-button:hover {
             background: var(--vscode-button-hoverBackground);
-            transform: scale(1.05);
         }
         
         .send-button:disabled {
-            opacity: 0.5;
+            opacity: 0.35;
             cursor: not-allowed;
             transform: none;
         }
@@ -644,7 +656,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 </button>
             </div>
             <button id="sendButton" class="send-button" title="${mcpIntegration ? '发送回复给 Agent' : '发送审查'}">
-                <i class="fas fa-arrow-up"></i>
+                <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
             </button>
         </div>
     </div>
@@ -779,16 +791,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             const text = messageInput.value.trim();
             if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
             
-            let displayMessage = text;
-            if (attachedImages.length > 0) {
-                displayMessage += (text ? '\\n\\n' : '') + \`[\${attachedImages.length} image(s) attached]\`;
-            }
-            if (attachedFiles.length > 0) {
-                displayMessage += (text || attachedImages.length > 0 ? '\\n\\n' : '') + \`[\${attachedFiles.length} file(s) attached]\`;
-            }
-            
-            addMessage(displayMessage, 'user');
-            
             vscode.postMessage({
                 command: 'send',
                 text: text,
@@ -801,14 +803,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             messageInput.value = '';
             attachedImages = [];
             attachedFiles = [];
-            // Clear file previews from DOM
             document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
             adjustTextareaHeight();
             
-            // Ensure mic icon is visible after sending message
             toggleMicIcon();
-            
-            simulateResponse(displayMessage);
         }
         
         function adjustTextareaHeight() {

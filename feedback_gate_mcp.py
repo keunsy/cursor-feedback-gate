@@ -355,6 +355,7 @@ class FeedbackGateServer:
     # Agent CLI receives -32001 and exits.  We use 50s as the wait ceiling so that
     # there is comfortable margin.  For IDE usage the original 72h timeout applies.
     _REMOTE_WAIT_SECONDS = 50
+    _REMOTE_MAX_TOTAL_SECONDS = 86400  # 24h max total wait for CLI
 
     @staticmethod
     def _build_heartbeat_message(count: int, elapsed_min: float) -> str:
@@ -408,7 +409,14 @@ class FeedbackGateServer:
                         return [TextContent(type="text", text=f"User Response: {user_input}")]
                     else:
                         self._heartbeat_count += 1
-                        elapsed_min = self._heartbeat_count * self._REMOTE_WAIT_SECONDS / 60
+                        elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
+                        elapsed_min = elapsed_total / 60
+                        if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
+                            self._pending_trigger_id = None
+                            self._heartbeat_count = 0
+                            self._last_trigger_responded_at = 0
+                            logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
+                            return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
                         logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
                         return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
                 else:
@@ -521,7 +529,14 @@ class FeedbackGateServer:
             else:
                 if is_remote:
                     self._heartbeat_count += 1
-                    elapsed_min = self._heartbeat_count * self._REMOTE_WAIT_SECONDS / 60
+                    elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
+                    elapsed_min = elapsed_total / 60
+                    if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
+                        self._pending_trigger_id = None
+                        self._heartbeat_count = 0
+                        self._last_trigger_responded_at = 0
+                        logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
+                        return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
                     logger.info(f"⏳ Remote wait timed out, returning WAITING (trigger {trigger_id} stays pending, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
                     return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
                 else:

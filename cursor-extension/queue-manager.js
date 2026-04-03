@@ -15,7 +15,7 @@ function getQueueFilePath() {
     const workspaceId = _vscode && _vscode.workspace.workspaceFolders
         ? _vscode.workspace.workspaceFolders[0].uri.fsPath.replace(/[^a-zA-Z0-9]/g, '_').slice(-40)
         : 'default';
-    return getTempPath(`feedback_gate_queue_${workspaceId}.json`);
+    return getTempPath(`feedback_gate_queue_${workspaceId}_pid${process.pid}.json`);
 }
 
 function loadQueue() {
