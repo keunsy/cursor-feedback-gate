@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Feedback Gate - One-Click Installation Script
-# Installs Feedback Gate globally for Cursor IDE (macOS / Linux)
+# Feedback Gate - 一键安装脚本
+# 支持 macOS / Linux
 
 set -e
 
@@ -15,53 +15,53 @@ err()     { echo -e "${C_RED}✗ $1${C_NC}"; }
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
-echo -e "${C_BLUE}Feedback Gate - One-Click Installation${C_NC}"
-echo -e "${C_BLUE}=========================================${C_NC}"
+echo -e "${C_BLUE}Feedback Gate - 一键安装${C_NC}"
+echo -e "${C_BLUE}=========================${C_NC}"
 echo ""
 
-# --- Detect OS ---
+# --- 检测操作系统 ---
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS="linux"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macos"
 else
-    err "Unsupported OS: $OSTYPE (Linux and macOS only)"
+    err "不支持的操作系统: $OSTYPE（仅支持 macOS 和 Linux）"
     exit 1
 fi
-ok "Detected OS: $OS"
+ok "操作系统: $OS"
 
-# --- Check Python 3 ---
+# --- 检查 Python 3 ---
 if ! command -v python3 &> /dev/null; then
-    err "Python 3 is required but not installed"
+    err "需要 Python 3，但未安装"
     exit 1
 fi
-ok "Python 3 found: $(python3 --version)"
+ok "Python 3: $(python3 --version)"
 
-# --- Optional: install SoX for speech-to-text ---
-log "Checking SoX (for speech-to-text, optional)..."
+# --- 可选：安装 SoX（语音转文字） ---
+log "检查 SoX（语音功能，可选）..."
 if command -v sox &> /dev/null; then
-    ok "SoX already installed"
+    ok "SoX 已安装"
 else
     if [[ "$OS" == "macos" ]]; then
         if command -v brew &> /dev/null; then
-            brew install sox 2>/dev/null || warn "SoX install failed — speech features disabled"
+            brew install sox 2>/dev/null || warn "SoX 安装失败 — 语音功能不可用"
         else
-            warn "Homebrew not found — skipping SoX (speech features disabled)"
+            warn "未找到 Homebrew — 跳过 SoX（语音功能不可用）"
         fi
     else
-        sudo apt-get update -qq && sudo apt-get install -y -qq sox 2>/dev/null || warn "SoX install failed — speech features disabled"
+        sudo apt-get update -qq && sudo apt-get install -y -qq sox 2>/dev/null || warn "SoX 安装失败 — 语音功能不可用"
     fi
 fi
 
-# --- Create installation directory ---
+# --- 创建安装目录 ---
 INSTALL_DIR="$HOME/cursor-extensions/feedback-gate"
-log "Installing to $INSTALL_DIR ..."
+log "安装到 $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 
 cp "$SCRIPT_DIR/feedback_gate_mcp.py" "$INSTALL_DIR/"
 
-# --- Python venv ---
-log "Setting up Python virtual environment..."
+# --- Python 虚拟环境 ---
+log "配置 Python 虚拟环境..."
 if [[ "$OS" == "linux" ]]; then
     dpkg -s python3-venv >/dev/null 2>&1 || sudo apt-get install -y python3-venv
 fi
@@ -72,26 +72,26 @@ fi
 source "$INSTALL_DIR/venv/bin/activate"
 pip install --upgrade pip -q
 
-log "Installing Python dependencies..."
+log "安装 Python 依赖..."
 pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"
 
 if pip install -q "faster-whisper>=1.0.0" 2>/dev/null; then
-    ok "faster-whisper installed (speech-to-text enabled)"
+    ok "faster-whisper 已安装（语音转文字可用）"
 else
-    warn "faster-whisper install failed — speech-to-text disabled"
+    warn "faster-whisper 安装失败 — 语音转文字不可用"
 fi
 
 deactivate
-ok "Python environment ready"
+ok "Python 环境就绪"
 
-# --- MCP configuration ---
+# --- MCP 配置 ---
 CURSOR_MCP_FILE="$HOME/.cursor/mcp.json"
-log "Configuring MCP..."
+log "配置 MCP..."
 mkdir -p "$HOME/.cursor"
 
 if [[ -f "$CURSOR_MCP_FILE" ]]; then
     cp "$CURSOR_MCP_FILE" "$CURSOR_MCP_FILE.backup.$(date +%Y%m%d_%H%M%S)"
-    warn "Existing MCP config backed up"
+    warn "已备份现有 MCP 配置"
 fi
 
 python3 -c "
@@ -121,29 +121,29 @@ servers['feedback-gate'] = {
 with open(config_file, 'w') as f:
     json.dump({'mcpServers': servers}, f, indent=2)
 "
-ok "MCP configuration updated: $CURSOR_MCP_FILE"
+ok "MCP 配置已更新: $CURSOR_MCP_FILE"
 
-# --- Build & Install Cursor extension ---
+# --- 构建并安装 Cursor 扩展 ---
 VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/dev/null)
 
 if [[ -z "$VSIX_FILE" ]]; then
-    log "No .vsix found, building extension..."
+    log "未找到 .vsix，正在构建扩展..."
     if command -v npx &> /dev/null; then
         (cd "$SCRIPT_DIR/cursor-extension" && npx @vscode/vsce package --no-dependencies 2>/dev/null)
         VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/dev/null)
         if [[ -n "$VSIX_FILE" ]]; then
-            ok "Extension built: $(basename "$VSIX_FILE")"
+            ok "扩展构建成功: $(basename "$VSIX_FILE")"
         else
-            warn "Extension build failed — install manually later"
+            warn "扩展构建失败 — 请手动安装"
         fi
     else
-        warn "npx not found — cannot build extension automatically"
-        echo -e "  ${C_YELLOW}Install Node.js, then run: cd cursor-extension && npx @vscode/vsce package --no-dependencies${C_NC}"
+        warn "未找到 npx — 无法自动构建扩展"
+        echo -e "  ${C_YELLOW}请安装 Node.js 后执行: cd cursor-extension && npx @vscode/vsce package --no-dependencies${C_NC}"
     fi
 fi
 
 if [[ -n "$VSIX_FILE" ]]; then
-    log "Installing Cursor extension..."
+    log "安装 Cursor 扩展..."
     cp "$VSIX_FILE" "$INSTALL_DIR/"
 
     INSTALLED=false
@@ -154,39 +154,39 @@ if [[ -n "$VSIX_FILE" ]]; then
     fi
     if [[ -n "$CURSOR_BIN" && -x "$CURSOR_BIN" ]]; then
         if "$CURSOR_BIN" --install-extension "$VSIX_FILE" --force >/dev/null 2>&1; then
-            ok "Extension installed automatically"
+            ok "扩展安装成功"
             INSTALLED=true
         fi
     fi
 
     if [[ "$INSTALLED" == false ]]; then
         echo ""
-        warn "Auto-install failed. Manual steps:"
-        echo "  1. Open Cursor → Cmd+Shift+P → 'Extensions: Install from VSIX'"
-        echo "  2. Select: $VSIX_FILE"
-        echo "  3. Reload Window"
+        warn "自动安装失败，请手动操作："
+        echo "  1. 打开 Cursor → Cmd+Shift+P → 'Extensions: Install from VSIX'"
+        echo "  2. 选择: $VSIX_FILE"
+        echo "  3. 重新加载窗口"
     fi
 fi
 
-# --- Install Cursor Rule ---
+# --- 安装 Cursor 规则 ---
 if [[ -f "$SCRIPT_DIR/FeedbackGate.mdc" ]]; then
     CURSOR_RULES_DIR="$HOME/.cursor/rules"
     mkdir -p "$CURSOR_RULES_DIR"
     cp "$SCRIPT_DIR/FeedbackGate.mdc" "$CURSOR_RULES_DIR/"
-    ok "Rule installed to: $CURSOR_RULES_DIR/FeedbackGate.mdc"
+    ok "规则已安装: $CURSOR_RULES_DIR/FeedbackGate.mdc"
 fi
 
-# --- Clean up stale temp files ---
+# --- 清理临时文件 ---
 rm -f /tmp/feedback_gate_* /tmp/mcp_response* 2>/dev/null || true
 
-# --- Done ---
+# --- 完成 ---
 echo ""
-echo -e "${C_GREEN}✓ Feedback Gate Installation Complete!${C_NC}"
+echo -e "${C_GREEN}✓ Feedback Gate 安装完成！${C_NC}"
 echo ""
-echo "  MCP Server : $INSTALL_DIR"
-echo "  MCP Config : $CURSOR_MCP_FILE"
+echo "  MCP 服务器 : $INSTALL_DIR"
+echo "  MCP 配置   : $CURSOR_MCP_FILE"
 echo ""
-echo -e "${C_BLUE}Next steps:${C_NC}"
-echo "  1. Reload Cursor (Cmd+Shift+P → Reload Window)"
-echo "  2. Check status bar for green 'FeedBack' indicator"
+echo -e "${C_BLUE}下一步:${C_NC}"
+echo "  1. 重新加载 Cursor（Cmd+Shift+P → Reload Window）"
+echo "  2. 检查状态栏是否有绿色 'FeedBack' 指示"
 echo ""
