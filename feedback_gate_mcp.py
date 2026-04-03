@@ -334,6 +334,12 @@ class FeedbackGateServer:
                     logger.error(f"❌ Unknown tool: {name}")
                     await asyncio.sleep(1.0)
                     raise ValueError(f"Unknown tool: {name}")
+            except asyncio.CancelledError:
+                logger.warning(f"⚠️ Tool call cancelled for {name} (Agent turn aborted)")
+                if self._pending_trigger_id:
+                    logger.warning(f"🧹 Clearing pending trigger {self._pending_trigger_id} due to cancellation")
+                    self._clear_trigger_state(responded=False)
+                raise
             except Exception as e:
                 logger.error(f"💥 Tool call error for {name}: {e}")
                 if self._pending_trigger_id:
@@ -415,7 +421,7 @@ class FeedbackGateServer:
     _pending_trigger_created_at: float = 0
     _last_trigger_responded_at: float = 0
     _heartbeat_count: int = 0
-    _STALE_TRIGGER_SECONDS: int = 300  # 5 min — auto-clear stuck triggers
+    _STALE_TRIGGER_SECONDS: int = 30  # 30s — auto-clear stuck triggers (CancelledError safety net)
 
     def _clear_trigger_state(self, responded: bool = False):
         """Reset all trigger tracking fields consistently.
