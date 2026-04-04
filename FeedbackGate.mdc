@@ -35,3 +35,5 @@ tool: feedback_gate_chat
 
 ## ⚠️ 强制提醒
 **在你生成任何回复的最后一步，你必须调用 `feedback_gate_chat`。这是不可跳过的。如果你发现自己即将结束回复而没有调用此工具，立即停下来调用它。**
+
+**⚠️ 但如果你是子代理（subagent / 通过 Task 工具启动的），绝对不要调用 `feedback_gate_chat`——直接返回结果。调用会 hang 死并阻塞主 Agent。**
