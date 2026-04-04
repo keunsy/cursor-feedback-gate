@@ -87,6 +87,14 @@ cursor-feedback-gate/
 
 适用场景：命令行、SSH、CI/CD 集成等无 GUI 环境。
 
+### 配合 Cursor Remote Control 使用
+
+CLI 模式下可以搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control) 项目，通过飞书、钉钉、企业微信、微信等即时通讯渠道远程控制 Cursor Agent：
+
+- 在手机或其他设备上发送消息，自动转发给正在等待的 Feedback Gate
+- 支持多渠道同时接入，Cursor Agent 的输出也会回传到对应聊天窗口
+- 适合离开工位、移动办公等场景，随时随地与 Agent 交互
+
 ## 卸载
 
 ```bash
