@@ -64,7 +64,7 @@ function generateId() {
     return now * 1000 + (_idCounter % 1000);
 }
 
-function enqueueMessage(text, attachments, files) {
+function enqueueMessage(text, attachments, files, meta) {
     const safeAttachments = (attachments || []).map(att => {
         const largeField = att.base64Data || att.dataUrl || att.data;
         if (largeField && largeField.length > 500000) {
@@ -83,7 +83,10 @@ function enqueueMessage(text, attachments, files) {
         attachments: safeAttachments,
         files: files || [],
         status: 'pending',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        source: meta?.source || 'local',
+        sourceLabel: meta?.sourceLabel || '',
+        chatId: meta?.chatId || '',
     };
     messageQueue.push(item);
     saveQueue();

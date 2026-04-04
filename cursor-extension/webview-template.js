@@ -637,9 +637,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         <div class="review-header">
             <div class="review-title">${title}</div>
             <div class="review-author">by keunsy</div>
-            <div class="status-capsule" id="statusCapsule">
-                <div class="status-indicator" id="statusIndicator"></div>
-                <div class="mcp-status" id="mcpStatus">等待 Agent 调用</div>
+            <div class="status-capsule inactive" id="statusCapsule">
+                <div class="status-indicator inactive" id="statusIndicator"></div>
+                <div class="mcp-status" id="mcpStatus">MCP 未激活</div>
             </div>
         </div>
         
@@ -664,15 +664,15 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             <div id="queueList"></div>
         </div>
         
-        <div class="input-container" id="inputContainer">
+        <div class="input-container disabled" id="inputContainer">
             <div class="input-wrapper" id="inputWrapper">
                 <i id="micIcon" class="fas fa-microphone mic-icon active" title="点击说话"></i>
-                <textarea id="messageInput" class="message-input" placeholder="等待 Agent 调用… 也可直接输入" rows="1"></textarea>
-                <button id="attachButton" class="attach-button" title="Upload image">
+                <textarea id="messageInput" class="message-input" placeholder="等待 MCP 连接…" rows="1" disabled></textarea>
+                <button id="attachButton" class="attach-button" title="Upload image" disabled>
                     <i class="fas fa-image"></i>
                 </button>
             </div>
-            <button id="sendButton" class="send-button" title="${mcpIntegration ? '发送回复给 Agent' : '发送审查'}">
+            <button id="sendButton" class="send-button" title="${mcpIntegration ? '发送回复给 Agent' : '发送审查'}" disabled>
                 <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
             </button>
         </div>
@@ -1326,6 +1326,13 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             queueList.innerHTML = items.map((item, i) => {
                 const isPending = item.status === 'pending';
                 const pi = isPending ? pendingItems.findIndex(p => p.id === item.id) : -1;
+                const imgCount = (item.attachments || []).length;
+                const fileCount = (item.files || []).length;
+                const badges = [
+                    item.sourceLabel ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;">📨\${item.sourceLabel}</span>\` : '',
+                    imgCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${imgCount}张图片">🖼️\${imgCount > 1 ? imgCount : ''}</span>\` : '',
+                    fileCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${(item.files||[]).map(f=>f.name||f.path||'文件').join(', ')}">📎\${fileCount > 1 ? fileCount : ''}</span>\` : '',
+                ].filter(Boolean).join('');
                 return \`
                 <div class="queue-item" data-queue-id="\${item.id}">
                     \${isPending && pendingItems.length > 1 ? \`
@@ -1335,7 +1342,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                         </span>
                     \` : ''}
                     <span class="queue-item-num">\${i + 1}</span>
-                    <span class="queue-item-text" \${isPending ? \`onclick="startEditQueueItem(this, \${item.id})" title="点击编辑"\` : ''}>\${item.text}</span>
+                    <span class="queue-item-text" \${isPending ? \`onclick="startEditQueueItem(this, \${item.id})" title="点击编辑"\` : ''}>\${badges}\${item.text || (imgCount ? '图片' : '文件')}</span>
                     \${isPending ? \`
                         <span class="queue-item-actions">
                             <button class="queue-item-remove" onclick="removeQueueItem(\${item.id})" title="移除">✕</button>

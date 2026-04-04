@@ -15,6 +15,9 @@ let sidebarViewProvider = null;
 let feedbackGateWatcher = null;
 let outputChannel = null;
 let mcpStatus = false;
+let firstTriggerReceived = false;
+let lastTriggerTime = 0;
+const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 let statusCheckInterval = null;
 let currentTriggerData = null;
 let boundMcpPid = null;
@@ -22,6 +25,25 @@ let usePanelView = true;
 let feedbackGateEnabled = true;
 let statusBarItem = null;
 const processedTriggerIds = new Set();
+
+// ── IDE Queue (remote /ide messages) ───────────────
+const EXTENSION_PID = process.pid;
+const IDE_QUEUE_PATH = getTempPath(`feedback_gate_ide_queue_${EXTENSION_PID}.jsonl`);
+const IDE_QUEUE_GLOBAL_PATH = getTempPath('feedback_gate_ide_queue.jsonl');
+const IDE_QUEUE_GLOBAL_PROCESSING_PATH = IDE_QUEUE_GLOBAL_PATH + '.processing';
+const IDE_SESSION_PATH = getTempPath(`feedback_gate_session_${EXTENSION_PID}.json`);
+const extensionActivatedAt = Date.now();
+
+const SOURCE_LABELS = {
+    feishu: '飞书',
+    dingtalk: '钉钉',
+    wecom: '企微',
+    wechat: '微信',
+};
+
+// ── IDE Reply (V2 bidirectional feedback) ──────────
+const IDE_REPLY_PATH = getTempPath('feedback_gate_ide_reply.jsonl');
+let pendingRemoteReply = null;
 
 // Queue delegates — initialized in activate()
 const enqueueMessage = (...args) => queue.enqueueMessage(...args);
@@ -96,6 +118,7 @@ class FeedbackGatePanelProvider {
                 const currentTriggerId = (currentTriggerData && currentTriggerData.trigger_id) || null;
                 switch (webviewMessage.command) {
                     case 'send': {
+                        pendingRemoteReply = null;
                         enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
                         logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                         if (currentTriggerData && currentTriggerData.trigger_id) {
@@ -294,6 +317,9 @@ function activate(context) {
     queue.init(vscode, postToWebview);
     speech.init(postToWebview, outputChannel);
 
+    // Recover any leftover IDE queue .processing file from a previous crash
+    recoverIdeQueueProcessing();
+
     // Start MCP status monitoring immediately
     startMcpStatusMonitoring(context);
 
@@ -420,10 +446,11 @@ function checkMcpStatus() {
             try {
                 const dir = path.dirname(getTempPath('x'));
                 const prefix = 'feedback_gate_mcp_';
+                const myPid = process.pid;
                 fs.readdirSync(dir).filter(f => f.startsWith(prefix) && f.endsWith('.pid')).forEach(f => {
                     try {
                         const data = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-                        if (data.pid) {
+                        if (data.pid && data.ppid === myPid) {
                             process.kill(data.pid, 0);
                             active = true;
                         }
@@ -433,7 +460,7 @@ function checkMcpStatus() {
         }
 
         const wasActive = mcpStatus;
-        mcpStatus = active;
+        mcpStatus = active && firstTriggerReceived;
         if (wasActive !== mcpStatus) updateChatPanelStatus();
     } catch (error) {
         if (mcpStatus) {
@@ -522,7 +549,184 @@ function discoverMcpPid() {
     return null;
 }
 
+// ── IDE Queue processing ───────────────────────────
+
+function recoverIdeQueueProcessing() {
+    try {
+        const dir = path.dirname(IDE_QUEUE_PATH);
+        const base = path.basename(IDE_QUEUE_PATH);
+        const procMarker = `${base}.processing`;
+        let files = [];
+        try {
+            files = fs.readdirSync(dir);
+        } catch {
+            return;
+        }
+        for (const f of files) {
+            if (f !== procMarker && !f.startsWith(`${procMarker}.`)) continue;
+            const full = path.join(dir, f);
+            let isFile = false;
+            try {
+                isFile = fs.statSync(full).isFile();
+            } catch {
+                continue;
+            }
+            if (!isFile) continue;
+            console.log('Feedback Gate: recovering leftover IDE queue processing file', f);
+            consumeIdeQueueFile(full);
+        }
+    } catch {}
+}
+
+function clearLegacyIdeQueueProcessingIfPresent() {
+    try {
+        if (fs.existsSync(IDE_QUEUE_GLOBAL_PROCESSING_PATH)) {
+            console.log('Feedback Gate: clearing legacy IDE queue .processing file');
+            consumeIdeQueueFile(IDE_QUEUE_GLOBAL_PROCESSING_PATH);
+        }
+    } catch {}
+}
+
+function checkIdeQueueFile() {
+    clearLegacyIdeQueueProcessingIfPresent();
+    consumeQueueIfExists(IDE_QUEUE_PATH);
+    consumeQueueIfExists(IDE_QUEUE_GLOBAL_PATH);
+}
+
+function consumeQueueIfExists(queuePath) {
+    let processingPath;
+    try {
+        if (!fs.existsSync(queuePath)) return;
+        processingPath = `${queuePath}.processing.${EXTENSION_PID}.${Date.now()}.${Math.random().toString(36).slice(2, 9)}`;
+        fs.renameSync(queuePath, processingPath);
+    } catch {
+        return;
+    }
+    consumeIdeQueueFile(processingPath);
+}
+
+function consumeIdeQueueFile(filePath) {
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim());
+        let count = 0;
+        let stale = 0;
+
+        for (const line of lines) {
+            try {
+                const item = JSON.parse(line);
+                if (!item.text) continue;
+
+                if (item.ts && new Date(item.ts).getTime() < extensionActivatedAt) {
+                    stale++;
+                    continue;
+                }
+
+                enqueueMessage(item.text, [], [], {
+                    source: item.source,
+                    sourceLabel: SOURCE_LABELS[item.source] || item.source,
+                    chatId: item.chatId,
+                });
+                count++;
+
+                const label = SOURCE_LABELS[item.source] || item.source || '远程';
+                postToWebview({
+                    command: 'addMessage',
+                    text: `📨 来自${label}的消息已入队: ${item.text}`,
+                    type: 'system',
+                    plain: true
+                });
+            } catch {}
+        }
+
+        fs.unlinkSync(filePath);
+        if (count > 0 || stale > 0) {
+            console.log(`Feedback Gate: consumed ${count} IDE queue message(s), discarded ${stale} stale`);
+        }
+        if (count > 0 && currentTriggerData && currentTriggerData.trigger_id) {
+            processQueueForPendingTrigger(true);
+        }
+    } catch (e) {
+        try { fs.unlinkSync(filePath); } catch {}
+    }
+}
+
+// ── IDE Reply (V2 bidirectional) ───────────────────
+
+function maybeWriteOutbox(agentMessage) {
+    if (!pendingRemoteReply) return;
+    if (!agentMessage || agentMessage.length < 10) return;
+
+    const MAX_LEN = 500;
+    const truncated = agentMessage.length > MAX_LEN
+        ? agentMessage.slice(0, MAX_LEN) + '\n\n...（在 IDE 中查看完整内容）'
+        : agentMessage;
+
+    try {
+        const entry = JSON.stringify({
+            chatId: pendingRemoteReply.chatId,
+            platform: pendingRemoteReply.source,
+            originalText: pendingRemoteReply.originalText || '',
+            agentMessage: truncated,
+            ts: new Date().toISOString()
+        });
+        fs.appendFileSync(IDE_REPLY_PATH, entry + '\n');
+        pendingRemoteReply = null;
+    } catch {}
+}
+
+function registerIdeSession() {
+    try {
+        const folders = vscode.workspace.workspaceFolders;
+        const project = folders && folders.length > 0
+            ? path.basename(folders[0].uri.fsPath)
+            : 'unknown';
+        const cwd = folders && folders.length > 0
+            ? folders[0].uri.fsPath
+            : '';
+        const data = {
+            pid: EXTENSION_PID,
+            project,
+            cwd,
+            ts: new Date().toISOString()
+        };
+        fs.writeFileSync(IDE_SESSION_PATH, JSON.stringify(data));
+        console.log(`Feedback Gate: IDE session registered (pid=${EXTENSION_PID}, project=${project})`);
+    } catch (e) {
+        console.log(`Feedback Gate: failed to register IDE session: ${e.message}`);
+    }
+}
+
+function unregisterIdeSession() {
+    try { fs.unlinkSync(IDE_SESSION_PATH); } catch {}
+    try { fs.unlinkSync(IDE_QUEUE_PATH); } catch {}
+}
+
+function cleanupOrphanPidFiles() {
+    try {
+        const dir = path.dirname(getTempPath('x'));
+        const prefix = 'feedback_gate_mcp_';
+        for (const f of fs.readdirSync(dir).filter(f => f.startsWith(prefix) && f.endsWith('.pid'))) {
+            try {
+                const fullPath = path.join(dir, f);
+                const data = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+                if (data.ppid) {
+                    try { process.kill(data.ppid, 0); } catch {
+                        try {
+                            process.kill(data.pid, 15);
+                            fs.unlinkSync(fullPath);
+                            console.log(`Feedback Gate: cleaned orphan MCP pid=${data.pid} (parent ${data.ppid} dead)`);
+                        } catch {}
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+}
+
 function startFeedbackGateIntegration(context) {
+    cleanupOrphanPidFiles();
+    
     boundMcpPid = discoverMcpPid();
     if (boundMcpPid) {
         console.log(`Feedback Gate bound to MCP PID: ${boundMcpPid}`);
@@ -540,6 +744,21 @@ function startFeedbackGateIntegration(context) {
             checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${boundMcpPid}.json`));
         }
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
+        checkIdeQueueFile();
+        // Expire stale pendingRemoteReply (30 minutes)
+        if (pendingRemoteReply && Date.now() - pendingRemoteReply.enqueuedAt > 30 * 60 * 1000) {
+            pendingRemoteReply = null;
+        }
+        // Expire idle session after 2h without any trigger
+        if (firstTriggerReceived && lastTriggerTime > 0 && !currentTriggerData
+            && Date.now() - lastTriggerTime > SESSION_IDLE_TIMEOUT_MS) {
+            firstTriggerReceived = false;
+            lastTriggerTime = 0;
+            unregisterIdeSession();
+            mcpStatus = false;
+            updateChatPanelStatus();
+            console.log('Feedback Gate: session expired — idle for 2h');
+        }
     }, 250);
     
     feedbackGateWatcher = pollInterval;
@@ -598,10 +817,12 @@ function checkTriggerFile(context, filePath) {
             }
             
             if (boundMcpPid && triggerPid && triggerPid !== boundMcpPid) {
-                if (!isPidNamespaced) {
-                    // Legacy file with wrong PID — skip without deleting
+                if (triggerPpid === myPid) {
+                    boundMcpPid = triggerPid;
+                    console.log(`Feedback Gate: switched to MCP PID ${triggerPid} (same window, PPID match)`);
+                } else {
+                    return;
                 }
-                return;
             }
             
             // If we have no bound PID yet, try to bind via PPID match or process check
@@ -636,6 +857,12 @@ function checkTriggerFile(context, filePath) {
                 }
             }
             
+            lastTriggerTime = Date.now();
+            if (!firstTriggerReceived) {
+                firstTriggerReceived = true;
+                registerIdeSession();
+                updateChatPanelStatus();
+            }
             console.log(`Feedback Gate triggered: ${triggerData.data.tool} (PID: ${triggerPid})`);
             
             // Auto-passthrough when disabled
@@ -660,6 +887,18 @@ function checkTriggerFile(context, filePath) {
             if (getPendingQueueCount() > 0) {
                 const queueItem = dequeueMessage();
                 if (queueItem) {
+                    // Track remote source for V2 bidirectional feedback
+                    if (queueItem.source && queueItem.source !== 'local' && queueItem.chatId) {
+                        pendingRemoteReply = {
+                            chatId: queueItem.chatId,
+                            source: queueItem.source,
+                            originalText: queueItem.text || '',
+                            enqueuedAt: Date.now()
+                        };
+                    } else {
+                        pendingRemoteReply = null;
+                    }
+
                     const qTriggerId = triggerData.data && triggerData.data.trigger_id;
                     if (qTriggerId) {
                         const responseData = {
@@ -694,20 +933,26 @@ function checkTriggerFile(context, filePath) {
                                 toolData: triggerData.data,
                                 mcpIntegration: false
                             });
+                            // V2: write Agent message to IDE reply for remote source
+                            maybeWriteOutbox(agentMsg);
                         }
                         postToWebview({
                             command: 'addMessage',
                             text: queueItem.text,
                             type: 'user'
                         });
+                        const sourceTag = queueItem.sourceLabel
+                            ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
+                            : '⚡ 已从队列自动发送';
                         postToWebview({
                             command: 'addMessage',
-                            text: '⚡ 已从队列自动发送',
+                            text: sourceTag,
                             type: 'system',
                             plain: true
                         });
                     } else {
                         // No trigger ID — recover the queue item to pending
+                        pendingRemoteReply = null;
                         queueItem.status = 'pending';
                         delete queueItem.processingAt;
                         console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id`);
@@ -829,6 +1074,12 @@ function handleFeedbackGateToolCall(context, toolData) {
     
     // Force consistent title regardless of tool call
     popupOptions.title = "Feedback Gate";
+    
+    // V2: write Agent message to IDE reply for remote source
+    const agentMsgForOutbox = toolData.message || toolData.prompt || '';
+    if (agentMsgForOutbox) {
+        maybeWriteOutbox(agentMsgForOutbox);
+    }
     
     // Immediately open Feedback Gate popup when tools are triggered by Cursor Agent
     openFeedbackGatePopup(context, popupOptions);
@@ -1030,6 +1281,7 @@ function openFeedbackGatePopup(context, options = {}) {
             
             switch (webviewMessage.command) {
                 case 'send':
+                    pendingRemoteReply = null;
                     enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
                     logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                     if (currentTriggerData && currentTriggerData.trigger_id) {
@@ -1135,6 +1387,12 @@ function processQueueForPendingTrigger(directSend) {
     const queueItem = dequeueMessage();
     if (!queueItem) return;
 
+    if (queueItem.source && queueItem.source !== 'local' && queueItem.chatId) {
+        pendingRemoteReply = { chatId: queueItem.chatId, source: queueItem.source, originalText: queueItem.text || '', enqueuedAt: Date.now() };
+    } else {
+        pendingRemoteReply = null;
+    }
+
     const triggerId = currentTriggerData.trigger_id;
     const toolType = currentTriggerData.tool;
 
@@ -1166,10 +1424,14 @@ function processQueueForPendingTrigger(directSend) {
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
     postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user' });
+    const sourceTag = queueItem.sourceLabel
+        ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
+        : '⚡ 已从队列自动发送';
     if (directSend) {
+        postToWebview({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
         handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
     } else {
-        postToWebview({ command: 'addMessage', text: '⚡ 已从队列发送给 Agent', type: 'system', plain: true });
+        postToWebview({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
         currentTriggerData = null;
         setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
     }
@@ -1397,7 +1659,7 @@ function handleDroppedFile(filePath, triggerId) {
 }
 
 function deactivate() {
-    // Silent deactivation
+    unregisterIdeSession();
     
     if (feedbackGateWatcher) {
         clearInterval(feedbackGateWatcher);
