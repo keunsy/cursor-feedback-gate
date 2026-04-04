@@ -149,7 +149,7 @@ JSONL（每行一条 JSON），支持多进程安全追加：
 
 **会话注册**：Extension 启动时写 `/tmp/feedback_gate_session_{pid}.json`：
 ```json
-{"pid": 12345, "project": "cursor-feedback-gate", "cwd": "/Users/user/work/cursor/cursor-feedback-gate", "ts": "2026-04-04T12:00:00Z"}
+{"pid": 12345, "project": "my-project", "cwd": "/home/user/projects/my-project", "ts": "2026-04-04T12:00:00Z"}
 ```
 
 **消息路由**：`cursor-remote-control` 读取所有 session 文件获取活跃实例列表，用户通过 `#序号` 或 `#PID` 指定目标。
