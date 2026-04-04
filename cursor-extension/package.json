@@ -1,8 +1,8 @@
 {
   "name": "cursor-feedback-gate",
   "displayName": "Feedback Gate",
-  "description": "Feedback Gate - Agent 反馈关卡，MCP 集成 for Cursor IDE",
-  "version": "1.0.1",
+  "description": "Feedback Gate - Agent 反馈关卡，支持消息队列、远程控制集成、语音输入",
+  "version": "1.0.2",
   "author": "keunsy",
   "publisher": "keunsy",
   "icon": "icon.png",
@@ -21,7 +21,8 @@
     "mcp",
     "cursor",
     "agent",
-    "review",
+    "queue",
+    "remote-control",
     "chat"
   ],
   "activationEvents": [
