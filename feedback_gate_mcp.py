@@ -55,6 +55,16 @@ def get_temp_path(filename: str) -> str:
 # Configure logging with immediate flush
 log_file_path = get_temp_path('feedback_gate.log')
 
+# Backward compat: old extension checks feedback_gate_v2.log for MCP status
+_legacy_log = get_temp_path('feedback_gate_v2.log')
+try:
+    if os.path.islink(_legacy_log) or not os.path.exists(_legacy_log):
+        if os.path.islink(_legacy_log):
+            os.unlink(_legacy_log)
+        os.symlink(log_file_path, _legacy_log)
+except OSError:
+    pass
+
 from logging.handlers import RotatingFileHandler
 
 handlers = []
