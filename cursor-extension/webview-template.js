@@ -739,7 +739,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             }
         }
         
-        function addMessage(text, type = 'user', toolData = null, plain = false, isError = false) {
+        function addMessage(text, type = 'user', toolData = null, plain = false, isError = false, attachments = []) {
             messageCount++;
             const messageDiv = document.createElement('div');
             messageDiv.className = \`message \${type}\${plain ? ' plain' : ''}\`;
@@ -748,14 +748,28 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             contentDiv.className = plain ? 'message-content' : 'message-bubble';
             contentDiv.textContent = text;
             
-            // Add special styling for speech errors
             if (isError && plain) {
                 contentDiv.setAttribute('data-speech-error', 'true');
             }
             
             messageDiv.appendChild(contentDiv);
             
-            // Only add timestamp for non-plain messages
+            if (attachments && attachments.length > 0) {
+                const gallery = document.createElement('div');
+                gallery.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;padding:0 4px;';
+                attachments.forEach(img => {
+                    const src = img.base64Data || img.dataUrl || img.data || '';
+                    if (!src) return;
+                    const thumb = document.createElement('img');
+                    thumb.src = src;
+                    thumb.style.cssText = 'max-width:120px;max-height:80px;border-radius:6px;cursor:pointer;object-fit:cover;border:1px solid var(--vscode-panel-border);';
+                    thumb.title = img.fileName || '图片';
+                    thumb.onclick = () => { window.open(src); };
+                    gallery.appendChild(thumb);
+                });
+                messageDiv.appendChild(gallery);
+            }
+            
             if (!plain) {
                 const timeDiv = document.createElement('div');
                 timeDiv.className = 'message-time';
@@ -816,14 +830,22 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             _sendLock = true;
             setTimeout(() => { _sendLock = false; }, 300);
             
+            const sentImages = [...attachedImages];
+            const sentFiles = [...attachedFiles];
+            
             vscode.postMessage({
                 command: 'send',
                 text: text,
-                attachments: attachedImages,
-                files: attachedFiles,
+                attachments: sentImages,
+                files: sentFiles,
                 timestamp: new Date().toISOString(),
                 mcpIntegration: mcpIntegration
             });
+            
+            const displayParts = [];
+            if (text) displayParts.push(text);
+            if (sentFiles.length > 0) displayParts.push(sentFiles.map(f => '📎 ' + (f.name || f.path || '文件')).join('\\n'));
+            addMessage(displayParts.join('\\n') || '图片', 'user', null, false, false, sentImages);
             
             messageInput.value = '';
             attachedImages = [];
@@ -1229,10 +1251,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
             switch (message.command) {
                 case 'addMessage':
-                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false);
+                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments);
                     break;
                 case 'newMessage':
-                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false);
+                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments);
                     if (message.mcpIntegration) {
                         mcpIntegration = true;
                         messageInput.placeholder = 'Cursor Agent 正在等待你的回复…';

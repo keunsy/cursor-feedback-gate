@@ -936,11 +936,14 @@ function checkTriggerFile(context, filePath) {
                             // V2: write Agent message to IDE reply for remote source
                             maybeWriteOutbox(agentMsg);
                         }
-                        postToWebview({
-                            command: 'addMessage',
-                            text: queueItem.text,
-                            type: 'user'
-                        });
+                        if (queueItem.source && queueItem.source !== 'local') {
+                            postToWebview({
+                                command: 'addMessage',
+                                text: queueItem.text,
+                                type: 'user',
+                                attachments: queueItem.attachments
+                            });
+                        }
                         const sourceTag = queueItem.sourceLabel
                             ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
                             : '⚡ 已从队列自动发送';
@@ -1423,7 +1426,9 @@ function processQueueForPendingTrigger(directSend) {
     markQueueItemDone(queueItem.id);
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
-    postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user' });
+    if (queueItem.source && queueItem.source !== 'local') {
+        postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments });
+    }
     const sourceTag = queueItem.sourceLabel
         ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
         : '⚡ 已从队列自动发送';
