@@ -6,6 +6,11 @@
   "author": "keunsy",
   "publisher": "keunsy",
   "icon": "icon.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/keunsy/cursor-feedback-gate"
+  },
   "engines": {
     "vscode": "^1.74.0"
   },
