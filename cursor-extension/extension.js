@@ -11,6 +11,7 @@ const speech = require('./speech-handler');
 
 let chatPanel = null;
 let chatViewProvider = null;
+let sidebarViewProvider = null;
 let feedbackGateWatcher = null;
 let outputChannel = null;
 let mcpStatus = false;
@@ -33,9 +34,25 @@ const reorderQueue = (ids) => queue.reorderQueue(ids);
 const getPendingQueueCount = () => queue.getPendingQueueCount();
 const syncQueueToWebview = () => queue.syncToWebview();
 
+function getPreferredLocation() {
+    try {
+        return vscode.workspace.getConfiguration('feedbackGate').get('defaultLocation', 'panel');
+    } catch { return 'panel'; }
+}
+
 function getActiveWebview() {
-    if (usePanelView && chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
+    const pref = getPreferredLocation();
+    if (pref === 'sidebar' && sidebarViewProvider && sidebarViewProvider._view && sidebarViewProvider._view.webview) {
+        return sidebarViewProvider._view.webview;
+    }
+    if (pref === 'panel' && usePanelView && chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
         return chatViewProvider._view.webview;
+    }
+    if (chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
+        return chatViewProvider._view.webview;
+    }
+    if (sidebarViewProvider && sidebarViewProvider._view && sidebarViewProvider._view.webview) {
+        return sidebarViewProvider._view.webview;
     }
     if (chatPanel && chatPanel.webview) return chatPanel.webview;
     return null;
@@ -47,15 +64,18 @@ function postToWebview(message) {
         webview.postMessage(message);
         return true;
     }
-    if (chatViewProvider) {
-        chatViewProvider._pendingMessages.push(message);
+    const pref = getPreferredLocation();
+    const provider = (pref === 'sidebar' ? sidebarViewProvider : chatViewProvider) || sidebarViewProvider || chatViewProvider;
+    if (provider) {
+        provider._pendingMessages.push(message);
     }
     return false;
 }
 
 class FeedbackGatePanelProvider {
-    constructor(context) {
+    constructor(context, viewId) {
         this._context = context;
+        this._viewId = viewId;
         this._view = null;
         this._pendingMessages = [];
         this._mcpIntegration = true;
@@ -163,10 +183,10 @@ class FeedbackGatePanelProvider {
 
     async focusView() {
         try {
-            await vscode.commands.executeCommand('feedbackGate.chatView.focus');
+            await vscode.commands.executeCommand(`${this._viewId}.focus`);
             return true;
         } catch (e) {
-            console.log(`Failed to focus panel view: ${e.message}`);
+            console.log(`Failed to focus view ${this._viewId}: ${e.message}`);
             return false;
         }
     }
@@ -207,9 +227,9 @@ function activate(context) {
 
     context.subscriptions.push(disposable);
 
-    // Register bottom panel WebviewViewProvider (primary UI)
+    // Register bottom panel WebviewViewProvider
     try {
-        chatViewProvider = new FeedbackGatePanelProvider(context);
+        chatViewProvider = new FeedbackGatePanelProvider(context, 'feedbackGate.chatView');
         context.subscriptions.push(
             vscode.window.registerWebviewViewProvider('feedbackGate.chatView', chatViewProvider, {
                 webviewOptions: { retainContextWhenHidden: true }
@@ -219,6 +239,19 @@ function activate(context) {
     } catch (e) {
         console.log(`Feedback Gate: bottom panel registration failed, using editor tab fallback: ${e.message}`);
         usePanelView = false;
+    }
+
+    // Register sidebar WebviewViewProvider (Activity Bar)
+    try {
+        sidebarViewProvider = new FeedbackGatePanelProvider(context, 'feedbackGate.sidebarView');
+        context.subscriptions.push(
+            vscode.window.registerWebviewViewProvider('feedbackGate.sidebarView', sidebarViewProvider, {
+                webviewOptions: { retainContextWhenHidden: true }
+            })
+        );
+        console.log('Feedback Gate: sidebar view registered');
+    } catch (e) {
+        console.log(`Feedback Gate: sidebar registration failed: ${e.message}`);
     }
 
     // Restore persisted toggle state
@@ -411,11 +444,21 @@ function checkMcpStatus() {
 }
 
 function updateChatPanelStatus() {
-    postToWebview({
+    const msg = {
         command: 'updateMcpStatus',
         active: mcpStatus,
         hasPendingTrigger: !!currentTriggerData
-    });
+    };
+    // Broadcast status to all live views
+    if (chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
+        chatViewProvider._view.webview.postMessage(msg);
+    }
+    if (sidebarViewProvider && sidebarViewProvider._view && sidebarViewProvider._view.webview) {
+        sidebarViewProvider._view.webview.postMessage(msg);
+    }
+    if (chatPanel && chatPanel.webview) {
+        chatPanel.webview.postMessage(msg);
+    }
 }
 
 function discoverMcpPid() {
@@ -828,52 +871,71 @@ function openFeedbackGatePopup(context, options = {}) {
         toolData = null,
         mcpIntegration = false,
         triggerId = null,
-        specialHandling = null
+        specialHandling = null,
+        _forceEditor = false
     } = options;
     
     if (triggerId) {
         currentTriggerData = { ...toolData, trigger_id: triggerId };
     }
 
-    // --- Primary: use bottom panel WebviewView ---
-    if (usePanelView && chatViewProvider) {
+    const pref = getPreferredLocation();
+
+    // Build an ordered list of providers to try based on preference
+    const providerCandidates = [];
+    if (pref === 'sidebar') {
+        if (sidebarViewProvider) providerCandidates.push(sidebarViewProvider);
+        if (usePanelView && chatViewProvider) providerCandidates.push(chatViewProvider);
+    } else if (pref === 'panel') {
+        if (usePanelView && chatViewProvider) providerCandidates.push(chatViewProvider);
+        if (sidebarViewProvider) providerCandidates.push(sidebarViewProvider);
+    }
+    // pref === 'editor' falls through to the editor tab path below
+
+    if (!_forceEditor && pref !== 'editor' && providerCandidates.length > 0) {
         if (chatPanel) {
             try { chatPanel.dispose(); } catch {}
             chatPanel = null;
         }
-        if (chatViewProvider._view) {
-            chatViewProvider._mcpIntegration = mcpIntegration;
-            chatViewProvider._currentSpecialHandling = specialHandling;
-            if (mcpIntegration) {
-                setTimeout(() => {
-                    postToWebview({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
-                }, 100);
+
+        // Try each candidate in priority order
+        for (const provider of providerCandidates) {
+            if (provider._view) {
+                provider._mcpIntegration = mcpIntegration;
+                provider._currentSpecialHandling = specialHandling;
+                if (mcpIntegration) {
+                    setTimeout(() => {
+                        postToWebview({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
+                    }, 100);
+                }
+                if (mcpIntegration && message) {
+                    setTimeout(() => {
+                        postToWebview({
+                            command: 'newMessage',
+                            text: message,
+                            type: 'system',
+                            toolData: toolData,
+                            mcpIntegration: mcpIntegration
+                        });
+                    }, 150);
+                }
+                provider.focusView();
+                if (autoFocus) {
+                    setTimeout(() => { postToWebview({ command: 'focus' }); }, 200);
+                }
+                return;
             }
-            if (mcpIntegration && message) {
-                setTimeout(() => {
-                    postToWebview({
-                        command: 'newMessage',
-                        text: message,
-                        type: 'system',
-                        toolData: toolData,
-                        mcpIntegration: mcpIntegration
-                    });
-                }, 150);
-            }
-            chatViewProvider.focusView();
-            if (autoFocus) {
-                setTimeout(() => { postToWebview({ command: 'focus' }); }, 200);
-            }
-            return;
         }
-        // View not yet resolved — try to focus it (triggers resolveWebviewView)
-        chatViewProvider._mcpIntegration = mcpIntegration;
-        chatViewProvider._currentSpecialHandling = specialHandling;
+
+        // None resolved yet — try to focus the preferred provider (triggers resolveWebviewView)
+        const primary = providerCandidates[0];
+        primary._mcpIntegration = mcpIntegration;
+        primary._currentSpecialHandling = specialHandling;
         if (mcpIntegration) {
-            chatViewProvider._pendingMessages.push({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
+            primary._pendingMessages.push({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
         }
         if (mcpIntegration && message) {
-            chatViewProvider._pendingMessages.push({
+            primary._pendingMessages.push({
                 command: 'newMessage',
                 text: message,
                 type: 'system',
@@ -881,18 +943,43 @@ function openFeedbackGatePopup(context, options = {}) {
                 mcpIntegration: mcpIntegration
             });
         }
-        chatViewProvider.focusView().then(ok => {
-            if (!ok) {
-                console.log('Feedback Gate: bottom panel focus failed, falling back to editor tab');
+        primary.focusView().then(ok => {
+            if (!ok && providerCandidates.length > 1) {
+                const fallback = providerCandidates[1];
+                console.log(`Feedback Gate: preferred view focus failed, trying fallback`);
+                primary._pendingMessages = [];
+                fallback._mcpIntegration = mcpIntegration;
+                fallback._currentSpecialHandling = specialHandling;
+                if (mcpIntegration) {
+                    fallback._pendingMessages.push({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
+                }
+                if (mcpIntegration && message) {
+                    fallback._pendingMessages.push({
+                        command: 'newMessage',
+                        text: message,
+                        type: 'system',
+                        toolData: toolData,
+                        mcpIntegration: mcpIntegration
+                    });
+                }
+                fallback.focusView().then(ok2 => {
+                    if (!ok2) {
+                        console.log('Feedback Gate: all view providers failed, falling back to editor tab');
+                        fallback._pendingMessages = [];
+                        openFeedbackGatePopup(context, { ...options, _forceEditor: true });
+                    }
+                });
+            } else if (!ok) {
+                console.log('Feedback Gate: view focus failed, falling back to editor tab');
+                primary._pendingMessages = [];
                 usePanelView = false;
-                chatViewProvider._pendingMessages = [];
-                openFeedbackGatePopup(context, options);
+                openFeedbackGatePopup(context, { ...options, _forceEditor: true });
             }
         });
         return;
     }
 
-    // --- Fallback: use editor tab WebviewPanel (old behavior) ---
+    // --- Fallback: use editor tab WebviewPanel ---
 
     if (chatPanel) {
         chatPanel.reveal(vscode.ViewColumn.One);

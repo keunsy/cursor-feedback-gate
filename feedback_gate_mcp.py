@@ -302,7 +302,7 @@ class FeedbackGateServer:
             tools = [
                 Tool(
                     name="feedback_gate_chat",
-                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response for up to 72 hours. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply.",
+                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -362,80 +362,13 @@ class FeedbackGateServer:
                 await asyncio.sleep(1.0)
                 return [TextContent(type="text", text=f"ERROR: Tool {name} failed: {str(e)}")]
 
-    async def _handle_unified_feedback_gate(self, args: dict) -> list[TextContent]:
-        """Handle unified Feedback Gate tool for all user interaction needs"""
-        message = args.get("message", "Please provide your input:")
-        title = args.get("title", "Feedback Gate")
-        context = args.get("context", "")
-        mode = args.get("mode", "chat")
-        urgent = args.get("urgent", False)
-        timeout = args.get("timeout", 259200)  # Default 72 hours
-        
-        logger.info(f"🎯 UNIFIED Feedback Gate activated - Mode: {mode}")
-        logger.info(f"📝 Title: {title}")
-        logger.info(f"📄 Message: {message}")
-        logger.info(f"⏱️ Timeout: {timeout}s")
-        
-        # Create trigger file for Cursor extension IMMEDIATELY
-        trigger_id = f"unified_{mode}_{int(time.time() * 1000)}"
-        
-        # Adapt the tool name based on mode for compatibility
-        tool_name = "feedback_gate"
-        if mode == "quick":
-            tool_name = "quick_feedback"
-        elif mode == "file":
-            tool_name = "file_feedback"
-        elif mode == "ingest":
-            tool_name = "ingest_text"
-        elif mode == "confirm":
-            tool_name = "shutdown_mcp"
-        
-        # Force immediate trigger creation
-        success = await self._trigger_cursor_popup_immediately({
-            "tool": tool_name,
-            "message": message,
-            "title": title,
-            "context": context,
-            "urgent": urgent,
-            "mode": mode,
-            "trigger_id": trigger_id,
-            "timestamp": datetime.now().isoformat(),
-            "immediate_activation": True,
-            "unified_tool": True
-        })
-        
-        if success:
-            logger.info(f"🔥 UNIFIED POPUP TRIGGERED - waiting for user input (trigger_id: {trigger_id}, mode: {mode})")
-            
-            # Wait for user input with specified timeout
-            user_input = await self._wait_for_user_input(trigger_id, timeout=timeout)
-            
-            if user_input:
-                # Return user input directly to MCP client with mode context
-                logger.info(f"✅ RETURNING USER INPUT TO MCP CLIENT: {user_input[:100]}...")
-                result_message = f"✅ User Response (Mode: {mode})\n\n"
-                result_message += f"💬 Input: {user_input}\n"
-                result_message += f"📝 Request: {message}\n"
-                result_message += f"📍 Context: {context}\n"
-                result_message += f"⚙️ Mode: {mode}\n"
-                result_message += f"🚨 Urgent: {urgent}\n\n"
-                result_message += f"🎯 User interaction completed successfully via unified Feedback Gate tool."
-                
-                return [TextContent(type="text", text=result_message)]
-            else:
-                response = f"TIMEOUT: No user input received within {timeout} seconds (Mode: {mode})"
-                logger.warning(f"⚠️ Unified Feedback Gate timed out waiting for user input after {timeout} seconds")
-                return [TextContent(type="text", text=response)]
-        else:
-            response = f"ERROR: Failed to trigger unified Feedback Gate popup (Mode: {mode})"
-            return [TextContent(type="text", text=response)]
-
     # Track whether a feedback gate trigger is currently pending
     _pending_trigger_id: str | None = None
     _pending_trigger_created_at: float = 0
     _last_trigger_responded_at: float = 0
     _heartbeat_count: int = 0
-    _STALE_TRIGGER_SECONDS: int = 30  # 30s — auto-clear stuck triggers (CancelledError safety net)
+    _STALE_TRIGGER_SECONDS_CLI: int = 120   # 2min — stale for CLI mode (50s heartbeat)
+    _STALE_TRIGGER_SECONDS_IDE: int = 4200  # 70min — stale for IDE mode (55min heartbeat)
 
     def _clear_trigger_state(self, responded: bool = False):
         """Reset all trigger tracking fields consistently.
@@ -525,12 +458,16 @@ class FeedbackGateServer:
                     logger.info(f"📁 Added file reference to response: {name}")
             self._last_files = []
 
-    # Agent CLI has a hardcoded ~60s MCP tool timeout. In remote-control scenarios
-    # (cursor-remote-control) we must return before that deadline hits, otherwise
-    # Agent CLI receives -32001 and exits.  We use 50s as the wait ceiling so that
-    # there is comfortable margin.  For IDE usage the original 72h timeout applies.
+    # Agent CLI has a hardcoded ~60s MCP tool timeout.  We use 50s as the wait
+    # ceiling so there is comfortable margin.
     _REMOTE_WAIT_SECONDS = 50
     _REMOTE_MAX_TOTAL_SECONDS = 86400  # 24h max total wait for CLI
+
+    # Cursor IDE aborts MCP tool calls after exactly 1 hour (3600s).  After 2
+    # consecutive aborts the Agent model gives up entirely.  We return a heartbeat
+    # every 55 minutes so the call never hits the 1h limit.
+    _IDE_WAIT_SECONDS = 3300  # 55 minutes
+    _IDE_MAX_TOTAL_SECONDS = 259200  # 72h max total wait for IDE
 
     @staticmethod
     def _build_heartbeat_message(count: int, elapsed_min: float) -> str:
@@ -565,12 +502,13 @@ class FeedbackGateServer:
         is_remote = bool(self._find_routing_file())
         
         # If a previous trigger is still pending (no response yet), re-enter the
-        # wait loop instead of creating a new trigger.  This is critical for the
-        # remote-control flow: after we return WAITING due to the 50s ceiling the
-        # Agent will call feedback_gate_chat again and we resume waiting here.
+        # wait loop instead of creating a new trigger.  After the heartbeat ceiling
+        # (50s for CLI, 55min for IDE) we return a WAITING message and the Agent
+        # calls feedback_gate_chat again — we resume waiting here.
         if self._pending_trigger_id:
             stale_age = time.time() - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
-            if stale_age > self._STALE_TRIGGER_SECONDS:
+            stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
+            if stale_age > stale_limit:
                 logger.warning(f"🧹 Clearing stale pending trigger {self._pending_trigger_id} (age: {stale_age:.0f}s)")
                 self._clear_trigger_state(responded=False)
             else:
@@ -584,10 +522,13 @@ class FeedbackGateServer:
                         self._append_media_to_response(result)
                         return result
                     self._clear_trigger_state(responded=False)
-                elif is_remote:
-                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id}")
+                else:
+                    wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
+                    max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
+                    label = "CLI" if is_remote else "IDE"
+                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
                     user_input = await self._wait_for_user_input(
-                        self._pending_trigger_id, timeout=self._REMOTE_WAIT_SECONDS
+                        self._pending_trigger_id, timeout=wait_secs
                     )
                     if user_input:
                         self._clear_trigger_state(responded=True)
@@ -597,17 +538,15 @@ class FeedbackGateServer:
                         return result
                     else:
                         self._heartbeat_count += 1
-                        elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
+                        elapsed_total = self._heartbeat_count * wait_secs
                         elapsed_min = elapsed_total / 60
-                        if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
+                        if elapsed_total >= max_secs:
                             self._clear_trigger_state(responded=False)
-                            logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
-                            return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
-                        logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                            max_hours = max_secs / 3600
+                            logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min)")
+                            return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
+                        logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min, {label})")
                         return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
-                else:
-                    logger.info(f"⏭️ Feedback Gate skipped: previous trigger {self._pending_trigger_id} still pending")
-                    return [TextContent(type="text", text="SKIP: A Feedback Gate popup is already open. You MUST call feedback_gate_chat again in 5 seconds to check for user response. Do NOT end your turn without calling feedback_gate_chat.")]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
@@ -685,9 +624,11 @@ class FeedbackGateServer:
             else:
                 logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
-            wait_timeout = self._REMOTE_WAIT_SECONDS if is_remote else 259200
-            logger.info(f"⏳ Waiting for user input (timeout={wait_timeout}s, remote={is_remote})...")
-            user_input = await self._wait_for_user_input(trigger_id, timeout=wait_timeout)
+            wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
+            max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
+            label = "CLI" if is_remote else "IDE"
+            logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
+            user_input = await self._wait_for_user_input(trigger_id, timeout=wait_secs)
             
             if user_input:
                 self._clear_trigger_state(responded=True)
@@ -699,21 +640,16 @@ class FeedbackGateServer:
                 
                 return response_content
             else:
-                if is_remote:
-                    self._heartbeat_count += 1
-                    elapsed_total = self._heartbeat_count * self._REMOTE_WAIT_SECONDS
-                    elapsed_min = elapsed_total / 60
-                    if elapsed_total >= self._REMOTE_MAX_TOTAL_SECONDS:
-                        self._clear_trigger_state(responded=False)
-                        logger.warning(f"⏰ CLI wait exceeded 24h limit ({elapsed_min:.0f}min)")
-                        return [TextContent(type="text", text="TIMEOUT: No user input received within 24 hours (CLI limit). Stopping wait.")]
-                    logger.info(f"⏳ Remote wait timed out, returning WAITING (trigger {trigger_id} stays pending, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
-                    return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
-                else:
+                self._heartbeat_count += 1
+                elapsed_total = self._heartbeat_count * wait_secs
+                elapsed_min = elapsed_total / 60
+                if elapsed_total >= max_secs:
                     self._clear_trigger_state(responded=False)
-                    response = f"TIMEOUT: No user input received for feedback gate within 72 hours"
-                    logger.warning("⚠️ Feedback Gate timed out waiting for user input after 72 hours")
-                    return [TextContent(type="text", text=response)]
+                    max_hours = max_secs / 3600
+                    logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min)")
+                    return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
+                logger.info(f"⏳ {label} wait timed out, returning heartbeat (trigger {trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
         else:
             response = f"ERROR: Failed to trigger Feedback Gate popup"
             logger.error("❌ Failed to trigger Feedback Gate popup")
@@ -1013,7 +949,7 @@ class FeedbackGateServer:
         logger.warning(f"⏰ TIMEOUT waiting for extension acknowledgement (trigger_id: {trigger_id})")
         return False
 
-    async def _wait_for_user_input(self, trigger_id: str, timeout: int = 259200) -> Optional[str]:
+    async def _wait_for_user_input(self, trigger_id: str, timeout: int = 3300) -> Optional[str]:
         """Wait for user input — only check the trigger-ID-specific response file.
         
         Previously we also polled generic fallback files (feedback_gate_response.json,

@@ -2,7 +2,7 @@
   "name": "cursor-feedback-gate",
   "displayName": "Feedback Gate",
   "description": "Feedback Gate - Agent 反馈关卡，支持消息队列、远程控制集成、语音输入",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "keunsy",
   "publisher": "keunsy",
   "icon": "icon.png",
@@ -33,7 +33,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:feedbackGate.openChat",
-    "onView:feedbackGate.chatView"
+    "onView:feedbackGate.chatView",
+    "onView:feedbackGate.sidebarView"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -52,6 +53,13 @@
           "title": "Feedback Gate",
           "icon": "icon.png"
         }
+      ],
+      "activitybar": [
+        {
+          "id": "feedbackGateSidebar",
+          "title": "Feedback Gate",
+          "icon": "sidebar-icon.svg"
+        }
       ]
     },
     "views": {
@@ -61,7 +69,30 @@
           "id": "feedbackGate.chatView",
           "name": "Feedback Gate"
         }
+      ],
+      "feedbackGateSidebar": [
+        {
+          "type": "webview",
+          "id": "feedbackGate.sidebarView",
+          "name": "Feedback Gate"
+        }
       ]
+    },
+    "configuration": {
+      "title": "Feedback Gate",
+      "properties": {
+        "feedbackGate.defaultLocation": {
+          "type": "string",
+          "default": "panel",
+          "enum": ["panel", "sidebar", "editor"],
+          "enumDescriptions": [
+            "底部面板 (与 Terminal 同级)",
+            "左侧边栏 (Activity Bar 图标)",
+            "编辑器标签页"
+          ],
+          "description": "Feedback Gate 默认显示位置"
+        }
+      }
     }
   },
   "scripts": {
