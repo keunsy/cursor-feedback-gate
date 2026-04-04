@@ -941,7 +941,8 @@ function checkTriggerFile(context, filePath) {
                                 command: 'addMessage',
                                 text: queueItem.text,
                                 type: 'user',
-                                attachments: queueItem.attachments
+                                attachments: queueItem.attachments,
+                                files: queueItem.files
                             });
                         }
                         const sourceTag = queueItem.sourceLabel
@@ -1427,7 +1428,7 @@ function processQueueForPendingTrigger(directSend) {
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
     if (queueItem.source && queueItem.source !== 'local') {
-        postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments });
+        postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
     }
     const sourceTag = queueItem.sourceLabel
         ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`

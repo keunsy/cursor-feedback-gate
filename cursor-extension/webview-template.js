@@ -739,7 +739,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             }
         }
         
-        function addMessage(text, type = 'user', toolData = null, plain = false, isError = false, attachments = []) {
+        function addMessage(text, type = 'user', toolData = null, plain = false, isError = false, attachments = [], files = []) {
             messageCount++;
             const messageDiv = document.createElement('div');
             messageDiv.className = \`message \${type}\${plain ? ' plain' : ''}\`;
@@ -768,6 +768,21 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     gallery.appendChild(thumb);
                 });
                 messageDiv.appendChild(gallery);
+            }
+            
+            if (files && files.length > 0) {
+                const fileList = document.createElement('div');
+                fileList.style.cssText = 'margin-top:4px;padding:0 4px;font-size:12px;opacity:0.8;';
+                files.forEach(f => {
+                    const name = f.name || f.fileName || '';
+                    const fPath = f.path || f.filePath || '';
+                    const display = name || fPath.split('/').pop() || fPath.split('\\\\').pop() || '文件';
+                    const row = document.createElement('div');
+                    row.style.cssText = 'padding:2px 0;';
+                    row.textContent = '📎 ' + display + (fPath && name ? ' (' + fPath + ')' : '');
+                    fileList.appendChild(row);
+                });
+                messageDiv.appendChild(fileList);
             }
             
             if (!plain) {
@@ -842,10 +857,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 mcpIntegration: mcpIntegration
             });
             
-            const displayParts = [];
-            if (text) displayParts.push(text);
-            if (sentFiles.length > 0) displayParts.push(sentFiles.map(f => '📎 ' + (f.name || f.path || '文件')).join('\\n'));
-            addMessage(displayParts.join('\\n') || '图片', 'user', null, false, false, sentImages);
+            addMessage(text || (sentImages.length > 0 ? '图片' : '文件'), 'user', null, false, false, sentImages, sentFiles);
             
             messageInput.value = '';
             attachedImages = [];
@@ -1251,10 +1263,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
             switch (message.command) {
                 case 'addMessage':
-                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments);
+                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files);
                     break;
                 case 'newMessage':
-                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments);
+                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files);
                     if (message.mcpIntegration) {
                         mcpIntegration = true;
                         messageInput.placeholder = 'Cursor Agent 正在等待你的回复…';
