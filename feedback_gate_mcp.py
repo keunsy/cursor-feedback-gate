@@ -302,7 +302,7 @@ class FeedbackGateServer:
             tools = [
                 Tool(
                     name="feedback_gate_chat",
-                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply.",
+                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply. WARNING: If you are a subagent (launched via Task tool), DO NOT call this tool — it will hang and block the main Agent. Return your result directly instead.",
                     inputSchema={
                         "type": "object",
                         "properties": {
