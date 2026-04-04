@@ -98,7 +98,7 @@ for handler in logger.handlers:
 
 class FeedbackGateServer:
     def __init__(self):
-        self.server = Server("feedback-gate-v2")
+        self.server = Server("feedback-gate")
         self.setup_handlers()
         self.shutdown_requested = False
         self.shutdown_reason = ""
@@ -226,7 +226,7 @@ class FeedbackGateServer:
                 "pid": self._server_pid,
                 "ppid": os.getppid(),
                 "timestamp": datetime.now().isoformat(),
-                "system": "feedback-gate-v2"
+                "system": "feedback-gate"
             }
             pid_file.write_text(json.dumps(pid_data))
             logger.info(f"📝 PID file written: {pid_file} (PPID: {os.getppid()})")
@@ -809,7 +809,7 @@ class FeedbackGateServer:
             "tool": "quick_feedback",
             "prompt": prompt,
             "context": context,
-            "title": "Quick Feedback - Feedback Gate v2",
+            "title": "Quick Feedback - Feedback Gate",
             "trigger_id": trigger_id,
             "timestamp": datetime.now().isoformat(),
             "immediate_activation": True
@@ -846,7 +846,7 @@ class FeedbackGateServer:
             "tool": "file_feedback",
             "instruction": instruction,
             "file_types": file_types,
-            "title": "File Feedback - Feedback Gate v2",
+            "title": "File Feedback - Feedback Gate",
             "trigger_id": trigger_id,
             "timestamp": datetime.now().isoformat(),
             "immediate_activation": True
@@ -890,7 +890,7 @@ class FeedbackGateServer:
             "source": source,
             "context": context,
             "processing_mode": processing_mode,
-            "title": "Text Ingestion - Feedback Gate v2",
+            "title": "Text Ingestion - Feedback Gate",
             "message": f"Text to process: {text_content}",
             "trigger_id": trigger_id,
             "timestamp": datetime.now().isoformat(),
@@ -945,7 +945,7 @@ class FeedbackGateServer:
             "reason": reason,
             "immediate": immediate,
             "cleanup": cleanup,
-            "title": "Shutdown - Feedback Gate v2",
+            "title": "Shutdown - Feedback Gate",
             "trigger_id": trigger_id,
             "timestamp": datetime.now().isoformat(),
             "immediate_activation": True
@@ -1083,7 +1083,7 @@ class FeedbackGateServer:
             
             trigger_data = {
                 "timestamp": datetime.now().isoformat(),
-                "system": "feedback-gate-v2",
+                "system": "feedback-gate",
                 "editor": "cursor",
                 "data": data,
                 "pid": self._server_pid,
@@ -1173,7 +1173,7 @@ class FeedbackGateServer:
                 backup_data = {
                     "backup_id": i,
                     "timestamp": datetime.now().isoformat(),
-                    "system": "feedback-gate-v2",
+                    "system": "feedback-gate",
                     "data": data,
                     "pid": self._server_pid,
                     "ppid": os.getppid(),
@@ -1193,7 +1193,7 @@ class FeedbackGateServer:
         
         
         async with stdio_server() as (read_stream, write_stream):
-            logger.info("✅ Feedback Gate v2 server ACTIVE on stdio transport for Cursor")
+            logger.info("✅ Feedback Gate server ACTIVE on stdio transport for Cursor")
             
             # Create server run task
             server_task = asyncio.create_task(
@@ -1225,9 +1225,9 @@ class FeedbackGateServer:
                     pass
             
             if self.shutdown_requested:
-                logger.info(f"🛑 Feedback Gate v2 server shutting down: {self.shutdown_reason}")
+                logger.info(f"🛑 Feedback Gate server shutting down: {self.shutdown_reason}")
             else:
-                logger.info("🏁 Feedback Gate v2 server completed normally")
+                logger.info("🏁 Feedback Gate server completed normally")
 
     async def _heartbeat_logger(self):
         """Periodically update log file to keep MCP status active in extension"""
@@ -1489,8 +1489,8 @@ class FeedbackGateServer:
         return status
 
 async def main():
-    """Main entry point for Feedback Gate v2 with immediate activation"""
-    logger.info("🎬 STARTING Feedback Gate v2 MCP Server...")
+    """Main entry point for Feedback Gate MCP Server"""
+    logger.info("🎬 STARTING Feedback Gate MCP Server...")
     logger.info(f"Python version: {sys.version}")
     logger.info(f"Platform: {sys.platform}")
     logger.info(f"OS name: {os.name}")

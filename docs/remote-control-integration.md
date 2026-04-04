@@ -123,7 +123,7 @@ if (feedbackPending && !prompt.startsWith('/')) {
 ```json
 {
     "timestamp": "2026-04-02T12:00:00",
-    "system": "feedback-gate-v2",
+    "system": "feedback-gate",
     "editor": "cursor",
     "data": {
         "tool": "feedback_gate_chat",

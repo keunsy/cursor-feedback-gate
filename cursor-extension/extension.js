@@ -531,7 +531,7 @@ function checkTriggerFile(context, filePath) {
                 return;
             }
             
-            if (triggerData.system && triggerData.system !== 'feedback-gate-v2') {
+            if (triggerData.system && triggerData.system !== 'feedback-gate' && triggerData.system !== 'feedback-gate-v2') {
                 return;
             }
             
@@ -806,7 +806,7 @@ function sendExtensionAcknowledgement(triggerId, toolType) {
             timestamp: timestamp,
             trigger_id: triggerId,
             tool_type: toolType,
-            extension: 'feedback-gate-v2',
+            extension: 'feedback-gate',
             popup_activated: true
         };
         

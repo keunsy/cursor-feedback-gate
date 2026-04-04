@@ -39,7 +39,7 @@ async function handleSpeechToText(audioData, triggerId, isFilePath = false) {
         // Send to MCP server for transcription
         const transcriptionRequest = {
             timestamp: new Date().toISOString(),
-            system: "feedback-gate-v2",
+            system: "feedback-gate",
             editor: "cursor",
             data: {
                 tool: "speech_to_text",
