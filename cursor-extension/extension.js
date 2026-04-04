@@ -7,7 +7,6 @@ const { spawn } = require('child_process');
 const { getTempPath, getMimeType } = require('./utils');
 const queue = require('./queue-manager');
 const { getFeedbackGateHTML } = require('./webview-template');
-const speech = require('./speech-handler');
 
 let chatPanel = null;
 let chatViewProvider = null;
@@ -154,14 +153,6 @@ class FeedbackGatePanelProvider {
                         break;
                     case 'logImageRemoved':
                         logUserInput(`Image removed: ${webviewMessage.imageId}`, 'IMAGE_REMOVED', currentTriggerId);
-                        break;
-                    case 'startRecording':
-                        logUserInput('User started speech recording', 'SPEECH_START', currentTriggerId);
-                        speech.startNodeRecording(currentTriggerId);
-                        break;
-                    case 'stopRecording':
-                        logUserInput('User stopped speech recording', 'SPEECH_STOP', currentTriggerId);
-                        speech.stopNodeRecording(currentTriggerId);
                         break;
                     case 'dropFile':
                         handleDroppedFile(webviewMessage.filePath, currentTriggerId);
@@ -315,7 +306,6 @@ function activate(context) {
 
     // Initialize modules
     queue.init(vscode, postToWebview);
-    speech.init(postToWebview, outputChannel);
 
     // Recover any leftover IDE queue .processing file from a previous crash
     recoverIdeQueueProcessing();
@@ -1279,9 +1269,6 @@ function openFeedbackGatePopup(context, options = {}) {
         webviewMessage => {
             // Get trigger ID from current trigger data or passed options
             const currentTriggerId = (currentTriggerData && currentTriggerData.trigger_id) || triggerId;
-            console.log(`🔍 DEBUG: Speech command - currentTriggerData:`, currentTriggerData);
-            console.log(`🔍 DEBUG: Speech command - triggerId:`, triggerId);
-            console.log(`🔍 DEBUG: Speech command - currentTriggerId:`, currentTriggerId);
             
             switch (webviewMessage.command) {
                 case 'send':
@@ -1323,14 +1310,6 @@ function openFeedbackGatePopup(context, options = {}) {
                     break;
                 case 'dropFile':
                     handleDroppedFile(webviewMessage.filePath, currentTriggerId);
-                    break;
-                case 'startRecording':
-                    logUserInput('User started speech recording', 'SPEECH_START', currentTriggerId);
-                    speech.startNodeRecording(currentTriggerId);
-                    break;
-                case 'stopRecording':
-                    logUserInput('User stopped speech recording', 'SPEECH_STOP', currentTriggerId);
-                    speech.stopNodeRecording(currentTriggerId);
                     break;
                 case 'showError':
                     vscode.window.showErrorMessage(webviewMessage.message);

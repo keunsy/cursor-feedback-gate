@@ -37,22 +37,6 @@ if ! command -v python3 &> /dev/null; then
 fi
 ok "Python 3: $(python3 --version)"
 
-# --- 可选：安装 SoX（语音转文字） ---
-log "检查 SoX（语音功能，可选）..."
-if command -v sox &> /dev/null; then
-    ok "SoX 已安装"
-else
-    if [[ "$OS" == "macos" ]]; then
-        if command -v brew &> /dev/null; then
-            brew install sox 2>/dev/null || warn "SoX 安装失败 — 语音功能不可用"
-        else
-            warn "未找到 Homebrew — 跳过 SoX（语音功能不可用）"
-        fi
-    else
-        sudo apt-get update -qq && sudo apt-get install -y -qq sox 2>/dev/null || warn "SoX 安装失败 — 语音功能不可用"
-    fi
-fi
-
 # --- 创建安装目录 ---
 INSTALL_DIR="$HOME/cursor-extensions/feedback-gate"
 log "安装到 $INSTALL_DIR ..."
@@ -75,11 +59,6 @@ pip install --upgrade pip -q
 log "安装 Python 依赖..."
 pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"
 
-if pip install -q "faster-whisper>=1.0.0" 2>/dev/null; then
-    ok "faster-whisper 已安装（语音转文字可用）"
-else
-    warn "faster-whisper 安装失败 — 语音转文字不可用"
-fi
 
 deactivate
 ok "Python 环境就绪"

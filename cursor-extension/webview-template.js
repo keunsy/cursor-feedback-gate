@@ -180,17 +180,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             color: var(--vscode-foreground);
         }
         
-        /* Speech error message styling */
-        .message.system.plain .message-content[data-speech-error] {
-            background: rgba(255, 107, 53, 0.1);
-            border: 1px solid rgba(255, 107, 53, 0.3);
-            color: var(--vscode-errorForeground);
-            font-weight: 500;
-            opacity: 1;
-            padding: 12px 16px;
-            border-radius: 8px;
-        }
-        
         .message-time {
             font-size: 11px;
             opacity: 0.5;
@@ -226,44 +215,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             position: relative;
         }
         
-        .mic-icon {
-            position: absolute;
-            left: 16px;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--vscode-input-placeholderForeground);
-            font-size: 14px;
-            pointer-events: none;
-            opacity: 0.7;
-            transition: all 0.2s ease;
-        }
-        
-        .mic-icon.active {
-            color: rgba(255, 255, 255, 0.55);
-            opacity: 1;
-            pointer-events: auto;
-            cursor: pointer;
-        }
-        
-        .mic-icon.active:hover {
-            color: rgba(255, 255, 255, 0.85);
-        }
-        
-        .mic-icon.recording {
-            color: #ff3333;
-            animation: pulse 1.5s infinite;
-        }
-        
-        .mic-icon.processing {
-            color: rgba(255, 255, 255, 0.55);
-            animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-            0% { transform: translateY(-50%) rotate(0deg); }
-            100% { transform: translateY(-50%) rotate(360deg); }
-        }
-        
         .input-wrapper:focus-within {
             border-color: transparent;
             box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5), 0 0 8px rgba(59, 130, 246, 0.25);
@@ -286,7 +237,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             font-family: inherit;
             font-size: 14px;
             line-height: 1.4;
-            padding-left: 24px; /* Make room for mic icon */
+            padding-left: 4px;
         }
         
         .message-input:focus {
@@ -666,7 +617,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         <div class="input-container disabled" id="inputContainer">
             <div class="input-wrapper" id="inputWrapper">
-                <i id="micIcon" class="fas fa-microphone mic-icon active" title="点击说话"></i>
                 <textarea id="messageInput" class="message-input" placeholder="等待 MCP 连接…" rows="1" disabled></textarea>
                 <button id="attachButton" class="attach-button" title="Upload image" disabled>
                     <i class="fas fa-image"></i>
@@ -685,7 +635,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
         const attachButton = document.getElementById('attachButton');
-        const micIcon = document.getElementById('micIcon');
         const typingIndicator = document.getElementById('typingIndicator');
         const statusIndicator = document.getElementById('statusIndicator');
         const statusCapsule = document.getElementById('statusCapsule');
@@ -700,8 +649,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         let mcpActive = false;
         let mcpIntegration = ${mcpIntegration};
         let attachedImages = []; // Store uploaded images
-        let isRecording = false;
-        let mediaRecorder = null;
         
         function updateMcpStatus(active, hasPendingTrigger) {
             mcpActive = active;
@@ -739,7 +686,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             }
         }
         
-        function addMessage(text, type = 'user', toolData = null, plain = false, isError = false, attachments = [], files = []) {
+        function addMessage(text, type = 'user', toolData = null, plain = false, _unused = false, attachments = [], files = []) {
             messageCount++;
             const messageDiv = document.createElement('div');
             messageDiv.className = \`message \${type}\${plain ? ' plain' : ''}\`;
@@ -747,10 +694,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             const contentDiv = document.createElement('div');
             contentDiv.className = plain ? 'message-content' : 'message-bubble';
             contentDiv.textContent = text;
-            
-            if (isError && plain) {
-                contentDiv.setAttribute('data-speech-error', 'true');
-            }
             
             messageDiv.appendChild(contentDiv);
             
@@ -796,33 +739,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
         
-        function addSpeechError(errorMessage) {
-            // Add prominent error message with special styling
-            addMessage('🎤 Speech Error: ' + errorMessage, 'system', null, true, true);
-            
-            // Add helpful troubleshooting tips based on error type
-            let tip = '';
-            if (errorMessage.includes('permission') || errorMessage.includes('Permission')) {
-                tip = '💡 Grant microphone access in system settings';
-            } else if (errorMessage.includes('busy') || errorMessage.includes('device')) {
-                tip = '💡 Close other recording apps and try again';
-            } else if (errorMessage.includes('SoX') || errorMessage.includes('sox')) {
-                tip = '💡 SoX audio tool may need to be installed or updated';
-            } else if (errorMessage.includes('timeout')) {
-                tip = '💡 Try speaking more clearly or check microphone connection';
-            } else if (errorMessage.includes('Whisper') || errorMessage.includes('transcription')) {
-                tip = '💡 Speech-to-text service may be unavailable';
-            } else {
-                tip = '💡 Check microphone permissions and try again';
-            }
-            
-            if (tip) {
-                setTimeout(() => {
-                    addMessage(tip, 'system', null, true);
-                }, 500);
-            }
-        }
-        
         function showTyping() {
             typingIndicator.style.display = 'flex';
         }
@@ -865,8 +781,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
             document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
             adjustTextareaHeight();
-            
-            toggleMicIcon();
         }
         
         function adjustTextareaHeight() {
@@ -1139,89 +1053,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             return false;
         }
         
-        // Hide/show mic icon based on input
-        function toggleMicIcon() {
-            // Don't toggle if we're currently recording or processing
-            if (isRecording || micIcon.classList.contains('processing')) {
-                return;
-            }
-            
-            if (messageInput.value.trim().length > 0) {
-                micIcon.style.opacity = '0';
-                micIcon.style.pointerEvents = 'none';
-            } else {
-                // Always ensure mic is visible and clickable when input is empty
-                micIcon.style.opacity = '0.7';
-                micIcon.style.pointerEvents = 'auto';
-                // Ensure proper mic icon state
-                if (!micIcon.classList.contains('fa-microphone')) {
-                    micIcon.className = 'fas fa-microphone mic-icon active';
-                }
-            }
-        }
-        
-        // Check if speech recording is available
-        function isSpeechAvailable() {
-            return (
-                navigator.mediaDevices && 
-                navigator.mediaDevices.getUserMedia && 
-                typeof MediaRecorder !== 'undefined'
-            );
-        }
-        
-        // Speech recording functions - using Node.js backend
-        function startRecording() {
-            // Start recording via extension backend
-            vscode.postMessage({
-                command: 'startRecording',
-                timestamp: new Date().toISOString()
-            });
-            
-            isRecording = true;
-            // Change icon to stop icon and add recording state
-            micIcon.className = 'fas fa-stop mic-icon recording';
-            micIcon.title = '录音中… 点击停止';
-            console.log('🎤 Recording started - UI updated to stop icon');
-        }
-        
-        function stopRecording() {
-            // Stop recording via extension backend
-            vscode.postMessage({
-                command: 'stopRecording',
-                timestamp: new Date().toISOString()
-            });
-            
-            isRecording = false;
-            // Change to processing state
-            micIcon.className = 'fas fa-spinner mic-icon processing';
-            micIcon.title = '正在处理语音…';
-            messageInput.placeholder = '正在处理语音… 请稍候';
-            console.log('🔄 Recording stopped - processing speech...');
-        }
-        
-        function resetMicIcon() {
-            // Reset to normal microphone state
-            isRecording = false; // Ensure recording flag is cleared
-            micIcon.className = 'fas fa-microphone mic-icon active';
-            micIcon.title = '点击说话';
-            messageInput.placeholder = mcpIntegration ? 'Cursor Agent 正在等待你的回复…' : '请输入你的审查反馈…';
-            
-            // Force visibility based on input state
-            if (messageInput.value.trim().length === 0) {
-                micIcon.style.opacity = '0.7';
-                micIcon.style.pointerEvents = 'auto';
-            } else {
-                micIcon.style.opacity = '0';
-                micIcon.style.pointerEvents = 'none';
-            }
-            
-            console.log('🎤 Mic icon reset to normal state');
-        }
-        
         // Event listeners
         messageInput.addEventListener('input', () => {
             adjustTextareaHeight();
-            toggleMicIcon();
         });
         
         messageInput.addEventListener('keydown', (e) => {
@@ -1247,14 +1081,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         attachButton.addEventListener('click', () => {
             vscode.postMessage({ command: 'uploadImage' });
-        });
-        
-        micIcon.addEventListener('click', () => {
-            if (isRecording) {
-                stopRecording();
-            } else {
-                startRecording();
-            }
         });
         
         // Handle messages from extension
@@ -1287,64 +1113,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 case 'syncQueue':
                     renderQueue(message.items, message.pendingCount);
                     break;
-                case 'recordingStarted':
-                    console.log('✅ Recording confirmation received from backend');
-                    break;
-                case 'speechTranscribed':
-                    // Handle speech-to-text result
-                    console.log('📝 Speech transcription received:', message);
-                    if (message.transcription && message.transcription.trim()) {
-                        messageInput.value = message.transcription.trim();
-                        adjustTextareaHeight();
-                        messageInput.focus();
-                        console.log('✅ Text injected into input:', message.transcription.trim());
-                        // Reset mic icon after successful transcription
-                        resetMicIcon();
-                    } else if (message.error) {
-                        console.error('❌ Speech transcription error:', message.error);
-                        
-                        // Show prominent error message in chat
-                        addSpeechError(message.error);
-                        
-                        // Also show in placeholder briefly
-                        const originalPlaceholder = messageInput.placeholder;
-                        messageInput.placeholder = '语音识别失败 - 请重试';
-                        setTimeout(() => {
-                            messageInput.placeholder = originalPlaceholder;
-                            resetMicIcon();
-                        }, 3000);
-                    } else {
-                        console.log('⚠️ Empty transcription received');
-                        
-                        // Show helpful message in chat
-                        addMessage('🎤 未检测到语音 - 请清晰说话后重试', 'system', null, true);
-                        
-                        const originalPlaceholder = messageInput.placeholder;
-                        messageInput.placeholder = '未检测到语音 - 请重试';
-                        setTimeout(() => {
-                            messageInput.placeholder = originalPlaceholder;
-                            resetMicIcon();
-                        }, 3000);
-                    }
-                    break;
             }
         });
-        
-        // Initialize speech availability - now using SoX directly
-        function initializeSpeech() {
-            // Always available since we're using SoX directly
-            micIcon.style.opacity = '0.7';
-            micIcon.style.pointerEvents = 'auto';
-            micIcon.title = '点击说话（SoX 录音）';
-            micIcon.classList.add('active');
-            console.log('Speech recording available via SoX direct recording');
-            
-            // Ensure mic icon visibility on initialization
-            if (messageInput.value.trim().length === 0) {
-                micIcon.style.opacity = '0.7';
-                micIcon.style.pointerEvents = 'auto';
-            }
-        }
         
         function renderQueue(items, pendingCount) {
             if (!items || items.length === 0) {
@@ -1441,7 +1211,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         // Initialize
         vscode.postMessage({ command: 'ready' });
-        initializeSpeech();
         
         // Focus input immediately
         setTimeout(() => {
