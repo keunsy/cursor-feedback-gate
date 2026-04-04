@@ -9,6 +9,8 @@ alwaysApply: true
 ## 核心规则
 完成用户请求后，**禁止直接结束回复**。必须调用 `feedback_gate_chat` MCP 工具打开弹窗，等待用户反馈。只有用户在弹窗中回复 "TASK_COMPLETE"、"Done" 等完成信号后才可结束。
 
+**⚠️ 子代理（subagent）严禁调用 `feedback_gate_chat`！** 子代理中 MCP 不可用，调用会 hang 死并阻塞主 Agent。如果你是通过 Task 工具启动的子代理，直接返回结果，不要调用此工具。
+
 ## 工作流程
 
 1. **执行任务**：正常完成用户请求（编码、分析、工具调用等）。
