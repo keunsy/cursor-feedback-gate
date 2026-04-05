@@ -701,7 +701,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 const gallery = document.createElement('div');
                 gallery.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;padding:0 4px;';
                 attachments.forEach(img => {
-                    const src = img.base64Data || img.dataUrl || img.data || '';
+                    const src = img.dataUrl || (img.base64Data ? \`data:\${img.mimeType || 'image/png'};base64,\${img.base64Data}\` : '') || img.data || '';
                     if (!src) return;
                     const thumb = document.createElement('img');
                     thumb.src = src;
@@ -1196,7 +1196,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
             input.addEventListener('blur', commitEdit);
             input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+                if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); input.blur(); }
                 if (e.key === 'Escape') { input.value = currentText; input.blur(); }
             });
         }

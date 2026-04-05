@@ -30,12 +30,40 @@ else
 fi
 ok "操作系统: $OS"
 
-# --- 检查 Python 3 ---
-if ! command -v python3 &> /dev/null; then
-    err "需要 Python 3，但未安装"
+# --- 检查 Python 3.10+ ---
+PYTHON_CMD=""
+
+find_suitable_python() {
+    for cmd in python3.13 python3.12 python3.11 python3.10 python3; do
+        if command -v "$cmd" &> /dev/null; then
+            local ver_major ver_minor
+            ver_major=$($cmd -c 'import sys; print(sys.version_info.major)' 2>/dev/null)
+            ver_minor=$($cmd -c 'import sys; print(sys.version_info.minor)' 2>/dev/null)
+            if [[ "$ver_major" -eq 3 ]] && [[ "$ver_minor" -ge 10 ]]; then
+                PYTHON_CMD="$cmd"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+if ! find_suitable_python; then
+    err "需要 Python 3.10+，未找到合适的 Python"
+    if command -v python3 &> /dev/null; then
+        echo -e "  当前 python3: $(python3 --version)（版本过低）"
+    fi
+    echo ""
+    echo -e "  ${C_YELLOW}请安装 Python 3.10+:${C_NC}"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "    brew install python@3.12"
+    else
+        echo "    sudo apt-get install python3.12 python3.12-venv"
+        echo "    或使用 pyenv: pyenv install 3.12 && pyenv global 3.12"
+    fi
     exit 1
 fi
-ok "Python 3: $(python3 --version)"
+ok "Python: $($PYTHON_CMD --version) [$(command -v $PYTHON_CMD)]"
 
 # --- 创建安装目录 ---
 INSTALL_DIR="$HOME/cursor-extensions/feedback-gate"
@@ -47,18 +75,40 @@ cp "$SCRIPT_DIR/feedback_gate_mcp.py" "$INSTALL_DIR/"
 # --- Python 虚拟环境 ---
 log "配置 Python 虚拟环境..."
 if [[ "$OS" == "linux" ]]; then
-    dpkg -s python3-venv >/dev/null 2>&1 || sudo apt-get install -y python3-venv
+    PY_MINOR_VER=$($PYTHON_CMD -c 'import sys; print(sys.version_info.minor)')
+    dpkg -s "python3.${PY_MINOR_VER}-venv" >/dev/null 2>&1 || \
+        dpkg -s python3-venv >/dev/null 2>&1 || \
+        sudo apt-get install -y "python3.${PY_MINOR_VER}-venv" || \
+        sudo apt-get install -y python3-venv
+fi
+
+if [[ -d "$INSTALL_DIR/venv" ]]; then
+    VENV_PY="$INSTALL_DIR/venv/bin/python"
+    if [[ ! -x "$VENV_PY" ]] || ! "$VENV_PY" -c 'import sys; assert sys.version_info >= (3,10)' 2>/dev/null; then
+        warn "旧虚拟环境 Python 版本不兼容，重建..."
+        rm -rf "$INSTALL_DIR/venv"
+    fi
 fi
 
 if [[ ! -d "$INSTALL_DIR/venv" ]]; then
-    python3 -m venv "$INSTALL_DIR/venv"
+    $PYTHON_CMD -m venv "$INSTALL_DIR/venv"
 fi
 source "$INSTALL_DIR/venv/bin/activate"
 pip install --upgrade pip -q
 
 log "安装 Python 依赖..."
-pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"
-
+if ! pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"; then
+    err "Python 依赖安装失败"
+    echo -e "  ${C_YELLOW}常见原因:${C_NC}"
+    echo "    1. Python 版本 < 3.10（mcp 包要求 3.10+）"
+    echo "    2. pip 版本过旧（已自动升级）"
+    echo "    3. 网络问题，请检查代理设置"
+    echo ""
+    echo "  当前 Python: $($PYTHON_CMD --version)"
+    echo "  尝试手动安装: pip install \"mcp>=1.9.2\" \"Pillow>=10.0.0\""
+    deactivate
+    exit 1
+fi
 
 deactivate
 ok "Python 环境就绪"
@@ -73,7 +123,7 @@ if [[ -f "$CURSOR_MCP_FILE" ]]; then
     warn "已备份现有 MCP 配置"
 fi
 
-python3 -c "
+$PYTHON_CMD -c "
 import json, os
 
 config_file = '$CURSOR_MCP_FILE'

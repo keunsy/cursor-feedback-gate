@@ -93,6 +93,30 @@ function postToWebview(message) {
     return false;
 }
 
+function broadcastToAllWebviews(message) {
+    let sent = false;
+    if (chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
+        chatViewProvider._view.webview.postMessage(message);
+        sent = true;
+    }
+    if (sidebarViewProvider && sidebarViewProvider._view && sidebarViewProvider._view.webview) {
+        sidebarViewProvider._view.webview.postMessage(message);
+        sent = true;
+    }
+    if (chatPanel && chatPanel.webview) {
+        chatPanel.webview.postMessage(message);
+        sent = true;
+    }
+    if (!sent) {
+        const pref = getPreferredLocation();
+        const provider = (pref === 'sidebar' ? sidebarViewProvider : chatViewProvider) || sidebarViewProvider || chatViewProvider;
+        if (provider) {
+            provider._pendingMessages.push(message);
+        }
+    }
+    return sent;
+}
+
 class FeedbackGatePanelProvider {
     constructor(context, viewId) {
         this._context = context;
@@ -228,8 +252,8 @@ function activate(context) {
     outputChannel = vscode.window.createOutputChannel('Feedback Gate');
     context.subscriptions.push(outputChannel);
     
-    // Silent activation - only log to console, not output channel
     console.log('Feedback Gate extension activated for Cursor MCP integration');
+    console.log(`Feedback Gate: EXTENSION_PID=${EXTENSION_PID}, IDE_QUEUE_PATH=${IDE_QUEUE_PATH}`);
 
     // Register command to open Feedback Gate manually
     let disposable = vscode.commands.registerCommand('feedbackGate.openChat', () => {
@@ -305,7 +329,7 @@ function activate(context) {
     );
 
     // Initialize modules
-    queue.init(vscode, postToWebview);
+    queue.init(vscode, broadcastToAllWebviews);
 
     // Recover any leftover IDE queue .processing file from a previous crash
     recoverIdeQueueProcessing();
@@ -581,6 +605,18 @@ function checkIdeQueueFile() {
     clearLegacyIdeQueueProcessingIfPresent();
     consumeQueueIfExists(IDE_QUEUE_PATH);
     consumeQueueIfExists(IDE_QUEUE_GLOBAL_PATH);
+    try {
+        const dir = path.dirname(IDE_QUEUE_PATH);
+        const prefix = 'feedback_gate_ide_queue_';
+        const myFile = path.basename(IDE_QUEUE_PATH);
+        const globalFile = path.basename(IDE_QUEUE_GLOBAL_PATH);
+        for (const f of fs.readdirSync(dir)) {
+            if (f === myFile || f === globalFile) continue;
+            if (f.startsWith(prefix) && f.endsWith('.jsonl') && !f.includes('.processing')) {
+                consumeQueueIfExists(path.join(dir, f));
+            }
+        }
+    } catch {}
 }
 
 function consumeQueueIfExists(queuePath) {
@@ -589,9 +625,11 @@ function consumeQueueIfExists(queuePath) {
         if (!fs.existsSync(queuePath)) return;
         processingPath = `${queuePath}.processing.${EXTENSION_PID}.${Date.now()}.${Math.random().toString(36).slice(2, 9)}`;
         fs.renameSync(queuePath, processingPath);
-    } catch {
+    } catch (e) {
+        console.log(`Feedback Gate: IDE queue rename failed for ${queuePath}: ${e.message}`);
         return;
     }
+    console.log(`Feedback Gate: consuming IDE queue from ${path.basename(queuePath)}`);
     consumeIdeQueueFile(processingPath);
 }
 
@@ -620,7 +658,7 @@ function consumeIdeQueueFile(filePath) {
                 count++;
 
                 const label = SOURCE_LABELS[item.source] || item.source || '远程';
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `📨 来自${label}的消息已入队: ${item.text}`,
                     type: 'system',
@@ -716,6 +754,7 @@ function cleanupOrphanPidFiles() {
 
 function startFeedbackGateIntegration(context) {
     cleanupOrphanPidFiles();
+    registerIdeSession();
     
     boundMcpPid = discoverMcpPid();
     if (boundMcpPid) {
@@ -850,9 +889,9 @@ function checkTriggerFile(context, filePath) {
             lastTriggerTime = Date.now();
             if (!firstTriggerReceived) {
                 firstTriggerReceived = true;
-                registerIdeSession();
                 updateChatPanelStatus();
             }
+            registerIdeSession();
             console.log(`Feedback Gate triggered: ${triggerData.data.tool} (PID: ${triggerPid})`);
             
             // Auto-passthrough when disabled
@@ -916,18 +955,17 @@ function checkTriggerFile(context, filePath) {
                         
                         const agentMsg = triggerData.data.message || triggerData.data.prompt || '';
                         if (agentMsg) {
-                            postToWebview({
+                            broadcastToAllWebviews({
                                 command: 'newMessage',
                                 text: agentMsg,
                                 type: 'system',
                                 toolData: triggerData.data,
                                 mcpIntegration: false
                             });
-                            // V2: write Agent message to IDE reply for remote source
                             maybeWriteOutbox(agentMsg);
                         }
                         if (queueItem.source && queueItem.source !== 'local') {
-                            postToWebview({
+                            broadcastToAllWebviews({
                                 command: 'addMessage',
                                 text: queueItem.text,
                                 type: 'user',
@@ -938,7 +976,7 @@ function checkTriggerFile(context, filePath) {
                         const sourceTag = queueItem.sourceLabel
                             ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
                             : '⚡ 已从队列自动发送';
-                        postToWebview({
+                        broadcastToAllWebviews({
                             command: 'addMessage',
                             text: sourceTag,
                             type: 'system',
@@ -1150,12 +1188,12 @@ function openFeedbackGatePopup(context, options = {}) {
                 provider._currentSpecialHandling = specialHandling;
                 if (mcpIntegration) {
                     setTimeout(() => {
-                        postToWebview({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
+                        broadcastToAllWebviews({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
                     }, 100);
                 }
                 if (mcpIntegration && message) {
                     setTimeout(() => {
-                        postToWebview({
+                        broadcastToAllWebviews({
                             command: 'newMessage',
                             text: message,
                             type: 'system',
@@ -1232,7 +1270,7 @@ function openFeedbackGatePopup(context, options = {}) {
         
         if (mcpIntegration) {
             setTimeout(() => {
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'updateMcpStatus',
                     active: true,
                     hasPendingTrigger: true
@@ -1407,18 +1445,18 @@ function processQueueForPendingTrigger(directSend) {
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
     if (queueItem.source && queueItem.source !== 'local') {
-        postToWebview({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+        broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
     }
     const sourceTag = queueItem.sourceLabel
         ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
         : '⚡ 已从队列自动发送';
     if (directSend) {
-        postToWebview({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
+        broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
         handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
     } else {
-        postToWebview({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
+        broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
         currentTriggerData = null;
-        setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+        setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
     }
 }
 
@@ -1448,50 +1486,48 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
             logUserInput(`SHUTDOWN CONFIRMED: ${text}`, 'SHUTDOWN_CONFIRMED', triggerId);
             
             setTimeout(() => {
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `🛑 关闭已确认: "${text}"\n\n用户已批准 MCP 服务器关闭。\n\nCursor Agent 将执行优雅关闭。`,
                     type: 'system'
                 });
-                setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+                setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
         } else {
             logUserInput(`SHUTDOWN ALTERNATIVE: ${text}`, 'SHUTDOWN_ALTERNATIVE', triggerId);
             
             setTimeout(() => {
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `💡 替代指令: "${text}"\n\n你的指令已发送给 Cursor Agent，替代关闭确认。\n\nAgent 将处理你的替代请求。`,
                     type: 'system'
                 });
-                setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+                setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
         }
     } else if (specialHandling === 'ingest_text') {
         logUserInput(`TEXT FEEDBACK: ${text}`, 'TEXT_FEEDBACK', triggerId);
         
             setTimeout(() => {
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `🔄 文本输入已处理: "${text}"\n\n你的反馈已发送给 Cursor Agent。\n\nAgent 将基于你的输入继续处理。`,
                     type: 'system'
                 });
-                setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+                setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
     } else {
-        // Standard handling for other tools
-        // Log to output channel for persistence
         outputChannel.appendLine(`${mcpIntegration ? 'MCP RESPONSE' : 'REVIEW'} SUBMITTED: ${text}`);
         
         setTimeout(() => {
             const randomResponse = funnyResponses[Math.floor(Math.random() * funnyResponses.length)];
-            postToWebview({
+            broadcastToAllWebviews({
                 command: 'addMessage',
                 text: randomResponse,
                 type: 'system',
                 plain: true
             });
-            setTimeout(() => { postToWebview({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+            setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
         }, 500);
     }
 }
@@ -1512,13 +1548,11 @@ function handleFileAttachment(triggerId) {
             
             logUserInput(`Files selected for review: ${fileNames.join(', ')}`, 'FILE_SELECTED', triggerId);
             
-            if (getActiveWebview()) {
-                postToWebview({
-                    command: 'addMessage',
-                    text: `Files attached for review:\n${fileNames.map(name => '• ' + name).join('\n')}\n\nPaths:\n${filePaths.map(fp => '• ' + fp).join('\n')}`,
-                    type: 'system'
-                });
-            }
+            broadcastToAllWebviews({
+                command: 'addMessage',
+                text: `Files attached for review:\n${fileNames.map(name => '• ' + name).join('\n')}\n\nPaths:\n${filePaths.map(fp => '• ' + fp).join('\n')}`,
+                type: 'system'
+            });
         } else {
             logUserInput('No files selected for review', 'FILE_CANCELLED', triggerId);
         }
@@ -1559,13 +1593,10 @@ function handleImageUpload(triggerId) {
                     
                     logUserInput(`Image uploaded: ${fileName}`, 'IMAGE_UPLOADED', triggerId);
                     
-                    // Send image data to webview
-                    if (getActiveWebview()) {
-                        postToWebview({
-                            command: 'imageUploaded',
-                            imageData: imageData
-                        });
-                    }
+                    broadcastToAllWebviews({
+                        command: 'imageUploaded',
+                        imageData: imageData
+                    });
                     
                 } catch (error) {
                     console.log(`Error processing image ${fileName}: ${error.message}`);
@@ -1601,7 +1632,7 @@ function handleDroppedFile(filePath, triggerId) {
             const mimeType = getMimeType(fileName);
             const dataUrl = `data:${mimeType};base64,${base64Data}`;
             
-            postToWebview({
+            broadcastToAllWebviews({
                 command: 'imageUploaded',
                 imageData: {
                     fileName: fileName,
@@ -1616,7 +1647,7 @@ function handleDroppedFile(filePath, triggerId) {
             const maxSize = 100 * 1024;
             if (stats.size > maxSize) {
                 logUserInput(`File too large to attach inline: ${fileName} (${(stats.size / 1024).toFixed(1)} KB)`, 'FILE_DROP_TOO_LARGE', triggerId);
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'fileAttached',
                     fileData: {
                         fileName: fileName,
@@ -1626,7 +1657,7 @@ function handleDroppedFile(filePath, triggerId) {
                     }
                 });
             } else {
-                postToWebview({
+                broadcastToAllWebviews({
                     command: 'fileAttached',
                     fileData: {
                         fileName: fileName,
