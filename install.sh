@@ -97,13 +97,12 @@ fi
 
 source "$INSTALL_DIR/venv/bin/activate"
 
-VENV_PY_VER=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "unknown")
-log "venv Python 版本: $VENV_PY_VER"
+pip install --upgrade pip -q 2>/dev/null
 
-pip install --upgrade pip -q
-
-log "安装 Python 依赖..."
-if ! pip install "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"; then
+log "安装 Python 依赖（首次安装需下载约 30MB）..."
+PIP_LOG=$(mktemp)
+if ! pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
+    cat "$PIP_LOG"
     err "Python 依赖安装失败"
     echo ""
     echo -e "  ${C_YELLOW}调试信息:${C_NC}"
@@ -118,9 +117,11 @@ if ! pip install "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"; then
     echo -e "  ${C_YELLOW}手动修复:${C_NC}"
     echo "    rm -rf $INSTALL_DIR/venv"
     echo "    然后重新运行 ./install.sh"
+    rm -f "$PIP_LOG"
     deactivate
     exit 1
 fi
+rm -f "$PIP_LOG"
 
 deactivate
 ok "Python 环境就绪"
