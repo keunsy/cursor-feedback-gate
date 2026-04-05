@@ -91,21 +91,33 @@ if [[ -d "$INSTALL_DIR/venv" ]]; then
 fi
 
 if [[ ! -d "$INSTALL_DIR/venv" ]]; then
+    log "使用 $PYTHON_CMD 创建虚拟环境..."
     $PYTHON_CMD -m venv "$INSTALL_DIR/venv"
 fi
+
 source "$INSTALL_DIR/venv/bin/activate"
+
+VENV_PY_VER=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "unknown")
+log "venv Python 版本: $VENV_PY_VER"
+
 pip install --upgrade pip -q
 
 log "安装 Python 依赖..."
-if ! pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"; then
+if ! pip install "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0"; then
     err "Python 依赖安装失败"
-    echo -e "  ${C_YELLOW}常见原因:${C_NC}"
-    echo "    1. Python 版本 < 3.10（mcp 包要求 3.10+）"
-    echo "    2. pip 版本过旧（已自动升级）"
-    echo "    3. 网络问题，请检查代理设置"
     echo ""
-    echo "  当前 Python: $($PYTHON_CMD --version)"
-    echo "  尝试手动安装: pip install \"mcp>=1.9.2\" \"Pillow>=10.0.0\""
+    echo -e "  ${C_YELLOW}调试信息:${C_NC}"
+    echo "    系统 Python: $($PYTHON_CMD --version) [$(command -v $PYTHON_CMD)]"
+    echo "    venv Python: $(python --version) [$(which python)]"
+    echo "    pip: $(pip --version)"
+    echo ""
+    echo -e "  ${C_YELLOW}常见原因:${C_NC}"
+    echo "    1. venv 内 Python < 3.10（删除 $INSTALL_DIR/venv 后重试）"
+    echo "    2. 网络问题，请检查代理设置"
+    echo ""
+    echo -e "  ${C_YELLOW}手动修复:${C_NC}"
+    echo "    rm -rf $INSTALL_DIR/venv"
+    echo "    然后重新运行 ./install.sh"
     deactivate
     exit 1
 fi
