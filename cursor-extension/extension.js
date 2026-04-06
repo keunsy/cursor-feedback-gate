@@ -749,12 +749,33 @@ function cleanupOrphanPidFiles() {
                 }
             } catch {}
         }
+
+        const sessionPrefix = 'feedback_gate_session_';
+        const maxAge = 4 * 3600 * 1000;
+        for (const f of fs.readdirSync(dir).filter(f => f.startsWith(sessionPrefix) && f.endsWith('.json'))) {
+            try {
+                const fullPath = path.join(dir, f);
+                const pidMatch = f.match(/session_(\d+)\.json$/);
+                if (!pidMatch) continue;
+                const sessionPid = parseInt(pidMatch[1], 10);
+                if (sessionPid === EXTENSION_PID) continue;
+                try { process.kill(sessionPid, 0); } catch {
+                    fs.unlinkSync(fullPath);
+                    console.log(`Feedback Gate: cleaned stale session (pid=${sessionPid}, process dead)`);
+                    continue;
+                }
+                const stat = fs.statSync(fullPath);
+                if (Date.now() - stat.mtimeMs > maxAge) {
+                    fs.unlinkSync(fullPath);
+                    console.log(`Feedback Gate: cleaned expired session (pid=${sessionPid}, age>${maxAge/3600000}h)`);
+                }
+            } catch {}
+        }
     } catch {}
 }
 
 function startFeedbackGateIntegration(context) {
     cleanupOrphanPidFiles();
-    registerIdeSession();
     
     boundMcpPid = discoverMcpPid();
     if (boundMcpPid) {

@@ -2,7 +2,7 @@
   "name": "cursor-feedback-gate",
   "displayName": "Feedback Gate",
   "description": "Feedback Gate - Agent 反馈关卡，支持消息队列、远程控制集成",
-  "version": "1.0.5",
+  "version": "1.0.7",
   "author": "keunsy",
   "publisher": "keunsy",
   "icon": "icon.png",
