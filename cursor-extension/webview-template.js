@@ -773,8 +773,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 mcpIntegration: mcpIntegration
             });
             
-            addMessage(text || (sentImages.length > 0 ? '图片' : '文件'), 'user', null, false, false, sentImages, sentFiles);
-            
             messageInput.value = '';
             attachedImages = [];
             attachedFiles = [];

@@ -94,6 +94,12 @@ function postToWebview(message) {
 }
 
 function broadcastToAllWebviews(message) {
+    const cmd = message && message.command;
+    const isChat = cmd === 'addMessage' || cmd === 'newMessage' || cmd === 'focus' || cmd === 'syncQueue';
+    if (isChat) {
+        return postToWebview(message);
+    }
+
     let sent = false;
     if (chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
         chatViewProvider._view.webview.postMessage(message);
@@ -985,15 +991,13 @@ function checkTriggerFile(context, filePath) {
                             });
                             maybeWriteOutbox(agentMsg);
                         }
-                        if (queueItem.source && queueItem.source !== 'local') {
-                            broadcastToAllWebviews({
-                                command: 'addMessage',
-                                text: queueItem.text,
-                                type: 'user',
-                                attachments: queueItem.attachments,
-                                files: queueItem.files
-                            });
-                        }
+                        broadcastToAllWebviews({
+                            command: 'addMessage',
+                            text: queueItem.text,
+                            type: 'user',
+                            attachments: queueItem.attachments,
+                            files: queueItem.files
+                        });
                         const sourceTag = queueItem.sourceLabel
                             ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
                             : '⚡ 已从队列自动发送';
@@ -1465,17 +1469,19 @@ function processQueueForPendingTrigger(directSend) {
     markQueueItemDone(queueItem.id);
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
-    if (queueItem.source && queueItem.source !== 'local') {
-        broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
-    }
-    const sourceTag = queueItem.sourceLabel
-        ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
-        : '⚡ 已从队列自动发送';
-    if (directSend) {
+    broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+
+    const isLocalDirect = directSend && (!queueItem.source || queueItem.source === 'local');
+    if (!isLocalDirect) {
+        const sourceTag = queueItem.sourceLabel
+            ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
+            : '⚡ 已从队列自动发送';
         broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
+    }
+
+    if (directSend) {
         handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
     } else {
-        broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
         currentTriggerData = null;
         setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
     }
