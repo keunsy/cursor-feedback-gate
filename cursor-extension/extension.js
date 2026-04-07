@@ -611,18 +611,6 @@ function checkIdeQueueFile() {
     clearLegacyIdeQueueProcessingIfPresent();
     consumeQueueIfExists(IDE_QUEUE_PATH);
     consumeQueueIfExists(IDE_QUEUE_GLOBAL_PATH);
-    try {
-        const dir = path.dirname(IDE_QUEUE_PATH);
-        const prefix = 'feedback_gate_ide_queue_';
-        const myFile = path.basename(IDE_QUEUE_PATH);
-        const globalFile = path.basename(IDE_QUEUE_GLOBAL_PATH);
-        for (const f of fs.readdirSync(dir)) {
-            if (f === myFile || f === globalFile) continue;
-            if (f.startsWith(prefix) && f.endsWith('.jsonl') && !f.includes('.processing')) {
-                consumeQueueIfExists(path.join(dir, f));
-            }
-        }
-    } catch {}
 }
 
 function consumeQueueIfExists(queuePath) {
@@ -689,7 +677,7 @@ function consumeIdeQueueFile(filePath) {
 
 function maybeWriteOutbox(agentMessage) {
     if (!pendingRemoteReply) return;
-    if (!agentMessage || agentMessage.length < 10) return;
+    if (!agentMessage || agentMessage.trim().length < 1) return;
 
     const MAX_LEN = 500;
     const truncated = agentMessage.length > MAX_LEN
