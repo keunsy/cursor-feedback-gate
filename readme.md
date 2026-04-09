@@ -93,20 +93,6 @@ cursor-feedback-gate/
 └── LICENSE
 ```
 
-## 双模心跳机制
-
-MCP 服务器根据运行环境自动选择不同的心跳策略，确保 Agent 不会因超时断开：
-
-| 模式 | 触发条件 | 心跳间隔 | 最长等待 |
-|---|---|---|---|
-| IDE 模式 | 在 Cursor IDE 中运行（默认） | 55 分钟 | 72 小时 |
-| CLI/远程模式 | 搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control) 运行 | 50 秒 | 24 小时 |
-
-- **IDE 模式**：Cursor 有 1 小时的 MCP 调用超时限制，每 55 分钟返回心跳消息避免断连
-- **CLI/远程模式**：Agent CLI 有约 60 秒的工具超时，每 50 秒返回心跳。由 `cursor-remote-control` 注入 `FEEDBACK_GATE_ROUTING_FILE` 环境变量触发
-
-心跳措辞随机变化，避免 Agent 识别为重复消息而放弃等待。
-
 ## 远程控制集成
 
 搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control) 项目，可以通过即时通讯渠道远程控制 Cursor Agent：
@@ -115,6 +101,15 @@ MCP 服务器根据运行环境自动选择不同的心跳策略，确保 Agent 
 - Cursor Agent 的输出也会回传到对应聊天窗口，形成完整的双向交互
 - 支持多渠道同时接入，便于扩展
 - 适合离开工位、移动办公等场景，随时随地与 Agent 交互
+
+### 智能心跳
+
+MCP 服务器根据运行环境自动选择心跳策略，确保 Agent 不会因超时断开。心跳措辞随机变化，避免被识别为重复消息：
+
+| 模式 | 心跳间隔 | 最长等待 | 说明 |
+|---|---|---|---|
+| IDE 模式 | 55 分钟 | 72 小时 | Cursor 有 1 小时 MCP 调用超时限制 |
+| 远程模式 | 50 秒 | 24 小时 | Agent CLI 有约 60 秒工具超时；由 `cursor-remote-control` 注入环境变量触发 |
 
 ### `/ide` 远程指令入队
 
