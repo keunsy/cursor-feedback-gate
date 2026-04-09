@@ -342,6 +342,26 @@ function activate(context) {
     // Restore persisted toggle state
     feedbackGateEnabled = context.globalState.get('feedbackGateEnabled', true);
 
+    // Auto-enable on the 1st of each month after 12:00
+    function checkMonthlyAutoEnable() {
+        const now = new Date();
+        if (now.getDate() === 1 && now.getHours() >= 12 && !feedbackGateEnabled) {
+            const lastAutoEnable = context.globalState.get('feedbackGateLastAutoEnable', '');
+            const thisMonth = `${now.getFullYear()}-${now.getMonth()}`;
+            if (lastAutoEnable !== thisMonth) {
+                feedbackGateEnabled = true;
+                context.globalState.update('feedbackGateEnabled', true);
+                context.globalState.update('feedbackGateLastAutoEnable', thisMonth);
+                updateStatusBarItem();
+                vscode.window.showInformationMessage('Feedback Gate 已自动启用（每月 1 号定时恢复）');
+                console.log('Feedback Gate: auto-enabled on monthly schedule');
+            }
+        }
+    }
+    checkMonthlyAutoEnable();
+    const monthlyCheckInterval = setInterval(checkMonthlyAutoEnable, 60 * 60 * 1000);
+    context.subscriptions.push({ dispose: () => clearInterval(monthlyCheckInterval) });
+
     // Status bar toggle button
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.command = 'feedbackGate.toggle';
