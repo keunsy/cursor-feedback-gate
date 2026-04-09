@@ -95,7 +95,7 @@ cursor-feedback-gate/
 
 ## CLI / 远程模式
 
-当没有 Cursor 扩展时（如通过 Claude CLI、API 或其他 MCP 客户端调用），MCP 服务器自动切换到远程模式：
+当通过 Claude CLI、API 或其他非 Cursor IDE 的 MCP 客户端调用时，MCP 服务器自动切换到 CLI/远程模式：
 
 - 以 50 秒间隔的心跳消息保持连接，措辞随机变化避免被识别为重复
 - Agent 持续等待直到收到用户回复
