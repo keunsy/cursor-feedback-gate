@@ -1674,7 +1674,17 @@ function handleDroppedFile(filePath, triggerId) {
         
         const stats = fs.statSync(filePath);
         if (stats.isDirectory()) {
-            console.log(`Dropped path is a directory: ${filePath}`);
+            const dirName = path.basename(filePath);
+            broadcastToAllWebviews({
+                command: 'fileAttached',
+                fileData: {
+                    fileName: dirName + '/',
+                    filePath: filePath,
+                    size: 0,
+                    isDirectory: true
+                }
+            });
+            logUserInput(`Folder dropped: ${dirName} (${filePath})`, 'FOLDER_DROPPED', triggerId);
             return;
         }
         

@@ -369,7 +369,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         body.drag-over::before {
-            content: '松开以附加文件';
+            content: '松开以附加文件/文件夹';
             position: fixed;
             top: 50%;
             left: 50%;
@@ -1151,10 +1151,12 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             const filePreview = document.createElement('div');
             filePreview.className = 'message system';
             filePreview.setAttribute('data-file-id', fileId);
+            const iconClass = fileData.isDirectory ? 'fa-folder' : 'fa-file-code';
+            const iconColor = fileData.isDirectory ? 'var(--vscode-charts-yellow, #e2b93d)' : 'var(--vscode-charts-orange)';
             filePreview.innerHTML = \`
                 <div class="message-bubble" style="max-width: 90%;">
                     <div class="image-header">
-                        <span class="image-filename" style="font-family: monospace;"><i class="fas fa-file-code" style="margin-right: 4px; color: var(--vscode-charts-orange);"></i>\${fileData.fileName}</span>
+                        <span class="image-filename" style="font-family: monospace;"><i class="fas \${iconClass}" style="margin-right: 4px; color: \${iconColor};"></i>\${fileData.fileName}</span>
                         <button class="remove-image-btn" onclick="removeFile('\${fileId}')" title="Remove file">
                             <i class="fas fa-times"></i>
                         </button>
