@@ -359,8 +359,6 @@ function activate(context) {
         }
     }
     checkMonthlyAutoEnable();
-    const monthlyCheckInterval = setInterval(checkMonthlyAutoEnable, 60 * 60 * 1000);
-    context.subscriptions.push({ dispose: () => clearInterval(monthlyCheckInterval) });
 
     // Status bar toggle button
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
