@@ -93,18 +93,19 @@ cursor-feedback-gate/
 └── LICENSE
 ```
 
-## CLI / 远程模式
+## 双模心跳机制
 
-当通过 Claude CLI、API 或其他非 Cursor IDE 的 MCP 客户端调用时，MCP 服务器自动切换到 CLI/远程模式：
+MCP 服务器根据运行环境自动选择不同的心跳策略，确保 Agent 不会因超时断开：
 
-- 以 50 秒间隔的心跳消息保持连接，措辞随机变化避免被识别为重复
-- Agent 持续等待直到收到用户回复
-- 最大等待时间 24 小时
-- 超时后自动返回超时通知
+| 模式 | 触发条件 | 心跳间隔 | 最长等待 |
+|---|---|---|---|
+| IDE 模式 | 在 Cursor IDE 中运行（默认） | 55 分钟 | 72 小时 |
+| CLI/远程模式 | 搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control) 运行 | 50 秒 | 24 小时 |
 
-IDE 模式同样具备心跳机制（55 分钟间隔），防止 Cursor 的 1 小时 MCP 调用超时限制导致 Agent 断开。
+- **IDE 模式**：Cursor 有 1 小时的 MCP 调用超时限制，每 55 分钟返回心跳消息避免断连
+- **CLI/远程模式**：Agent CLI 有约 60 秒的工具超时，每 50 秒返回心跳。由 `cursor-remote-control` 注入 `FEEDBACK_GATE_ROUTING_FILE` 环境变量触发
 
-适用场景：命令行、SSH、CI/CD 集成等无 GUI 环境。
+心跳措辞随机变化，避免 Agent 识别为重复消息而放弃等待。
 
 ## 远程控制集成
 
