@@ -43,9 +43,30 @@
         "command": "feedbackGate.openChat",
         "title": "Open Feedback Gate",
         "category": "Feedback Gate"
+      },
+      {
+        "command": "feedbackGate.addCodeReference",
+        "title": "Add to Feedback Gate",
+        "category": "Feedback Gate"
       }
     ],
-    "keybindings": [],
+    "keybindings": [
+      {
+        "command": "feedbackGate.addCodeReference",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g",
+        "when": "editorTextFocus && editorHasSelection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "feedbackGate.addCodeReference",
+          "when": "editorHasSelection",
+          "group": "9_cutcopypaste@50"
+        }
+      ]
+    },
     "viewsContainers": {
       "panel": [
         {

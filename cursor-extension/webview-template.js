@@ -581,6 +581,83 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .queue-item-remove:hover { opacity: 0.8; background: rgba(255, 59, 48, 0.15); color: #ff3b30; }
+        
+        .code-ref-card {
+            position: relative;
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.12));
+            border-radius: 8px;
+            margin: 4px 0;
+            overflow: hidden;
+            animation: messageSlide 0.2s ease-out;
+        }
+        
+        .code-ref-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 10px;
+            background: rgba(255, 255, 255, 0.04);
+            border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.08));
+            font-size: 11px;
+        }
+        
+        .code-ref-file {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-family: var(--vscode-editor-font-family, monospace);
+            color: var(--vscode-textLink-foreground, #3794ff);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+        }
+        
+        .code-ref-lines {
+            color: var(--vscode-descriptionForeground);
+            font-size: 10px;
+            margin-left: 8px;
+            flex-shrink: 0;
+        }
+        
+        .code-ref-remove {
+            background: none;
+            border: none;
+            color: var(--vscode-foreground);
+            opacity: 0.3;
+            cursor: pointer;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: all 0.2s;
+            flex-shrink: 0;
+            margin-left: 6px;
+        }
+        
+        .code-ref-remove:hover { opacity: 0.8; background: rgba(255, 59, 48, 0.15); color: #ff3b30; }
+        
+        .code-ref-code {
+            padding: 8px 10px;
+            font-family: var(--vscode-editor-font-family, monospace);
+            font-size: 12px;
+            line-height: 1.5;
+            overflow-x: auto;
+            white-space: pre;
+            max-height: 160px;
+            overflow-y: auto;
+            color: var(--vscode-editor-foreground);
+            tab-size: 4;
+        }
+        
+        .code-refs-area {
+            padding: 0 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .code-refs-area:empty { display: none; }
     </style>
 </head>
 <body>
@@ -615,6 +692,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             <div id="queueList"></div>
         </div>
         
+        <div class="code-refs-area" id="codeRefsArea"></div>
+        
         <div class="input-container disabled" id="inputContainer">
             <div class="input-wrapper" id="inputWrapper">
                 <textarea id="messageInput" class="message-input" placeholder="等待 MCP 连接…" rows="1" disabled></textarea>
@@ -648,7 +727,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         let messageCount = 0;
         let mcpActive = false;
         let mcpIntegration = ${mcpIntegration};
-        let attachedImages = []; // Store uploaded images
+        let attachedImages = [];
+        let codeReferences = [];
+        const codeRefsArea = document.getElementById('codeRefsArea');
         
         function updateMcpStatus(active, hasPendingTrigger) {
             mcpActive = active;
@@ -753,9 +834,60 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             hideTyping();
         }
         
+        function addCodeReference(codeRef) {
+            const refId = 'cref_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+            codeRef.id = refId;
+            codeReferences.push(codeRef);
+            
+            const maxLines = 8;
+            const lines = codeRef.content.split('\\n');
+            const truncated = lines.length > maxLines;
+            const displayCode = truncated
+                ? lines.slice(0, maxLines).join('\\n') + '\\n// ... (' + (lines.length - maxLines) + ' more lines)'
+                : codeRef.content;
+            
+            const card = document.createElement('div');
+            card.className = 'code-ref-card';
+            card.setAttribute('data-cref-id', refId);
+            card.innerHTML = \`
+                <div class="code-ref-header">
+                    <span class="code-ref-file"><i class="fas fa-code" style="opacity:0.6;"></i> \${escapeHtml(codeRef.filePath)}</span>
+                    <span class="code-ref-lines">L\${codeRef.startLine}\${codeRef.endLine !== codeRef.startLine ? '-' + codeRef.endLine : ''}</span>
+                    <button class="code-ref-remove" onclick="removeCodeReference('\${refId}')" title="移除">✕</button>
+                </div>
+                <div class="code-ref-code">\${escapeHtml(displayCode)}</div>
+            \`;
+            codeRefsArea.appendChild(card);
+        }
+        
+        function removeCodeReference(refId) {
+            codeReferences = codeReferences.filter(r => r.id !== refId);
+            const el = document.querySelector('[data-cref-id="' + refId + '"]');
+            if (el) el.remove();
+        }
+        window.removeCodeReference = removeCodeReference;
+        
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+        
+        function formatCodeRefsForSend() {
+            if (codeReferences.length === 0) return '';
+            return codeReferences.map(ref => {
+                const lineRange = ref.endLine !== ref.startLine
+                    ? \`Lines \${ref.startLine}-\${ref.endLine}\`
+                    : \`Line \${ref.startLine}\`;
+                return \`\\n\\nCode Reference:\\nFile: \${ref.filePath} (\${lineRange})\\n\\\`\\\`\\\`\${ref.language}\\n\${ref.content}\\n\\\`\\\`\\\`\`;
+            }).join('');
+        }
+        
         let _sendLock = false;
         function sendMessage() {
-            const text = messageInput.value.trim();
+            const rawText = messageInput.value.trim();
+            const codeRefText = formatCodeRefsForSend();
+            const text = rawText + codeRefText;
             if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
             if (_sendLock) return;
             _sendLock = true;
@@ -776,6 +908,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             messageInput.value = '';
             attachedImages = [];
             attachedFiles = [];
+            codeReferences = [];
+            codeRefsArea.innerHTML = '';
             document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
             document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
             adjustTextareaHeight();
@@ -1107,6 +1241,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     break;
                 case 'fileAttached':
                     addFileAttachment(message.fileData);
+                    break;
+                case 'addCodeReference':
+                    addCodeReference(message.codeRef);
+                    messageInput.focus();
                     break;
                 case 'syncQueue':
                     renderQueue(message.items, message.pendingCount);

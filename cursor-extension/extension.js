@@ -271,6 +271,47 @@ function activate(context) {
 
     context.subscriptions.push(disposable);
 
+    // Register command to add code reference from editor selection
+    context.subscriptions.push(
+        vscode.commands.registerCommand('feedbackGate.addCodeReference', () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                vscode.window.showWarningMessage('没有活动的编辑器');
+                return;
+            }
+            const selection = editor.selection;
+            if (selection.isEmpty) {
+                vscode.window.showWarningMessage('请先选中一段代码');
+                return;
+            }
+            const document = editor.document;
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            const wsRoot = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : '';
+            let filePath = document.uri.fsPath;
+            if (wsRoot && filePath.startsWith(wsRoot)) {
+                filePath = filePath.slice(wsRoot.length).replace(/^[/\\]/, '');
+            }
+
+            const codeRef = {
+                filePath: filePath,
+                absolutePath: document.uri.fsPath,
+                startLine: selection.start.line + 1,
+                endLine: selection.end.line + 1,
+                content: document.getText(selection),
+                language: document.languageId,
+            };
+
+            broadcastToAllWebviews({
+                command: 'addCodeReference',
+                codeRef: codeRef,
+            });
+
+            const pref = getPreferredLocation();
+            const provider = (pref === 'sidebar' ? sidebarViewProvider : chatViewProvider) || chatViewProvider || sidebarViewProvider;
+            if (provider) provider.focusView();
+        })
+    );
+
     // Register bottom panel WebviewViewProvider
     try {
         chatViewProvider = new FeedbackGatePanelProvider(context, 'feedbackGate.chatView');
