@@ -986,8 +986,10 @@ function checkTriggerFile(context, filePath) {
                 return;
             }
             
-            // Check queue first: if messages waiting, auto-respond with queue head
-            if (getPendingQueueCount() > 0) {
+            // Check queue first: if messages waiting AND no active user interaction,
+            // auto-respond with queue head. Skip auto-consume when the user is still
+            // interacting with a previous gate to prevent premature queue drain.
+            if (getPendingQueueCount() > 0 && !currentTriggerData) {
                 const queueItem = dequeueMessage();
                 if (queueItem) {
                     // Track remote source for V2 bidirectional feedback
