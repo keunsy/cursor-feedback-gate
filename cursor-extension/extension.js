@@ -882,7 +882,7 @@ function startFeedbackGateIntegration(context) {
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
     }, 100);
     
-    vscode.window.showInformationMessage('Feedback Gate MCP 集成就绪！正在监听 Cursor Agent 工具调用…');
+    vscode.window.showInformationMessage('Feedback Gate MCP 集成就绪！正在监听 Cursor 工具调用…');
 }
 
 function checkTriggerFile(context, filePath) {
@@ -1135,7 +1135,7 @@ function handleFeedbackGateToolCall(context, toolData) {
             
         case 'ingest_text':
             popupOptions = {
-                message: `Cursor Agent received text input and needs your feedback:\n\n**Text Content:** ${toolData.text_content}\n**Source:** ${toolData.source}\n**Context:** ${toolData.context || 'None'}\n**Processing Mode:** ${toolData.processing_mode}\n\n请审查并提供反馈：`,
+                message: `Cursor received text input and needs your feedback:\n\n**Text Content:** ${toolData.text_content}\n**Source:** ${toolData.source}\n**Context:** ${toolData.context || 'None'}\n**Processing Mode:** ${toolData.processing_mode}\n\n请审查并提供反馈：`,
                 title: toolData.title || "Feedback Gate - Text Input",
                 autoFocus: true,
                 toolData: toolData,
@@ -1145,7 +1145,7 @@ function handleFeedbackGateToolCall(context, toolData) {
             
         case 'shutdown_mcp':
             popupOptions = {
-                message: `Cursor Agent is requesting to shutdown the MCP server:\n\n**Reason:** ${toolData.reason}\n**Immediate:** ${toolData.immediate ? 'Yes' : 'No'}\n**Cleanup:** ${toolData.cleanup ? 'Yes' : 'No'}\n\nType 'CONFIRM' to proceed with shutdown, or provide alternative instructions:`,
+                message: `Cursor is requesting to shutdown the MCP server:\n\n**Reason:** ${toolData.reason}\n**Immediate:** ${toolData.immediate ? 'Yes' : 'No'}\n**Cleanup:** ${toolData.cleanup ? 'Yes' : 'No'}\n\nType 'CONFIRM' to proceed with shutdown, or provide alternative instructions:`,
                 title: toolData.title || "Feedback Gate - Shutdown Confirmation",
                 autoFocus: true,
                 toolData: toolData,
@@ -1156,7 +1156,7 @@ function handleFeedbackGateToolCall(context, toolData) {
             
         case 'file_feedback':
             popupOptions = {
-                message: toolData.instruction || "Cursor Agent needs you to select files:",
+                message: toolData.instruction || "Cursor needs you to select files:",
                 title: toolData.title || "Feedback Gate - File Feedback",
                 autoFocus: true,
                 toolData: toolData,
@@ -1166,7 +1166,7 @@ function handleFeedbackGateToolCall(context, toolData) {
             
         default:
             popupOptions = {
-                message: toolData.message || toolData.prompt || toolData.instruction || "Cursor Agent needs your input. Please provide your response:",
+                message: toolData.message || toolData.prompt || toolData.instruction || "Cursor needs your input. Please provide your response:",
                 title: toolData.title || "Feedback Gate - General Input",
                 autoFocus: true,
                 toolData: toolData,
@@ -1195,7 +1195,7 @@ function handleFeedbackGateToolCall(context, toolData) {
     
     // Show appropriate notification
     const toolDisplayName = toolData.tool.replace('_', ' ').toUpperCase();
-    vscode.window.showInformationMessage(`Cursor Agent triggered "${toolDisplayName}" - Feedback Gate popup opened for your input!`);
+    vscode.window.showInformationMessage(`Cursor triggered "${toolDisplayName}" - Feedback Gate popup opened for your input!`);
 }
 
 function sendExtensionAcknowledgement(triggerId, toolType) {
@@ -1540,17 +1540,17 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
     currentTriggerData = null;
     
     const funnyResponses = [
-        "Agent 已读已回，正在疯狂敲键盘中 ⌨️",
-        "你的需求比 P0 还 P0，Agent 连夜赶工 🌙",
-        "收到！Agent 表示：「这活儿我熟」🫡",
-        "消息已发，Agent 已经在 996 了…",
-        "指令已达！Agent：「收到，这就卷」💪",
-        "你的反馈价值一个亿，Agent 搬砖去了 🧱",
-        "Agent 正在头秃中… 但你的需求它记住了 🧑‍🦲",
-        "已阅已办！Agent 正在用爱发电 ⚡",
-        "需求已投喂，Agent 消化中… 🍜",
-        "Agent 默默点了个赞，然后开始干活了 👍",
-        "你说啥就是啥，Agent 照单全收 📋",
+        "Cursor 已读已回，正在疯狂敲键盘中 ⌨️",
+        "你的需求比 P0 还 P0，Cursor 连夜赶工 🌙",
+        "收到！Cursor 表示：「这活儿我熟」🫡",
+        "消息已发，Cursor 已经在 996 了…",
+        "指令已达！Cursor：「收到，这就卷」💪",
+        "你的反馈价值一个亿，Cursor 搬砖去了 🧱",
+        "Cursor 正在头秃中… 但你的需求它记住了 🧑‍🦲",
+        "已阅已办！Cursor 正在用爱发电 ⚡",
+        "需求已投喂，Cursor 消化中… 🍜",
+        "Cursor 默默点了个赞，然后开始干活了 👍",
+        "你说啥就是啥，Cursor 照单全收 📋",
         "消息已签收，顺丰都没这么快 🚀",
     ];
     
@@ -1564,7 +1564,7 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
             setTimeout(() => {
                 broadcastToAllWebviews({
                     command: 'addMessage',
-                    text: `🛑 关闭已确认: "${text}"\n\n用户已批准 MCP 服务器关闭。\n\nCursor Agent 将执行优雅关闭。`,
+                    text: `🛑 关闭已确认: "${text}"\n\n用户已批准 MCP 服务器关闭。\n\nCursor 将执行优雅关闭。`,
                     type: 'system'
                 });
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
@@ -1575,7 +1575,7 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
             setTimeout(() => {
                 broadcastToAllWebviews({
                     command: 'addMessage',
-                    text: `💡 替代指令: "${text}"\n\n你的指令已发送给 Cursor Agent，替代关闭确认。\n\nAgent 将处理你的替代请求。`,
+                    text: `💡 替代指令: "${text}"\n\n你的指令已发送给 Cursor，替代关闭确认。\n\nCursor 将处理你的替代请求。`,
                     type: 'system'
                 });
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
@@ -1587,7 +1587,7 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
             setTimeout(() => {
                 broadcastToAllWebviews({
                     command: 'addMessage',
-                    text: `🔄 文本输入已处理: "${text}"\n\n你的反馈已发送给 Cursor Agent。\n\nAgent 将基于你的输入继续处理。`,
+                    text: `🔄 文本输入已处理: "${text}"\n\n你的反馈已发送给 Cursor。\n\nCursor 将基于你的输入继续处理。`,
                     type: 'system'
                 });
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);

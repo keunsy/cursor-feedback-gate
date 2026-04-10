@@ -701,7 +701,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     <i class="fas fa-image"></i>
                 </button>
             </div>
-            <button id="sendButton" class="send-button" title="${mcpIntegration ? '发送回复给 Agent' : '发送审查'}" disabled>
+            <button id="sendButton" class="send-button" title="${mcpIntegration ? '发送回复给 Cursor' : '发送审查'}" disabled>
                 <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
             </button>
         </div>
@@ -737,17 +737,17 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             if (active && hasPendingTrigger) {
                 statusIndicator.className = 'status-indicator active';
                 statusCapsule.className = 'status-capsule active';
-                mcpStatus.textContent = 'Agent 等待回复';
+                mcpStatus.textContent = 'Cursor 等待回复';
                 inputContainer.classList.remove('disabled');
                 inputWrapper.classList.add('agent-active');
                 messageInput.disabled = false;
                 sendButton.disabled = false;
                 attachButton.disabled = false;
-                messageInput.placeholder = 'Cursor Agent 正在等待你的回复…';
+                messageInput.placeholder = 'Cursor 正在等待你的回复…';
             } else if (active) {
                 statusIndicator.className = 'status-indicator';
                 statusCapsule.className = 'status-capsule';
-                mcpStatus.textContent = '等待 Agent 调用';
+                mcpStatus.textContent = '等待 Cursor 调用';
                 inputContainer.classList.remove('disabled');
                 inputWrapper.classList.remove('agent-active');
                 messageInput.disabled = false;
@@ -973,7 +973,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         // Update image counter in input placeholder
         function updateImageCounter() {
             const count = attachedImages.length;
-            const baseText = mcpIntegration ? 'Cursor Agent 正在等待你的回复' : '请输入你的审查反馈';
+            const baseText = mcpIntegration ? 'Cursor 正在等待你的回复' : '请输入你的审查反馈';
             
             if (count > 0) {
                 messageInput.placeholder = \`\${baseText}… 已附加 \${count} 张图片\`;
@@ -1229,7 +1229,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files);
                     if (message.mcpIntegration) {
                         mcpIntegration = true;
-                        messageInput.placeholder = 'Cursor Agent 正在等待你的回复…';
+                        messageInput.placeholder = 'Cursor 正在等待你的回复…';
                     }
                     break;
                 case 'focus':

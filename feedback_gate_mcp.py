@@ -386,9 +386,37 @@ class FeedbackGateServer:
 
     # Cursor IDE aborts MCP tool calls after exactly 1 hour (3600s).  After 2
     # consecutive aborts the Agent model gives up entirely.  We return a heartbeat
-    # every 55 minutes so the call never hits the 1h limit.
-    _IDE_WAIT_SECONDS = 3300  # 55 minutes
+    # every N minutes so the call never hits the 1h limit.
+    # Override with FEEDBACK_GATE_IDE_WAIT_SECONDS env var.
+    _IDE_WAIT_SECONDS = int(os.environ.get("FEEDBACK_GATE_IDE_WAIT_SECONDS", "600"))
     _IDE_MAX_TOTAL_SECONDS = 259200  # 72h max total wait for IDE
+
+    # Heartbeat config file for dynamic (no-restart) configuration.
+    # Falls back to env vars, then defaults.
+    _HEARTBEAT_CONFIG_PATH = os.path.join(
+        os.path.expanduser("~"), ".cursor", "feedback-gate-config.json"
+    )
+
+    @classmethod
+    def _load_heartbeat_config(cls) -> tuple[str, str, int | None]:
+        """Read heartbeat mode, reply, and optional wait_seconds from config file.
+        Config file is re-read on every heartbeat so changes take effect
+        without restarting the MCP server.
+        Returns (mode, reply, wait_seconds_override_or_None)."""
+        mode = os.environ.get("FEEDBACK_GATE_HEARTBEAT_MODE", "waiting").lower()
+        reply = os.environ.get("FEEDBACK_GATE_HEARTBEAT_REPLY", "当前时间")
+        wait_override: int | None = None
+        try:
+            cfg_path = Path(cls._HEARTBEAT_CONFIG_PATH)
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text())
+                mode = cfg.get("heartbeat_mode", mode).lower()
+                reply = cfg.get("heartbeat_reply", reply)
+                if "wait_seconds" in cfg:
+                    wait_override = int(cfg["wait_seconds"])
+        except Exception as e:
+            logger.debug(f"Failed to read heartbeat config: {e}")
+        return mode, reply, wait_override
 
     @staticmethod
     def _build_heartbeat_message(count: int, elapsed_min: float) -> str:
@@ -412,6 +440,17 @@ class FeedbackGateServer:
             "to continue waiting. Do NOT end your response or summarize — just call "
             "the tool again now."
         )
+
+    def _build_heartbeat_response(self, count: int, elapsed_min: float) -> str:
+        """Return heartbeat text based on configured mode (re-reads config file).
+        - 'waiting' (default): [WAITING] + re-call instruction
+        - 'user_response': fake User Response to keep a normal Agent cycle
+        """
+        mode, reply, _ = self._load_heartbeat_config()
+        if mode == "user_response":
+            logger.info(f"💓 Heartbeat using user_response mode: '{reply}'")
+            return f"User Response: {reply}"
+        return self._build_heartbeat_message(count, elapsed_min)
 
     async def _handle_feedback_gate_chat(self, args: dict) -> list[TextContent]:
         """Handle Feedback Gate chat popup and wait for user input with 5 minute timeout"""
@@ -445,6 +484,9 @@ class FeedbackGateServer:
                     self._clear_trigger_state(responded=False)
                 else:
                     wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
+                    _, _, wait_override = self._load_heartbeat_config()
+                    if wait_override is not None and not is_remote:
+                        wait_secs = wait_override
                     max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
                     label = "CLI" if is_remote else "IDE"
                     logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
@@ -467,7 +509,7 @@ class FeedbackGateServer:
                             logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min)")
                             return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
                         logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min, {label})")
-                        return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                        return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
@@ -546,6 +588,9 @@ class FeedbackGateServer:
                 logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
             wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
+            _, _, wait_override = self._load_heartbeat_config()
+            if wait_override is not None and not is_remote:
+                wait_secs = wait_override
             max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
             label = "CLI" if is_remote else "IDE"
             logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
@@ -570,7 +615,7 @@ class FeedbackGateServer:
                     logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min)")
                     return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
                 logger.info(f"⏳ {label} wait timed out, returning heartbeat (trigger {trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
-                return [TextContent(type="text", text=self._build_heartbeat_message(self._heartbeat_count, elapsed_min))]
+                return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         else:
             response = f"ERROR: Failed to trigger Feedback Gate popup"
             logger.error("❌ Failed to trigger Feedback Gate popup")
