@@ -64,10 +64,12 @@ function generateId() {
     return now * 1000 + (_idCounter % 1000);
 }
 
+const QUEUE_IMAGE_MAX_B64_LEN = 5 * 1024 * 1024;
+
 function enqueueMessage(text, attachments, files, meta) {
     const safeAttachments = (attachments || []).map(att => {
         const largeField = att.base64Data || att.dataUrl || att.data;
-        if (largeField && largeField.length > 500000) {
+        if (largeField && largeField.length > QUEUE_IMAGE_MAX_B64_LEN) {
             const cleaned = { ...att, originalSize: largeField.length };
             if (att.base64Data) cleaned.base64Data = '[TOO_LARGE_FOR_QUEUE]';
             if (att.dataUrl) cleaned.dataUrl = '[TOO_LARGE_FOR_QUEUE]';
