@@ -581,6 +581,49 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .queue-item-remove:hover { opacity: 0.8; background: rgba(255, 59, 48, 0.15); color: #ff3b30; }
+
+        #queueImgTooltip {
+            position: fixed;
+            z-index: 9999;
+            display: none;
+            flex-wrap: wrap;
+            gap: 4px;
+            padding: 6px;
+            background: var(--vscode-editorWidget-background, #1e1e1e);
+            border: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.12));
+            border-radius: 8px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+            max-width: 320px;
+            pointer-events: none;
+            animation: fadeInUp 0.15s ease-out;
+        }
+
+        #queueImgTooltip.visible { display: flex; }
+
+        #queueImgTooltip img {
+            max-width: 140px;
+            max-height: 100px;
+            border-radius: 4px;
+            object-fit: cover;
+            border: 1px solid rgba(255,255,255,0.08);
+        }
+
+        #queueImgTooltip .img-placeholder {
+            width: 60px;
+            height: 60px;
+            border-radius: 4px;
+            background: rgba(255,255,255,0.05);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            opacity: 0.4;
+        }
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
         
         .code-ref-card {
             position: relative;
@@ -691,6 +734,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             </div>
             <div id="queueList"></div>
         </div>
+        <div id="queueImgTooltip"></div>
         
         <div class="code-refs-area" id="codeRefsArea"></div>
         
@@ -1254,7 +1298,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             }
         });
         
+        const _queueAttachmentsMap = new Map();
+
         function renderQueue(items, pendingCount) {
+            _queueAttachmentsMap.clear();
             if (!items || items.length === 0) {
                 queueContainer.classList.add('empty');
                 queueList.innerHTML = '';
@@ -1275,8 +1322,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     imgCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${imgCount}张图片">🖼️\${imgCount > 1 ? imgCount : ''}</span>\` : '',
                     fileCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${(item.files||[]).map(f=>f.name||f.path||'文件').join(', ')}">📎\${fileCount > 1 ? fileCount : ''}</span>\` : '',
                 ].filter(Boolean).join('');
+                if (imgCount) _queueAttachmentsMap.set(item.id, item.attachments);
                 return \`
-                <div class="queue-item" data-queue-id="\${item.id}">
+                <div class="queue-item\${imgCount ? ' has-imgs' : ''}" data-queue-id="\${item.id}">
                     \${isPending && pendingItems.length > 1 ? \`
                         <span class="queue-item-arrows">
                             <button class="queue-arrow" \${pi === 0 ? 'disabled' : ''} onclick="moveQueueItemUp(\${item.id})" title="上移">▲</button>
@@ -1292,9 +1340,42 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     \` : \`<span style="font-size:10px;opacity:0.5;">⏳</span>\`}
                 </div>
             \`}).join('');
+
+            bindQueueImgHover();
             
         }
         
+        function bindQueueImgHover() {
+            const tooltip = document.getElementById('queueImgTooltip');
+            if (!tooltip) return;
+            document.querySelectorAll('.queue-item.has-imgs').forEach(el => {
+                el.addEventListener('mouseenter', function () {
+                    const qid = Number(el.dataset.queueId);
+                    const atts = _queueAttachmentsMap.get(qid);
+                    if (!atts || atts.length === 0) return;
+                    const thumbs = atts.map(att => {
+                        const src = att.dataUrl || (att.base64Data && att.base64Data !== '[TOO_LARGE_FOR_QUEUE]' ? \`data:\${att.mimeType || 'image/png'};base64,\${att.base64Data}\` : '') || (att.data && att.data !== '[TOO_LARGE_FOR_QUEUE]' ? att.data : '');
+                        if (!src) return '<div class="img-placeholder">🖼️</div>';
+                        return \`<img src="\${src}" alt="\${att.fileName || '图片'}">\`;
+                    });
+                    tooltip.innerHTML = thumbs.join('');
+                    const rect = el.getBoundingClientRect();
+                    tooltip.style.left = Math.min(rect.left, window.innerWidth - 330) + 'px';
+                    if (rect.top > 120) {
+                        tooltip.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+                        tooltip.style.top = 'auto';
+                    } else {
+                        tooltip.style.top = (rect.bottom + 6) + 'px';
+                        tooltip.style.bottom = 'auto';
+                    }
+                    tooltip.classList.add('visible');
+                });
+                el.addEventListener('mouseleave', function () {
+                    tooltip.classList.remove('visible');
+                });
+            });
+        }
+
         function removeQueueItem(itemId) {
             vscode.postMessage({ command: 'removeQueueItem', itemId: itemId });
         }

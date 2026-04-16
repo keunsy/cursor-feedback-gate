@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1e1e1e; color: #cccccc;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px; padding: 16px; width: 420px;
+    }
+    .header {
+      display: flex; align-items: center; gap: 8px;
+      padding-bottom: 12px; border-bottom: 1px solid #333;
+      margin-bottom: 12px;
+    }
+    .header-icon { font-size: 16px; }
+    .header-title { font-size: 14px; font-weight: 600; color: #e0e0e0; }
+    .header-badge {
+      margin-left: auto; font-size: 11px; color: #888;
+      background: #2a2a2a; padding: 2px 8px; border-radius: 10px;
+    }
+    .agent-message {
+      background: #252526; border: 1px solid #333; border-radius: 8px;
+      padding: 12px 14px; margin-bottom: 12px; line-height: 1.6;
+    }
+    .agent-label { font-size: 11px; color: #888; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .message-text { color: #d4d4d4; }
+    .message-text .highlight { color: #569cd6; }
+    .attachments-area {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px;
+    }
+    .attachment-thumb {
+      width: 64px; height: 64px; border-radius: 6px;
+      border: 1px solid #404040; background: #2a2a2a;
+      display: flex; align-items: center; justify-content: center;
+      position: relative; overflow: hidden;
+    }
+    .attachment-thumb img { width: 100%; height: 100%; object-fit: cover; }
+    .remove-btn {
+      position: absolute; top: 2px; right: 2px;
+      background: rgba(0,0,0,0.7); color: #ccc;
+      border: none; border-radius: 50%; width: 16px; height: 16px;
+      font-size: 10px; cursor: pointer; display: flex;
+      align-items: center; justify-content: center;
+    }
+    .input-area {
+      display: flex; gap: 8px; align-items: flex-end;
+    }
+    .text-input {
+      flex: 1; background: #2d2d2d; border: 1px solid #404040;
+      border-radius: 8px; padding: 10px 12px; color: #cccccc;
+      font-size: 13px; min-height: 40px; resize: none;
+      font-family: inherit; line-height: 1.4;
+    }
+    .text-input::placeholder { color: #666; }
+    .text-input:focus { outline: none; border-color: #007acc; }
+    .action-buttons { display: flex; flex-direction: column; gap: 4px; }
+    .icon-btn {
+      background: #333; border: 1px solid #444; border-radius: 6px;
+      color: #999; width: 32px; height: 32px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; transition: all 0.15s;
+    }
+    .icon-btn:hover { background: #404040; color: #ccc; border-color: #555; }
+    .send-btn {
+      background: #007acc; border: none; border-radius: 6px;
+      color: white; width: 32px; height: 32px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; transition: all 0.15s;
+    }
+    .send-btn:hover { background: #0098ff; }
+    .footer {
+      margin-top: 10px; padding-top: 8px; border-top: 1px solid #2a2a2a;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .hint { font-size: 11px; color: #555; }
+    .shortcut { color: #666; background: #2a2a2a; padding: 1px 5px; border-radius: 3px; font-size: 10px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="header-icon">🔔</span>
+    <span class="header-title">Feedback Gate</span>
+    <span class="header-badge">MCP App</span>
+  </div>
+
+  <div class="agent-message">
+    <div class="agent-label">💬 Agent Message</div>
+    <div class="message-text">
+      已完成代码重构，影响文件：<br>
+      • <span class="highlight">src/service/GameServiceImpl.java</span><br>
+      • <span class="highlight">src/dao/GameDao.java</span><br><br>
+      主要修改：finally 块中添加 null 检查防止 NPE。<br>
+      请确认修改是否正确。
+    </div>
+  </div>
+
+  <div class="attachments-area">
+    <div class="attachment-thumb">
+      <div style="background: linear-gradient(135deg, #4a90d9, #7b68ee); width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: white; font-size: 20px;">📷</div>
+      <button class="remove-btn">✕</button>
+    </div>
+    <div class="attachment-thumb">
+      <div style="background: linear-gradient(135deg, #50c878, #2d8a56); width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: white; font-size: 20px;">📄</div>
+      <button class="remove-btn">✕</button>
+    </div>
+  </div>
+
+  <div class="input-area">
+    <textarea class="text-input" placeholder="输入你的反馈..." rows="2">确认没问题，NPE 修复正确</textarea>
+    <div class="action-buttons">
+      <button class="icon-btn" title="添加附件">📎</button>
+      <button class="send-btn" title="发送">▶</button>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="hint">支持粘贴图片 · 拖拽文件</span>
+    <span class="hint"><span class="shortcut">Enter</span> 发送 · <span class="shortcut">Shift+Enter</span> 换行</span>
+  </div>
+</body>
+</html>

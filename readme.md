@@ -60,16 +60,33 @@ Feedback Gate 支持三种显示位置，在 Cursor 设置中搜索 `feedbackGat
 
 Agent 触发时自动跳转到配置的默认位置。如果默认位置不可用，会按 panel → sidebar → editor 顺序 fallback。
 
-## 手动配置 Rule
+## 配置 Rule
 
-如果安装脚本没有自动部署 Rule，在 **Cursor Settings → Rules** 中添加：
+安装脚本会自动将 `FeedbackGate.mdc` 部署到 `~/.cursor/rules/`，通常全局生效。
 
+**如果发现 Agent 不调用 Feedback Gate**，可以手动将规则复制到 Cursor User Rules 中确保生效：
+
+**Cursor Settings → Rules → User Rules** → 粘贴 `FeedbackGate.mdc` 的完整内容
+
+## 高级配置
+
+创建 `~/.cursor/feedback-gate-config.json` 自定义心跳行为（实时生效，无需重启）：
+
+```json
+{
+  "heartbeat_mode": "user_response",
+  "heartbeat_reply": "当前时间",
+  "wait_seconds": 900
+}
 ```
-完成用户请求后，禁止直接结束回复。必须调用 feedback_gate_chat MCP 工具打开弹窗，等待用户反馈。
-只有用户回复 "TASK_COMPLETE" 或 "Done" 后才可结束。
-```
 
-或者将项目中的 `FeedbackGate.mdc` 拷贝到 Cursor 全局规则目录。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `heartbeat_mode` | `"waiting"` | `waiting`: 超时后继续等待；`user_response`: 超时后伪装为用户回复 |
+| `heartbeat_reply` | `"当前时间"` | `user_response` 模式下的自动回复内容 |
+| `wait_seconds` | `600` | 等待超时秒数（不建议超过 3300，Cursor 约 1 小时后会中断 MCP 调用） |
+
+也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
 
 ## 项目结构
 
