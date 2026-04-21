@@ -581,6 +581,20 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .queue-item-remove:hover { opacity: 0.8; background: rgba(255, 59, 48, 0.15); color: #ff3b30; }
+        
+        .queue-item-pin {
+            background: none;
+            border: none;
+            color: var(--vscode-foreground);
+            opacity: 0.3;
+            cursor: pointer;
+            font-size: 10px;
+            padding: 2px 4px;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        
+        .queue-item-pin:hover { opacity: 0.8; background: rgba(255, 165, 0, 0.15); color: #ffa500; }
 
         #queueImgTooltip {
             position: fixed;
@@ -1335,6 +1349,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     <span class="queue-item-text" \${isPending ? \`onclick="startEditQueueItem(this, \${item.id})" title="点击编辑"\` : ''}>\${badges}\${item.text || (imgCount ? '图片' : '文件')}</span>
                     \${isPending ? \`
                         <span class="queue-item-actions">
+                            \${pi > 0 ? \`<button class="queue-item-pin" onclick="pinQueueItem(\${item.id})" title="置顶">📌</button>\` : ''}
                             <button class="queue-item-remove" onclick="removeQueueItem(\${item.id})" title="移除">✕</button>
                         </span>
                     \` : \`<span style="font-size:10px;opacity:0.5;">⏳</span>\`}
@@ -1388,6 +1403,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             vscode.postMessage({ command: 'moveQueueItem', itemId: itemId, direction: 'down' });
         }
         
+        function pinQueueItem(itemId) {
+            vscode.postMessage({ command: 'pinQueueItem', itemId: itemId });
+        }
+        
         function startEditQueueItem(span, itemId) {
             if (span.tagName === 'INPUT') return;
             const currentText = span.textContent;
@@ -1424,6 +1443,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         window.removeQueueItem = removeQueueItem;
         window.moveQueueItemUp = moveQueueItemUp;
         window.moveQueueItemDown = moveQueueItemDown;
+        window.pinQueueItem = pinQueueItem;
         
         // Make removeImage globally accessible for onclick handlers
         window.removeImage = removeImage;

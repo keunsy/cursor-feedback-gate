@@ -50,6 +50,7 @@ const dequeueMessage = () => queue.dequeueMessage();
 const markQueueItemDone = (id) => queue.markQueueItemDone(id);
 const removeQueueItem = (id) => queue.removeQueueItem(id);
 const moveQueueItem = (id, dir) => queue.moveQueueItem(id, dir);
+const pinQueueItem = (id) => queue.pinQueueItem(id);
 const editQueueItem = (id, t) => queue.editQueueItem(id, t);
 const reorderQueue = (ids) => queue.reorderQueue(ids);
 const getPendingQueueCount = () => queue.getPendingQueueCount();
@@ -163,6 +164,9 @@ class FeedbackGatePanelProvider {
                         break;
                     case 'moveQueueItem':
                         moveQueueItem(webviewMessage.itemId, webviewMessage.direction);
+                        break;
+                    case 'pinQueueItem':
+                        pinQueueItem(webviewMessage.itemId);
                         break;
                     case 'reorderQueue':
                         reorderQueue(webviewMessage.orderedIds);
@@ -1399,6 +1403,9 @@ function openFeedbackGatePopup(context, options = {}) {
                     break;
                 case 'moveQueueItem':
                     moveQueueItem(webviewMessage.itemId, webviewMessage.direction);
+                    break;
+                case 'pinQueueItem':
+                    pinQueueItem(webviewMessage.itemId);
                     break;
                 case 'reorderQueue':
                     reorderQueue(webviewMessage.orderedIds);

@@ -152,6 +152,21 @@ function moveQueueItem(id, direction) {
     syncToWebview();
 }
 
+function pinQueueItem(id) {
+    const pendingItems = messageQueue.filter(m => m.status === 'pending');
+    const idx = pendingItems.findIndex(m => m.id === id);
+    if (idx <= 0) return;
+
+    const item = pendingItems[idx];
+    const actualIdx = messageQueue.indexOf(item);
+    const firstPendingActualIdx = messageQueue.indexOf(pendingItems[0]);
+
+    messageQueue.splice(actualIdx, 1);
+    messageQueue.splice(firstPendingActualIdx, 0, item);
+    saveQueue();
+    syncToWebview();
+}
+
 function editQueueItem(id, newText) {
     const item = messageQueue.find(m => m.id === id && m.status === 'pending');
     if (item) {
@@ -186,6 +201,7 @@ module.exports = {
     markQueueItemDone,
     removeQueueItem,
     moveQueueItem,
+    pinQueueItem,
     editQueueItem,
     reorderQueue,
     getPendingQueueCount,

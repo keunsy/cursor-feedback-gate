@@ -78,7 +78,7 @@ handlers.append(stderr_handler)
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - [PID:%(process)d] %(message)s',
     handlers=handlers
 )
 logger = logging.getLogger(__name__)
@@ -98,6 +98,8 @@ class FeedbackGateServer:
         self._last_attachments = []
         self._last_files = []
         self._server_pid = os.getpid()
+        self._current_wait_task: Optional[asyncio.Task] = None
+        self._wait_task_lock = asyncio.Lock()
         
         # Clean up stale files from dead MCP instances before writing our own PID
         self._cleanup_stale_files()
@@ -270,9 +272,9 @@ class FeedbackGateServer:
                     await asyncio.sleep(1.0)
                     raise ValueError(f"Unknown tool: {name}")
             except asyncio.CancelledError:
-                logger.warning(f"⚠️ Tool call cancelled for {name} (Agent turn aborted)")
+                logger.warning(f"⚠️ [DIAG] Tool call CANCELLED for {name} | pending_trigger={self._pending_trigger_id} | This means Cursor IDE aborted the MCP call (possible IDE-level timeout or user Stop)")
                 if self._pending_trigger_id:
-                    logger.warning(f"🧹 Clearing pending trigger {self._pending_trigger_id} due to cancellation")
+                    logger.warning(f"🧹 [DIAG] Clearing pending trigger {self._pending_trigger_id} due to cancellation — user response may have been lost")
                     self._clear_trigger_state(responded=False)
                 raise
             except Exception as e:
@@ -459,6 +461,9 @@ class FeedbackGateServer:
         context = args.get("context", "")
         urgent = args.get("urgent", False)
         
+        call_entry_time = time.time()
+        logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | msg_preview={message[:80]}...")
+        
         is_remote = bool(self._find_routing_file())
         
         # If a previous trigger is still pending (no response yet), re-enter the
@@ -489,13 +494,41 @@ class FeedbackGateServer:
                         wait_secs = wait_override
                     max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
                     label = "CLI" if is_remote else "IDE"
-                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
-                    user_input = await self._wait_for_user_input(
-                        self._pending_trigger_id, timeout=wait_secs
-                    )
+                    async with self._wait_task_lock:
+                        if self._current_wait_task:
+                            if self._current_wait_task.done():
+                                if not self._current_wait_task.cancelled():
+                                    try:
+                                        old_result = self._current_wait_task.result()
+                                        if old_result:
+                                            logger.info(f"✅ [DIAG] Previous wait task completed with result, reusing | trigger={self._pending_trigger_id}")
+                                            self._current_wait_task = None
+                                            self._clear_trigger_state(responded=True)
+                                            wall_elapsed = time.time() - call_entry_time
+                                            logger.info(f"✅ [DIAG] RE-ENTER reused previous result after {wall_elapsed:.1f}s | trigger={self._pending_trigger_id} | input={old_result[:100]}...")
+                                            result = [TextContent(type="text", text=f"User Response: {old_result}")]
+                                            self._append_media_to_response(result)
+                                            return result
+                                    except Exception as e:
+                                        logger.debug(f"[DIAG] Could not reuse previous wait result: {e}")
+                            else:
+                                logger.info(f"🔄 [DIAG] Cancelling previous wait task before re-entering wait for {self._pending_trigger_id}")
+                                self._current_wait_task.cancel()
+                                try:
+                                    await self._current_wait_task
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception as e:
+                                    logger.debug(f"[DIAG] Previous wait task raised on cancel: {e}")
+                        logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
+                        self._current_wait_task = asyncio.ensure_future(
+                            self._wait_for_user_input(self._pending_trigger_id, timeout=wait_secs)
+                        )
+                    user_input = await self._current_wait_task
                     if user_input:
                         self._clear_trigger_state(responded=True)
-                        logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
+                        wall_elapsed = time.time() - call_entry_time
+                        logger.info(f"✅ [DIAG] RE-ENTER got user feedback after {wall_elapsed:.1f}s wall-time | trigger={self._pending_trigger_id} | input={user_input[:100]}...")
                         result = [TextContent(type="text", text=f"User Response: {user_input}")]
                         self._append_media_to_response(result)
                         return result
@@ -503,12 +536,13 @@ class FeedbackGateServer:
                         self._heartbeat_count += 1
                         elapsed_total = self._heartbeat_count * wait_secs
                         elapsed_min = elapsed_total / 60
+                        wall_elapsed = time.time() - call_entry_time
                         if elapsed_total >= max_secs:
                             self._clear_trigger_state(responded=False)
                             max_hours = max_secs / 3600
-                            logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min)")
+                            logger.warning(f"⏰ [DIAG] RE-ENTER {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
                             return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
-                        logger.info(f"⏳ Still waiting for user reply (trigger {self._pending_trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min, {label})")
+                        logger.info(f"⏳ [DIAG] RE-ENTER heartbeat #{self._heartbeat_count} | trigger={self._pending_trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative | {label}")
                         return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
@@ -594,11 +628,25 @@ class FeedbackGateServer:
             max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
             label = "CLI" if is_remote else "IDE"
             logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
-            user_input = await self._wait_for_user_input(trigger_id, timeout=wait_secs)
+            async with self._wait_task_lock:
+                if self._current_wait_task and not self._current_wait_task.done():
+                    logger.info(f"🔄 [DIAG] Cancelling previous wait task before starting new wait for {trigger_id}")
+                    self._current_wait_task.cancel()
+                    try:
+                        await self._current_wait_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.debug(f"[DIAG] Previous wait task raised on cancel: {e}")
+                self._current_wait_task = asyncio.ensure_future(
+                    self._wait_for_user_input(trigger_id, timeout=wait_secs)
+                )
+            user_input = await self._current_wait_task
             
             if user_input:
                 self._clear_trigger_state(responded=True)
-                logger.info(f"✅ RETURNING USER FEEDBACK TO MCP CLIENT: {user_input[:100]}...")
+                wall_elapsed = time.time() - call_entry_time
+                logger.info(f"✅ [DIAG] RETURNING USER FEEDBACK after {wall_elapsed:.1f}s wall-time | trigger={trigger_id} | input={user_input[:100]}...")
                 
                 response_content = [TextContent(type="text", text=f"User Response: {user_input}")]
                 
@@ -609,12 +657,13 @@ class FeedbackGateServer:
                 self._heartbeat_count += 1
                 elapsed_total = self._heartbeat_count * wait_secs
                 elapsed_min = elapsed_total / 60
+                wall_elapsed = time.time() - call_entry_time
                 if elapsed_total >= max_secs:
                     self._clear_trigger_state(responded=False)
                     max_hours = max_secs / 3600
-                    logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min)")
+                    logger.warning(f"⏰ [DIAG] {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
                     return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
-                logger.info(f"⏳ {label} wait timed out, returning heartbeat (trigger {trigger_id}, heartbeat #{self._heartbeat_count}, ~{elapsed_min:.1f}min)")
+                logger.info(f"⏳ [DIAG] {label} wait timed out, returning heartbeat #{self._heartbeat_count} | trigger={trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative")
                 return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         else:
             response = f"ERROR: Failed to trigger Feedback Gate popup"
@@ -946,7 +995,8 @@ class FeedbackGateServer:
                 logger.error(f"❌ Error in wait loop: {e}")
                 await asyncio.sleep(0.5)
         
-        logger.warning(f"⏰ TIMEOUT waiting for user input (trigger_id: {trigger_id})")
+        actual_elapsed = time.time() - start_time
+        logger.warning(f"⏰ [DIAG] TIMEOUT waiting for user input | trigger={trigger_id} | config_timeout={timeout}s | actual_elapsed={actual_elapsed:.1f}s")
         return None
 
     async def _trigger_cursor_popup_immediately(self, data: dict) -> bool:
