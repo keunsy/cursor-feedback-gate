@@ -1333,7 +1333,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 const fileCount = (item.files || []).length;
                 const badges = [
                     item.sourceLabel ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;">📨\${item.sourceLabel}</span>\` : '',
-                    imgCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${imgCount}张图片">🖼️\${imgCount > 1 ? imgCount : ''}</span>\` : '',
+                    imgCount ? \`<span class="queue-img-badge" style="font-size:10px;opacity:0.6;margin-right:3px;cursor:default;" data-queue-id="\${item.id}" title="\${imgCount}张图片">🖼️\${imgCount > 1 ? imgCount : ''}</span>\` : '',
                     fileCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${(item.files||[]).map(f=>f.name||f.path||'文件').join(', ')}">📎\${fileCount > 1 ? fileCount : ''}</span>\` : '',
                 ].filter(Boolean).join('');
                 if (imgCount) _queueAttachmentsMap.set(item.id, item.attachments);
@@ -1360,32 +1360,37 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
         }
         
+        let _queueHoverTimer = null;
         function bindQueueImgHover() {
             const tooltip = document.getElementById('queueImgTooltip');
             if (!tooltip) return;
-            document.querySelectorAll('.queue-item.has-imgs').forEach(el => {
-                el.addEventListener('mouseenter', function () {
-                    const qid = Number(el.dataset.queueId);
-                    const atts = _queueAttachmentsMap.get(qid);
-                    if (!atts || atts.length === 0) return;
-                    const thumbs = atts.map(att => {
-                        const src = att.dataUrl || (att.base64Data && att.base64Data !== '[TOO_LARGE_FOR_QUEUE]' ? \`data:\${att.mimeType || 'image/png'};base64,\${att.base64Data}\` : '') || (att.data && att.data !== '[TOO_LARGE_FOR_QUEUE]' ? att.data : '');
-                        if (!src) return '<div class="img-placeholder">🖼️</div>';
-                        return \`<img src="\${src}" alt="\${att.fileName || '图片'}">\`;
-                    });
-                    tooltip.innerHTML = thumbs.join('');
-                    const rect = el.getBoundingClientRect();
-                    tooltip.style.left = Math.min(rect.left, window.innerWidth - 330) + 'px';
-                    if (rect.top > 120) {
-                        tooltip.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
-                        tooltip.style.top = 'auto';
-                    } else {
-                        tooltip.style.top = (rect.bottom + 6) + 'px';
-                        tooltip.style.bottom = 'auto';
-                    }
-                    tooltip.classList.add('visible');
+            document.querySelectorAll('.queue-img-badge').forEach(badge => {
+                badge.addEventListener('mouseenter', function () {
+                    clearTimeout(_queueHoverTimer);
+                    _queueHoverTimer = setTimeout(() => {
+                        const qid = Number(badge.dataset.queueId);
+                        const atts = _queueAttachmentsMap.get(qid);
+                        if (!atts || atts.length === 0) return;
+                        const thumbs = atts.map(att => {
+                            const src = att.dataUrl || (att.base64Data && att.base64Data !== '[TOO_LARGE_FOR_QUEUE]' ? \`data:\${att.mimeType || 'image/png'};base64,\${att.base64Data}\` : '') || (att.data && att.data !== '[TOO_LARGE_FOR_QUEUE]' ? att.data : '');
+                            if (!src) return '<div class="img-placeholder">🖼️</div>';
+                            return \`<img src="\${src}" alt="\${att.fileName || '图片'}">\`;
+                        });
+                        tooltip.innerHTML = thumbs.join('');
+                        const rect = badge.getBoundingClientRect();
+                        tooltip.style.left = Math.min(rect.left, window.innerWidth - 330) + 'px';
+                        if (rect.top > 120) {
+                            tooltip.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+                            tooltip.style.top = 'auto';
+                        } else {
+                            tooltip.style.top = (rect.bottom + 6) + 'px';
+                            tooltip.style.bottom = 'auto';
+                        }
+                        tooltip.classList.add('visible');
+                    }, 300);
                 });
-                el.addEventListener('mouseleave', function () {
+                badge.addEventListener('mouseleave', function () {
+                    clearTimeout(_queueHoverTimer);
                     tooltip.classList.remove('visible');
                 });
             });

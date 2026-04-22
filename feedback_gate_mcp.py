@@ -461,6 +461,9 @@ class FeedbackGateServer:
         context = args.get("context", "")
         urgent = args.get("urgent", False)
         
+        self._last_attachments = []
+        self._last_files = []
+        
         call_entry_time = time.time()
         logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | msg_preview={message[:80]}...")
         
