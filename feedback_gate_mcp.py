@@ -89,6 +89,28 @@ for handler in logger.handlers:
     if hasattr(handler, 'flush'):
         handler.flush()
 
+# === Compact event log for request-time correlation ===
+_event_log_path = get_temp_path('feedback_gate_events.log')
+_event_logger = logging.getLogger('fg_events')
+_event_logger.setLevel(logging.INFO)
+_event_logger.propagate = False
+try:
+    _evt_handler = RotatingFileHandler(
+        _event_log_path, mode='a', encoding='utf-8',
+        maxBytes=2 * 1024 * 1024, backupCount=1,
+    )
+    _evt_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    _event_logger.addHandler(_evt_handler)
+except Exception:
+    pass
+
+def _log_event(event_type: str, detail: str = ""):
+    """Write a single-line event to the compact event log."""
+    pid = os.getpid()
+    _event_logger.info(f"PID:{pid} | {event_type} | {detail}")
+    for h in _event_logger.handlers:
+        h.flush()
+
 class FeedbackGateServer:
     def __init__(self):
         self.server = Server("feedback-gate")
@@ -273,9 +295,14 @@ class FeedbackGateServer:
                     raise ValueError(f"Unknown tool: {name}")
             except asyncio.CancelledError:
                 logger.warning(f"⚠️ [DIAG] Tool call CANCELLED for {name} | pending_trigger={self._pending_trigger_id} | This means Cursor IDE aborted the MCP call (possible IDE-level timeout or user Stop)")
+                _log_event("CANCELLED", f"tool={name} trigger={self._pending_trigger_id}")
                 if self._pending_trigger_id:
-                    logger.warning(f"🧹 [DIAG] Clearing pending trigger {self._pending_trigger_id} due to cancellation — user response may have been lost")
-                    self._clear_trigger_state(responded=False)
+                    # Do NOT clear trigger state on cancellation — the extension popup
+                    # is still alive and the user may respond later.  Clearing here caused
+                    # a race condition where the next feedback_gate_chat call would create
+                    # a NEW trigger while the extension was still bound to the old one,
+                    # resulting in lost user messages.
+                    logger.info(f"🔒 [DIAG] PRESERVING pending trigger {self._pending_trigger_id} despite cancellation — popup is still alive, user may respond later")
                 raise
             except Exception as e:
                 logger.error(f"💥 Tool call error for {name}: {e}")
@@ -291,7 +318,7 @@ class FeedbackGateServer:
     _last_trigger_responded_at: float = 0
     _heartbeat_count: int = 0
     _STALE_TRIGGER_SECONDS_CLI: int = 120   # 2min — stale for CLI mode (50s heartbeat)
-    _STALE_TRIGGER_SECONDS_IDE: int = 4200  # 70min — stale for IDE mode (55min heartbeat)
+    _STALE_TRIGGER_SECONDS_IDE: int = 86400  # 24h default — dynamically overridable via config
 
     def _clear_trigger_state(self, responded: bool = False):
         """Reset all trigger tracking fields consistently.
@@ -344,6 +371,8 @@ class FeedbackGateServer:
             return user_input if user_input else None
         except Exception as e:
             logger.error(f"❌ Error reading response file {response_file}: {e}")
+            self._last_attachments = []
+            self._last_files = []
             return None
 
     def _append_media_to_response(self, response_content: list):
@@ -400,14 +429,15 @@ class FeedbackGateServer:
     )
 
     @classmethod
-    def _load_heartbeat_config(cls) -> tuple[str, str, int | None]:
-        """Read heartbeat mode, reply, and optional wait_seconds from config file.
+    def _load_heartbeat_config(cls) -> tuple[str, str, int | None, int | None]:
+        """Read heartbeat mode, reply, optional wait_seconds, and optional stale_seconds from config file.
         Config file is re-read on every heartbeat so changes take effect
         without restarting the MCP server.
-        Returns (mode, reply, wait_seconds_override_or_None)."""
+        Returns (mode, reply, wait_seconds_override_or_None, stale_seconds_override_or_None)."""
         mode = os.environ.get("FEEDBACK_GATE_HEARTBEAT_MODE", "waiting").lower()
         reply = os.environ.get("FEEDBACK_GATE_HEARTBEAT_REPLY", "当前时间")
         wait_override: int | None = None
+        stale_override: int | None = None
         try:
             cfg_path = Path(cls._HEARTBEAT_CONFIG_PATH)
             if cfg_path.exists():
@@ -416,9 +446,11 @@ class FeedbackGateServer:
                 reply = cfg.get("heartbeat_reply", reply)
                 if "wait_seconds" in cfg:
                     wait_override = int(cfg["wait_seconds"])
+                if "stale_seconds" in cfg:
+                    stale_override = int(cfg["stale_seconds"])
         except Exception as e:
             logger.debug(f"Failed to read heartbeat config: {e}")
-        return mode, reply, wait_override
+        return mode, reply, wait_override, stale_override
 
     @staticmethod
     def _build_heartbeat_message(count: int, elapsed_min: float) -> str:
@@ -448,7 +480,7 @@ class FeedbackGateServer:
         - 'waiting' (default): [WAITING] + re-call instruction
         - 'user_response': fake User Response to keep a normal Agent cycle
         """
-        mode, reply, _ = self._load_heartbeat_config()
+        mode, reply, _, _ = self._load_heartbeat_config()
         if mode == "user_response":
             logger.info(f"💓 Heartbeat using user_response mode: '{reply}'")
             return f"User Response: {reply}"
@@ -466,6 +498,7 @@ class FeedbackGateServer:
         
         call_entry_time = time.time()
         logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | msg_preview={message[:80]}...")
+        _log_event("ENTERED", f"trigger={self._pending_trigger_id} hb={self._heartbeat_count} msg={message[:60]}")
         
         is_remote = bool(self._find_routing_file())
         
@@ -476,8 +509,13 @@ class FeedbackGateServer:
         if self._pending_trigger_id:
             stale_age = time.time() - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
             stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
+            if not is_remote:
+                _, _, _, stale_override = self._load_heartbeat_config()
+                if stale_override is not None:
+                    stale_limit = stale_override
             if stale_age > stale_limit:
                 logger.warning(f"🧹 Clearing stale pending trigger {self._pending_trigger_id} (age: {stale_age:.0f}s)")
+                _log_event("TRIGGER_EXPIRED", f"trigger={self._pending_trigger_id} age={stale_age:.0f}s limit={stale_limit:.0f}s")
                 self._clear_trigger_state(responded=False)
             else:
                 response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
@@ -492,7 +530,7 @@ class FeedbackGateServer:
                     self._clear_trigger_state(responded=False)
                 else:
                     wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-                    _, _, wait_override = self._load_heartbeat_config()
+                    _, _, wait_override, _ = self._load_heartbeat_config()
                     if wait_override is not None and not is_remote:
                         wait_secs = wait_override
                     max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
@@ -532,6 +570,7 @@ class FeedbackGateServer:
                         self._clear_trigger_state(responded=True)
                         wall_elapsed = time.time() - call_entry_time
                         logger.info(f"✅ [DIAG] RE-ENTER got user feedback after {wall_elapsed:.1f}s wall-time | trigger={self._pending_trigger_id} | input={user_input[:100]}...")
+                        _log_event("USER_RESPONSE", f"path=re-enter trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
                         result = [TextContent(type="text", text=f"User Response: {user_input}")]
                         self._append_media_to_response(result)
                         return result
@@ -546,6 +585,7 @@ class FeedbackGateServer:
                             logger.warning(f"⏰ [DIAG] RE-ENTER {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
                             return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
                         logger.info(f"⏳ [DIAG] RE-ENTER heartbeat #{self._heartbeat_count} | trigger={self._pending_trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative | {label}")
+                        _log_event("HEARTBEAT", f"#{self._heartbeat_count} trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
                         return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
@@ -595,6 +635,7 @@ class FeedbackGateServer:
             self._pending_trigger_created_at = time.time()
             self._heartbeat_count = 0
             logger.info(f"🔥 POPUP TRIGGERED IMMEDIATELY - waiting for user input (trigger_id: {trigger_id})")
+            _log_event("NEW_TRIGGER", f"trigger={trigger_id} msg={message[:60]}")
             
             # Quick check: is the extension alive?
             # The extension polls every 250ms and deletes trigger files immediately.
@@ -625,7 +666,7 @@ class FeedbackGateServer:
                 logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
             wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-            _, _, wait_override = self._load_heartbeat_config()
+            _, _, wait_override, _ = self._load_heartbeat_config()
             if wait_override is not None and not is_remote:
                 wait_secs = wait_override
             max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
@@ -650,6 +691,7 @@ class FeedbackGateServer:
                 self._clear_trigger_state(responded=True)
                 wall_elapsed = time.time() - call_entry_time
                 logger.info(f"✅ [DIAG] RETURNING USER FEEDBACK after {wall_elapsed:.1f}s wall-time | trigger={trigger_id} | input={user_input[:100]}...")
+                _log_event("USER_RESPONSE", f"path=first-wait trigger={trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
                 
                 response_content = [TextContent(type="text", text=f"User Response: {user_input}")]
                 
@@ -667,6 +709,7 @@ class FeedbackGateServer:
                     logger.warning(f"⏰ [DIAG] {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
                     return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
                 logger.info(f"⏳ [DIAG] {label} wait timed out, returning heartbeat #{self._heartbeat_count} | trigger={trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative")
+                _log_event("HEARTBEAT", f"#{self._heartbeat_count} trigger={trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min (first-wait)")
                 return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         else:
             response = f"ERROR: Failed to trigger Feedback Gate popup"
@@ -1072,14 +1115,17 @@ class FeedbackGateServer:
                 logger.info(f"✅ Trigger file was consumed immediately by extension: {trigger_file}")
                 file_size = len(json.dumps(trigger_data, indent=2))
             
-            # Force file system sync with retry
-            for attempt in range(3):
+            # Flush trigger file to disk (single-file flush, not full os.sync())
+            try:
+                fd = os.open(str(trigger_file), os.O_RDONLY)
                 try:
-                    os.sync()
-                    break
-                except Exception as sync_error:
-                    logger.warning(f"⚠️ Sync attempt {attempt + 1} failed: {sync_error}")
-                    await asyncio.sleep(0.1)  # Wait 100ms between attempts
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except FileNotFoundError:
+                pass
+            except Exception as sync_error:
+                logger.debug(f"fsync skipped: {sync_error}")
             
             logger.info(f"🔥 IMMEDIATE trigger created for Cursor: {trigger_file}")
             logger.info(f"📁 Trigger file path: {trigger_file.absolute()}")
@@ -1185,20 +1231,31 @@ class FeedbackGateServer:
                 logger.info("🏁 Feedback Gate server completed normally")
 
     async def _heartbeat_logger(self):
-        """Periodically update log file to keep MCP status active in extension"""
+        """Periodically update log file to keep MCP status active in extension.
+        
+        Extension checks log mtime < 30s to determine if MCP is alive,
+        so we must write at least every 20s.  To reduce log noise, only
+        write an INFO line every 5 minutes; other cycles just flush handlers
+        (which updates mtime without adding content).
+        """
         logger.info("💓 Starting heartbeat logger for extension status monitoring")
         heartbeat_count = 0
         
         while not self.shutdown_requested:
             try:
-                # Update log every 10 seconds to keep file modification time fresh
-                await asyncio.sleep(10)
+                await asyncio.sleep(20)
                 heartbeat_count += 1
                 
-                # Write heartbeat to log
-                logger.info(f"💓 MCP heartbeat #{heartbeat_count} - Server is active and ready")
+                if heartbeat_count % 15 == 0:
+                    logger.info(f"💓 MCP heartbeat #{heartbeat_count} - Server is active and ready")
                 
-                # Force log flush to ensure file is updated
+                # Touch log file to update mtime — extension checks mtime < 30s.
+                # On non-INFO cycles we skip the log line but still need mtime updated.
+                try:
+                    Path(log_file_path).touch(exist_ok=True)
+                except Exception:
+                    pass
+                
                 for handler in logger.handlers:
                     if hasattr(handler, 'flush'):
                         handler.flush()
@@ -1238,6 +1295,7 @@ class FeedbackGateServer:
 async def main():
     """Main entry point for Feedback Gate MCP Server"""
     logger.info("🎬 STARTING Feedback Gate MCP Server...")
+    _log_event("SERVER_START", f"pid={os.getpid()} python={sys.version.split()[0]}")
     logger.info(f"Python version: {sys.version}")
     logger.info(f"Platform: {sys.platform}")
     logger.info(f"OS name: {os.name}")
@@ -1256,7 +1314,9 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        _log_event("SERVER_STOP", "reason=KeyboardInterrupt")
         logger.info("🛑 Server stopped by user")
     except Exception as e:
+        _log_event("SERVER_STOP", f"reason=crash error={e}")
         logger.error(f"❌ Server crashed: {e}")
         sys.exit(1) 
