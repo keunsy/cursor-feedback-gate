@@ -104,10 +104,29 @@ try:
 except Exception:
     pass
 
+_last_entered_time: float = 0.0
+_last_event_time: float = 0.0
+
 def _log_event(event_type: str, detail: str = ""):
-    """Write a single-line event to the compact event log."""
+    """Write a single-line event to the compact event log.
+    For ENTERED events, also logs the gap since last ENTERED/HEARTBEAT/CANCELLED
+    to help distinguish same-turn re-calls from new requests."""
+    global _last_entered_time, _last_event_time
     pid = os.getpid()
-    _event_logger.info(f"PID:{pid} | {event_type} | {detail}")
+    now = time.time()
+    gap_info = ""
+    if event_type == "ENTERED":
+        if _last_event_time > 0:
+            gap = now - _last_event_time
+            if gap < 1.5:
+                gap_info = f" gap={gap:.2f}s(same-turn)"
+            elif gap < 15:
+                gap_info = f" gap={gap:.1f}s(maybe-new-req)"
+            else:
+                gap_info = f" gap={gap:.0f}s(new-req)"
+        _last_entered_time = now
+    _last_event_time = now
+    _event_logger.info(f"PID:{pid} | {event_type} | {detail}{gap_info}")
     for h in _event_logger.handlers:
         h.flush()
 
@@ -334,7 +353,9 @@ class FeedbackGateServer:
 
     def _read_and_consume_response(self, response_file: Path) -> str | None:
         """Read a response JSON file, populate _last_attachments/_last_files, delete the file.
-        Returns user_input string or None if parsing failed."""
+        Returns user_input string or None if parsing failed.
+        IMPORTANT: file is only deleted when valid content is extracted — if content
+        is empty/unreadable, the file is left intact so the caller can retry later."""
         try:
             file_content = response_file.read_text().strip()
             if not file_content:
@@ -367,8 +388,13 @@ class FeedbackGateServer:
                 self._last_attachments = []
                 self._last_files = []
 
-            response_file.unlink(missing_ok=True)
-            return user_input if user_input else None
+            if user_input:
+                response_file.unlink(missing_ok=True)
+                return user_input
+            return None
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ Response file has invalid JSON (may still be writing): {e}")
+            return None
         except Exception as e:
             logger.error(f"❌ Error reading response file {response_file}: {e}")
             self._last_attachments = []
@@ -524,69 +550,72 @@ class FeedbackGateServer:
                     if ready_input:
                         self._clear_trigger_state(responded=True)
                         logger.info(f"✅ Found ready response for pending trigger: {ready_input[:100]}...")
+                        _log_event("USER_RESPONSE", f"path=ready-file trigger={self._pending_trigger_id} input={ready_input[:60]}")
                         result = [TextContent(type="text", text=f"User Response: {ready_input}")]
                         self._append_media_to_response(result)
                         return result
-                    self._clear_trigger_state(responded=False)
-                else:
-                    wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-                    _, _, wait_override, _ = self._load_heartbeat_config()
-                    if wait_override is not None and not is_remote:
-                        wait_secs = wait_override
-                    max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
-                    label = "CLI" if is_remote else "IDE"
-                    async with self._wait_task_lock:
-                        if self._current_wait_task:
-                            if self._current_wait_task.done():
-                                if not self._current_wait_task.cancelled():
-                                    try:
-                                        old_result = self._current_wait_task.result()
-                                        if old_result:
-                                            logger.info(f"✅ [DIAG] Previous wait task completed with result, reusing | trigger={self._pending_trigger_id}")
-                                            self._current_wait_task = None
-                                            self._clear_trigger_state(responded=True)
-                                            wall_elapsed = time.time() - call_entry_time
-                                            logger.info(f"✅ [DIAG] RE-ENTER reused previous result after {wall_elapsed:.1f}s | trigger={self._pending_trigger_id} | input={old_result[:100]}...")
-                                            result = [TextContent(type="text", text=f"User Response: {old_result}")]
-                                            self._append_media_to_response(result)
-                                            return result
-                                    except Exception as e:
-                                        logger.debug(f"[DIAG] Could not reuse previous wait result: {e}")
-                            else:
-                                logger.info(f"🔄 [DIAG] Cancelling previous wait task before re-entering wait for {self._pending_trigger_id}")
-                                self._current_wait_task.cancel()
+                    logger.warning(f"⚠️ Response file existed but content was empty/unreadable for trigger={self._pending_trigger_id}, continuing to wait")
+                    _log_event("EMPTY_RESPONSE_FILE", f"trigger={self._pending_trigger_id}")
+
+                # Either no response file yet, or it was empty — continue waiting
+                wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
+                _, _, wait_override, _ = self._load_heartbeat_config()
+                if wait_override is not None and not is_remote:
+                    wait_secs = wait_override
+                max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
+                label = "CLI" if is_remote else "IDE"
+                async with self._wait_task_lock:
+                    if self._current_wait_task:
+                        if self._current_wait_task.done():
+                            if not self._current_wait_task.cancelled():
                                 try:
-                                    await self._current_wait_task
-                                except asyncio.CancelledError:
-                                    pass
+                                    old_result = self._current_wait_task.result()
+                                    if old_result:
+                                        logger.info(f"✅ [DIAG] Previous wait task completed with result, reusing | trigger={self._pending_trigger_id}")
+                                        self._current_wait_task = None
+                                        self._clear_trigger_state(responded=True)
+                                        wall_elapsed = time.time() - call_entry_time
+                                        logger.info(f"✅ [DIAG] RE-ENTER reused previous result after {wall_elapsed:.1f}s | trigger={self._pending_trigger_id} | input={old_result[:100]}...")
+                                        result = [TextContent(type="text", text=f"User Response: {old_result}")]
+                                        self._append_media_to_response(result)
+                                        return result
                                 except Exception as e:
-                                    logger.debug(f"[DIAG] Previous wait task raised on cancel: {e}")
-                        logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
-                        self._current_wait_task = asyncio.ensure_future(
-                            self._wait_for_user_input(self._pending_trigger_id, timeout=wait_secs)
-                        )
-                    user_input = await self._current_wait_task
-                    if user_input:
-                        self._clear_trigger_state(responded=True)
-                        wall_elapsed = time.time() - call_entry_time
-                        logger.info(f"✅ [DIAG] RE-ENTER got user feedback after {wall_elapsed:.1f}s wall-time | trigger={self._pending_trigger_id} | input={user_input[:100]}...")
-                        _log_event("USER_RESPONSE", f"path=re-enter trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
-                        result = [TextContent(type="text", text=f"User Response: {user_input}")]
-                        self._append_media_to_response(result)
-                        return result
-                    else:
-                        self._heartbeat_count += 1
-                        elapsed_total = self._heartbeat_count * wait_secs
-                        elapsed_min = elapsed_total / 60
-                        wall_elapsed = time.time() - call_entry_time
-                        if elapsed_total >= max_secs:
-                            self._clear_trigger_state(responded=False)
-                            max_hours = max_secs / 3600
-                            logger.warning(f"⏰ [DIAG] RE-ENTER {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
-                            return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
-                        logger.info(f"⏳ [DIAG] RE-ENTER heartbeat #{self._heartbeat_count} | trigger={self._pending_trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative | {label}")
-                        _log_event("HEARTBEAT", f"#{self._heartbeat_count} trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
-                        return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
+                                    logger.debug(f"[DIAG] Could not reuse previous wait result: {e}")
+                        else:
+                            logger.info(f"🔄 [DIAG] Cancelling previous wait task before re-entering wait for {self._pending_trigger_id}")
+                            self._current_wait_task.cancel()
+                            try:
+                                await self._current_wait_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as e:
+                                logger.debug(f"[DIAG] Previous wait task raised on cancel: {e}")
+                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
+                    self._current_wait_task = asyncio.ensure_future(
+                        self._wait_for_user_input(self._pending_trigger_id, timeout=wait_secs)
+                    )
+                user_input = await self._current_wait_task
+                if user_input:
+                    self._clear_trigger_state(responded=True)
+                    wall_elapsed = time.time() - call_entry_time
+                    logger.info(f"✅ [DIAG] RE-ENTER got user feedback after {wall_elapsed:.1f}s wall-time | trigger={self._pending_trigger_id} | input={user_input[:100]}...")
+                    _log_event("USER_RESPONSE", f"path=re-enter trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
+                    result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                    self._append_media_to_response(result)
+                    return result
+                else:
+                    self._heartbeat_count += 1
+                    elapsed_total = self._heartbeat_count * wait_secs
+                    elapsed_min = elapsed_total / 60
+                    wall_elapsed = time.time() - call_entry_time
+                    if elapsed_total >= max_secs:
+                        self._clear_trigger_state(responded=False)
+                        max_hours = max_secs / 3600
+                        logger.warning(f"⏰ [DIAG] RE-ENTER {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
+                        return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
+                    logger.info(f"⏳ [DIAG] RE-ENTER heartbeat #{self._heartbeat_count} | trigger={self._pending_trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative | {label}")
+                    _log_event("HEARTBEAT", f"#{self._heartbeat_count} trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
+                    return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
         
         # Brief cooldown: avoid rapid re-trigger right after receiving a response.
         # Only 2 seconds — long enough to let Agent process feedback, short enough to
