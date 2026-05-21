@@ -715,6 +715,59 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         .code-refs-area:empty { display: none; }
+        
+        /* Session tabs */
+        .session-tabs {
+            flex-shrink: 0;
+            display: none;
+            align-items: center;
+            gap: 2px;
+            padding: 4px 10px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            background: var(--vscode-editor-background);
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+        .session-tabs::-webkit-scrollbar { display: none; }
+        .session-tabs.visible { display: flex; }
+        
+        .session-tab {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+            white-space: nowrap;
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--vscode-foreground);
+            opacity: 0.6;
+            transition: all 0.15s ease;
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .session-tab:hover { opacity: 0.85; background: rgba(255,255,255,0.04); }
+        .session-tab.active {
+            opacity: 1;
+            background: rgba(59,130,246,0.1);
+            border-color: rgba(59,130,246,0.3);
+        }
+        .session-tab .tab-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .session-tab .tab-dot.pending {
+            background: var(--vscode-charts-green, #4caf50);
+            animation: pulse 1.5s infinite;
+        }
+        .session-tab .tab-dot.idle {
+            background: rgba(128,128,128,0.4);
+        }
     </style>
 </head>
 <body>
@@ -727,6 +780,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 <div class="mcp-status" id="mcpStatus">MCP 未激活</div>
             </div>
         </div>
+        
+        <div class="session-tabs" id="sessionTabs"></div>
         
         <div class="messages-container" id="messages">
             <!-- Messages will be added here -->
@@ -782,12 +837,14 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         const queueList = document.getElementById('queueList');
         const queueBadge = document.getElementById('queueBadge');
         
+        const sessionTabs = document.getElementById('sessionTabs');
         let messageCount = 0;
         let mcpActive = false;
         let mcpIntegration = ${mcpIntegration};
         let attachedImages = [];
         let codeReferences = [];
         const codeRefsArea = document.getElementById('codeRefsArea');
+        let currentSessionKey = null;
         
         function updateMcpStatus(active, hasPendingTrigger) {
             mcpActive = active;
@@ -1309,13 +1366,21 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 case 'syncQueue':
                     renderQueue(message.items, message.pendingCount);
                     break;
+                case 'syncTabs':
+                    renderSessionTabs(message.tabs, message.activeKey);
+                    break;
+                case 'loadSession':
+                    loadSession(message.sessionKey, message.label, message.messages, message.draft, message.hasPendingTrigger);
+                    break;
             }
         });
         
         const _queueAttachmentsMap = new Map();
+        const _queueTextMap = new Map();
 
         function renderQueue(items, pendingCount) {
             _queueAttachmentsMap.clear();
+            _queueTextMap.clear();
             if (!items || items.length === 0) {
                 queueContainer.classList.add('empty');
                 queueList.innerHTML = '';
@@ -1337,6 +1402,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     fileCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${(item.files||[]).map(f=>f.name||f.path||'文件').join(', ')}">📎\${fileCount > 1 ? fileCount : ''}</span>\` : '',
                 ].filter(Boolean).join('');
                 if (imgCount) _queueAttachmentsMap.set(item.id, item.attachments);
+                _queueTextMap.set(item.id, item.text || '');
                 return \`
                 <div class="queue-item\${imgCount ? ' has-imgs' : ''}" data-queue-id="\${item.id}">
                     \${isPending && pendingItems.length > 1 ? \`
@@ -1414,33 +1480,28 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         function startEditQueueItem(span, itemId) {
             if (span.tagName === 'INPUT') return;
-            const currentText = span.textContent;
+            const rawText = _queueTextMap.get(itemId) || '';
             const input = document.createElement('input');
             input.type = 'text';
             input.className = 'queue-item-text-edit';
-            input.value = currentText;
+            input.value = rawText;
             span.replaceWith(input);
             input.focus();
             input.select();
             
             function commitEdit() {
                 const newText = input.value.trim();
-                if (newText && newText !== currentText) {
+                if (newText && newText !== rawText) {
                     vscode.postMessage({ command: 'editQueueItem', itemId: itemId, newText: newText });
                 } else {
-                    const newSpan = document.createElement('span');
-                    newSpan.className = 'queue-item-text';
-                    newSpan.textContent = currentText;
-                    newSpan.onclick = () => startEditQueueItem(newSpan, itemId);
-                    newSpan.title = '点击编辑';
-                    input.replaceWith(newSpan);
+                    vscode.postMessage({ command: 'cancelEditQueueItem', itemId: itemId });
                 }
             }
             
             input.addEventListener('blur', commitEdit);
             input.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); input.blur(); }
-                if (e.key === 'Escape') { input.value = currentText; input.blur(); }
+                if (e.key === 'Escape') { input.value = rawText; input.blur(); }
             });
         }
         
@@ -1452,6 +1513,55 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         // Make removeImage globally accessible for onclick handlers
         window.removeImage = removeImage;
+        
+        function renderSessionTabs(tabs, activeKey) {
+            if (!tabs || tabs.length <= 1) {
+                sessionTabs.classList.remove('visible');
+                sessionTabs.innerHTML = '';
+                return;
+            }
+            sessionTabs.classList.add('visible');
+            sessionTabs.innerHTML = tabs.map(t => {
+                const isActive = t.key === activeKey;
+                const dotClass = t.hasPendingTrigger ? 'pending' : 'idle';
+                const label = escapeHtml(t.label || '对话');
+                return \`<div class="session-tab\${isActive ? ' active' : ''}" data-session-key="\${t.key}" title="\${label}\${t.lastMessage ? '\\n' + escapeHtml(t.lastMessage) : ''}">
+                    <span class="tab-dot \${dotClass}"></span>
+                    <span>\${label}</span>
+                </div>\`;
+            }).join('');
+            sessionTabs.querySelectorAll('.session-tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    const key = tab.dataset.sessionKey;
+                    if (key && key !== currentSessionKey) {
+                        vscode.postMessage({
+                            command: 'switchSession',
+                            sessionKey: key,
+                            draft: messageInput.value || '',
+                        });
+                    }
+                });
+            });
+        }
+        
+        function loadSession(sessionKey, label, messages, draft, hasPendingTrigger) {
+            currentSessionKey = sessionKey;
+            // Clear current messages
+            messagesContainer.innerHTML = '';
+            messageCount = 0;
+            // Replay session messages
+            if (messages && messages.length > 0) {
+                messages.forEach(msg => {
+                    addMessage(msg.text, msg.type || 'system', null, msg.plain || false, false, msg.attachments, msg.files);
+                });
+            }
+            // Restore draft
+            messageInput.value = draft || '';
+            adjustTextareaHeight();
+            // Update trigger status
+            updateMcpStatus(mcpActive, hasPendingTrigger);
+            messageInput.focus();
+        }
         
         // Initialize
         vscode.postMessage({ command: 'ready' });

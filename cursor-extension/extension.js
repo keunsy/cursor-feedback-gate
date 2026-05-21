@@ -25,6 +25,210 @@ let feedbackGateEnabled = true;
 let statusBarItem = null;
 const processedTriggerIds = new Set();
 
+// ── Multi-conversation Session Management ──────────
+// Each agent conversation spawns its own MCP server process with a unique PID.
+// We use PID + creation timestamp as the session key to avoid PID reuse issues.
+const sessions = new Map(); // sessionKey → SessionState
+let activeSessionKey = null;
+let sessionCounter = 0;
+
+function createSessionKey(mcpPid, timestamp) {
+    return `${mcpPid}_${timestamp}`;
+}
+
+function createSession(mcpPid, pidTimestamp) {
+    sessionCounter++;
+    const key = createSessionKey(mcpPid, pidTimestamp);
+    const session = {
+        key,
+        mcpPid,
+        pidTimestamp,
+        index: sessionCounter,
+        label: `#${sessionCounter}`,
+        triggerData: null,
+        messages: [],
+        draft: '',
+        attachedImages: [],
+        attachedFiles: [],
+        codeReferences: [],
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+        pendingRemoteReply: null,
+    };
+    sessions.set(key, session);
+    console.log(`Feedback Gate: session created key=${key} index=#${sessionCounter}`);
+    return session;
+}
+
+function getSessionByMcpPid(mcpPid) {
+    for (const session of sessions.values()) {
+        if (session.mcpPid === mcpPid) return session;
+    }
+    return null;
+}
+
+function getOrCreateSession(mcpPid) {
+    let session = getSessionByMcpPid(mcpPid);
+    if (session) {
+        session.lastActiveAt = Date.now();
+        return session;
+    }
+    // Read the PID file to get the creation timestamp for session key stability
+    let pidTimestamp = Date.now();
+    try {
+        const pidFile = getTempPath(`feedback_gate_mcp_${mcpPid}.pid`);
+        if (fs.existsSync(pidFile)) {
+            const data = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+            if (data.timestamp) pidTimestamp = new Date(data.timestamp).getTime();
+        }
+    } catch {}
+    return createSession(mcpPid, pidTimestamp);
+}
+
+function getActiveSession() {
+    if (!activeSessionKey) return null;
+    return sessions.get(activeSessionKey) || null;
+}
+
+function switchToSession(sessionKey) {
+    if (activeSessionKey === sessionKey) return;
+    const session = sessions.get(sessionKey);
+    if (!session) return;
+
+    // Save current session's draft/attachments from webview
+    // (done via message from webview before switch)
+    activeSessionKey = sessionKey;
+    session.lastActiveAt = Date.now();
+
+    // Send full session state to webview
+    syncSessionToWebview(session);
+    syncTabsToWebview();
+    console.log(`Feedback Gate: switched to session ${sessionKey} (${session.label})`);
+}
+
+function syncSessionToWebview(session) {
+    if (!session) return;
+    broadcastToAllWebviews({
+        command: 'loadSession',
+        sessionKey: session.key,
+        label: session.label,
+        messages: session.messages,
+        draft: session.draft,
+        hasPendingTrigger: !!session.triggerData,
+    });
+}
+
+function syncTabsToWebview() {
+    const tabs = [];
+    for (const s of sessions.values()) {
+        tabs.push({
+            key: s.key,
+            label: s.label,
+            hasPendingTrigger: !!s.triggerData,
+            isActive: s.key === activeSessionKey,
+            lastMessage: s.messages.length > 0
+                ? s.messages[s.messages.length - 1].text.slice(0, 30)
+                : '',
+        });
+    }
+    broadcastToAllWebviews({ command: 'syncTabs', tabs, activeKey: activeSessionKey });
+}
+
+function cleanupStaleSessions() {
+    const now = Date.now();
+    const toRemove = [];
+    for (const [key, session] of sessions) {
+        const age = now - session.lastActiveAt;
+        let processAlive = false;
+        try { process.kill(session.mcpPid, 0); processAlive = true; } catch {}
+
+        if (session.triggerData) {
+            // Has pending trigger — only clean if MCP process is dead
+            if (!processAlive) {
+                toRemove.push(key);
+            }
+            // Process alive → conversation is still waiting, never clean
+            continue;
+        }
+
+        // No pending trigger
+        if (!processAlive && age > 5 * 60 * 1000) {
+            // Process dead + 5 min grace → clean
+            toRemove.push(key);
+        } else if (processAlive && age > 30 * 60 * 1000) {
+            // Process alive but 30 min idle without trigger → clean
+            toRemove.push(key);
+        }
+    }
+    for (const key of toRemove) {
+        console.log(`Feedback Gate: cleaning stale session ${key}`);
+        sessions.delete(key);
+        if (activeSessionKey === key) {
+            // Switch to another session if available
+            const next = findNextPendingSession();
+            activeSessionKey = next ? next.key : (sessions.size > 0 ? sessions.keys().next().value : null);
+        }
+    }
+    if (toRemove.length > 0) syncTabsToWebview();
+}
+
+function findNextPendingSession() {
+    for (const session of sessions.values()) {
+        if (session.triggerData && session.key !== activeSessionKey) {
+            return session;
+        }
+    }
+    return null;
+}
+
+function addMessageToSession(sessionKey, msg) {
+    const session = sessions.get(sessionKey);
+    if (!session) return;
+    session.messages.push(msg);
+    // Cap messages at 200 per session
+    if (session.messages.length > 200) {
+        session.messages = session.messages.slice(-200);
+    }
+    // If this is the active session, also push to webview
+    if (sessionKey === activeSessionKey) {
+        broadcastToAllWebviews({
+            command: 'addMessage',
+            text: msg.text,
+            type: msg.type,
+            plain: msg.plain || false,
+            attachments: msg.attachments,
+            files: msg.files,
+        });
+    }
+}
+
+// Backward compat: get currentTriggerData from active session
+function getCurrentTriggerData() {
+    const session = getActiveSession();
+    return session ? session.triggerData : currentTriggerData;
+}
+
+function setCurrentTriggerData(triggerData, mcpPid) {
+    if (mcpPid) {
+        const session = getOrCreateSession(mcpPid);
+        session.triggerData = triggerData;
+        session.lastActiveAt = Date.now();
+        return session;
+    }
+    currentTriggerData = triggerData;
+    return null;
+}
+
+function clearSessionTrigger(sessionKey) {
+    const session = sessions.get(sessionKey);
+    if (session) {
+        session.triggerData = null;
+    }
+    // Also clear legacy global
+    currentTriggerData = null;
+    syncTabsToWebview();
+}
+
 // ── IDE Queue (remote /ide messages) ───────────────
 const EXTENSION_PID = process.pid;
 const IDE_QUEUE_PATH = getTempPath(`feedback_gate_ide_queue_${EXTENSION_PID}.jsonl`);
@@ -145,17 +349,29 @@ class FeedbackGatePanelProvider {
 
         webviewView.webview.onDidReceiveMessage(
             webviewMessage => {
-                const currentTriggerId = (currentTriggerData && currentTriggerData.trigger_id) || null;
+                const activeSession = getActiveSession();
+                const activeTrigger = activeSession ? activeSession.triggerData : currentTriggerData;
+                const currentTriggerId = (activeTrigger && activeTrigger.trigger_id) || null;
                 switch (webviewMessage.command) {
                     case 'send': {
-                        pendingRemoteReply = null;
+                        if (activeSession) activeSession.pendingRemoteReply = null;
+                        else pendingRemoteReply = null;
                         enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
                         logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
-                        if (currentTriggerData && currentTriggerData.trigger_id) {
+                        if (activeTrigger && activeTrigger.trigger_id) {
                             processQueueForPendingTrigger(true);
                         }
                         break;
                     }
+                    case 'switchSession':
+                        if (webviewMessage.sessionKey) {
+                            // Save draft from current session before switching
+                            if (activeSession && webviewMessage.draft !== undefined) {
+                                activeSession.draft = webviewMessage.draft || '';
+                            }
+                            switchToSession(webviewMessage.sessionKey);
+                        }
+                        break;
                     case 'removeQueueItem':
                         removeQueueItem(webviewMessage.itemId);
                         break;
@@ -197,12 +413,13 @@ class FeedbackGatePanelProvider {
                     case 'showError':
                         vscode.window.showErrorMessage(webviewMessage.message);
                         break;
-                    case 'ready':
+                    case 'ready': {
+                        const hasAnyTrigger = [...sessions.values()].some(s => s.triggerData) || !!currentTriggerData;
                         if (this._pendingMessages.length > 0) {
                             webviewView.webview.postMessage({
                                 command: 'updateMcpStatus',
                                 active: true,
-                                hasPendingTrigger: !!currentTriggerData
+                                hasPendingTrigger: hasAnyTrigger
                             });
                             for (const msg of this._pendingMessages) {
                                 webviewView.webview.postMessage(msg);
@@ -212,11 +429,17 @@ class FeedbackGatePanelProvider {
                             webviewView.webview.postMessage({
                                 command: 'updateMcpStatus',
                                 active: mcpStatus,
-                                hasPendingTrigger: !!currentTriggerData
+                                hasPendingTrigger: hasAnyTrigger
                             });
                         }
                         syncQueueToWebview();
+                        syncTabsToWebview();
+                        if (activeSessionKey) {
+                            const s = sessions.get(activeSessionKey);
+                            if (s) syncSessionToWebview(s);
+                        }
                         break;
+                    }
                 }
             },
             undefined,
@@ -382,20 +605,32 @@ function activate(context) {
             vscode.window.showInformationMessage(
                 feedbackGateEnabled ? 'Feedback Gate 已启用' : 'Feedback Gate 已禁用（自动放行模式）'
             );
-            if (!feedbackGateEnabled && currentTriggerData && currentTriggerData.trigger_id) {
-                const triggerId = currentTriggerData.trigger_id;
-                const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
-                if (!fs.existsSync(responseFile)) {
-                    fs.writeFileSync(responseFile, JSON.stringify({
-                        response: "TASK_COMPLETE",
-                        auto_response: true,
-                        feedback_gate_disabled: true,
-                        timestamp: new Date().toISOString(),
-                        trigger_id: triggerId
-                    }, null, 2));
-                    console.log(`Feedback Gate: auto-responded TASK_COMPLETE for pending trigger ${triggerId}`);
+            if (!feedbackGateEnabled) {
+                const pendingTriggers = [];
+                for (const session of sessions.values()) {
+                    if (session.triggerData && session.triggerData.trigger_id) {
+                        pendingTriggers.push(session.triggerData.trigger_id);
+                        session.triggerData = null;
+                    }
                 }
-                currentTriggerData = null;
+                if (currentTriggerData && currentTriggerData.trigger_id) {
+                    pendingTriggers.push(currentTriggerData.trigger_id);
+                    currentTriggerData = null;
+                }
+                for (const triggerId of pendingTriggers) {
+                    const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
+                    if (!fs.existsSync(responseFile)) {
+                        fs.writeFileSync(responseFile, JSON.stringify({
+                            response: "TASK_COMPLETE",
+                            auto_response: true,
+                            feedback_gate_disabled: true,
+                            timestamp: new Date().toISOString(),
+                            trigger_id: triggerId
+                        }, null, 2));
+                        console.log(`Feedback Gate: auto-responded TASK_COMPLETE for pending trigger ${triggerId}`);
+                    }
+                }
+                syncTabsToWebview();
             }
         })
     );
@@ -550,10 +785,11 @@ function checkMcpStatus() {
 }
 
 function updateChatPanelStatus() {
+    const hasTrigger = [...sessions.values()].some(s => s.triggerData) || !!currentTriggerData;
     const msg = {
         command: 'updateMcpStatus',
         active: mcpStatus,
-        hasPendingTrigger: !!currentTriggerData
+        hasPendingTrigger: hasTrigger
     };
     // Broadcast status to all live views
     if (chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) {
@@ -727,7 +963,8 @@ function consumeIdeQueueFile(filePath) {
         if (count > 0 || stale > 0) {
             console.log(`Feedback Gate: consumed ${count} IDE queue message(s), discarded ${stale} stale`);
         }
-        if (count > 0 && currentTriggerData && currentTriggerData.trigger_id) {
+        const activeTrigger = getCurrentTriggerData();
+        if (count > 0 && activeTrigger && activeTrigger.trigger_id) {
             processQueueForPendingTrigger(true);
         }
     } catch (e) {
@@ -853,8 +1090,14 @@ function startFeedbackGateIntegration(context) {
         if (pendingRemoteReply && Date.now() - pendingRemoteReply.enqueuedAt > 30 * 60 * 1000) {
             pendingRemoteReply = null;
         }
+        // Clean up stale conversation sessions periodically
+        if (!cleanupStaleSessions._lastRun || Date.now() - cleanupStaleSessions._lastRun > 60000) {
+            cleanupStaleSessions._lastRun = Date.now();
+            cleanupStaleSessions();
+        }
         // Expire idle session after 2h without any trigger
-        if (firstTriggerReceived && lastTriggerTime > 0 && !currentTriggerData
+        if (firstTriggerReceived && lastTriggerTime > 0
+            && ![...sessions.values()].some(s => s.triggerData) && !currentTriggerData
             && Date.now() - lastTriggerTime > SESSION_IDLE_TIMEOUT_MS) {
             firstTriggerReceived = false;
             lastTriggerTime = 0;
@@ -979,22 +1222,21 @@ function checkTriggerFile(context, filePath) {
                 return;
             }
             
-            // Check queue first: if messages waiting AND no active user interaction,
-            // auto-respond with queue head. Skip auto-consume when the user is still
-            // interacting with a previous gate to prevent premature queue drain.
-            if (getPendingQueueCount() > 0 && !currentTriggerData) {
+            // Check queue first: if messages waiting AND no session currently waiting
+            // for user interaction, auto-respond with queue head.
+            // In multi-session mode, only auto-consume if NO session has a pending trigger.
+            const anySessionHasTrigger = [...sessions.values()].some(s => s.triggerData);
+            if (getPendingQueueCount() > 0 && !anySessionHasTrigger && !currentTriggerData) {
                 const queueItem = dequeueMessage();
                 if (queueItem) {
-                    // Track remote source for V2 bidirectional feedback
+                    const session = triggerPid ? getOrCreateSession(triggerPid) : null;
                     if (queueItem.source && queueItem.source !== 'local' && queueItem.chatId) {
-                        pendingRemoteReply = {
-                            chatId: queueItem.chatId,
-                            source: queueItem.source,
-                            originalText: queueItem.text || '',
-                            enqueuedAt: Date.now()
-                        };
+                        const rr = { chatId: queueItem.chatId, source: queueItem.source, originalText: queueItem.text || '', enqueuedAt: Date.now() };
+                        if (session) session.pendingRemoteReply = rr;
+                        else pendingRemoteReply = rr;
                     } else {
-                        pendingRemoteReply = null;
+                        if (session) session.pendingRemoteReply = null;
+                        else pendingRemoteReply = null;
                     }
 
                     const qTriggerId = triggerData.data && triggerData.data.trigger_id;
@@ -1012,46 +1254,43 @@ function checkTriggerFile(context, filePath) {
                             queue_item_id: queueItem.id
                         };
                         const responseJson = JSON.stringify(responseData, null, 2);
-                        const responsePatterns = [
+                        [
                             getTempPath(`feedback_gate_response_${qTriggerId}.json`),
                             getTempPath('feedback_gate_response.json'),
-                        ];
-                        responsePatterns.forEach(f => {
+                        ].forEach(f => {
                             try { fs.writeFileSync(f, responseJson); } catch (e) {}
                         });
                         markQueueItemDone(queueItem.id);
                         sendExtensionAcknowledgement(qTriggerId, triggerData.data.tool);
                         
                         const agentMsg = triggerData.data.message || triggerData.data.prompt || '';
-                        if (agentMsg) {
-                            broadcastToAllWebviews({
-                                command: 'newMessage',
-                                text: agentMsg,
-                                type: 'system',
-                                toolData: triggerData.data,
-                                mcpIntegration: false
-                            });
-                            maybeWriteOutbox(agentMsg);
+                        if (session) {
+                            if (agentMsg) {
+                                addMessageToSession(session.key, { text: agentMsg, type: 'system' });
+                                maybeWriteOutbox(agentMsg);
+                            }
+                            addMessageToSession(session.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+                            if (session.label === `#${session.index}` && queueItem.text) {
+                                const preview = queueItem.text.replace(/\n/g, ' ').slice(0, 20);
+                                session.label = `#${session.index} ${preview}${queueItem.text.length > 20 ? '…' : ''}`;
+                            }
+                            const sourceTag = queueItem.sourceLabel
+                                ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
+                                : '⚡ 已从队列自动发送';
+                            addMessageToSession(session.key, { text: sourceTag, type: 'system', plain: true });
+                        } else {
+                            if (agentMsg) {
+                                broadcastToAllWebviews({ command: 'newMessage', text: agentMsg, type: 'system', toolData: triggerData.data, mcpIntegration: false });
+                                maybeWriteOutbox(agentMsg);
+                            }
+                            broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+                            const sourceTag = queueItem.sourceLabel
+                                ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
+                                : '⚡ 已从队列自动发送';
+                            broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
                         }
-                        broadcastToAllWebviews({
-                            command: 'addMessage',
-                            text: queueItem.text,
-                            type: 'user',
-                            attachments: queueItem.attachments,
-                            files: queueItem.files
-                        });
-                        const sourceTag = queueItem.sourceLabel
-                            ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
-                            : '⚡ 已从队列自动发送';
-                        broadcastToAllWebviews({
-                            command: 'addMessage',
-                            text: sourceTag,
-                            type: 'system',
-                            plain: true
-                        });
                     } else {
-                        // No trigger ID — recover the queue item to pending
-                        pendingRemoteReply = null;
+                        if (!triggerPid) pendingRemoteReply = null;
                         queueItem.status = 'pending';
                         delete queueItem.processingAt;
                         console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id`);
@@ -1062,10 +1301,38 @@ function checkTriggerFile(context, filePath) {
                 }
             }
             
-            // Store current trigger data for response handling
-            currentTriggerData = triggerData.data;
+            // Eagerly clean dead sessions before routing new trigger
+            let cleaned = false;
+            for (const [sKey, s] of sessions) {
+                if (s.mcpPid === triggerPid) continue;
+                try { process.kill(s.mcpPid, 0); } catch {
+                    console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
+                    sessions.delete(sKey);
+                    if (activeSessionKey === sKey) activeSessionKey = null;
+                    cleaned = true;
+                }
+            }
+            if (cleaned) syncTabsToWebview();
             
-            handleFeedbackGateToolCall(context, triggerData.data);
+            // Route trigger to session (or legacy global)
+            const session = triggerPid ? setCurrentTriggerData(triggerData.data, triggerPid) : null;
+            if (!session) {
+                currentTriggerData = triggerData.data;
+            }
+            
+            // Decide whether to auto-switch to this session's tab
+            if (session) {
+                const active = getActiveSession();
+                const shouldAutoSwitch = !active || !active.triggerData;
+                if (shouldAutoSwitch) {
+                    switchToSession(session.key);
+                } else {
+                    // Another session is actively waiting — just update tabs, don't interrupt
+                    syncTabsToWebview();
+                }
+            }
+            
+            handleFeedbackGateToolCall(context, triggerData.data, triggerPid);
             
             // Clean up trigger file immediately
             try {
@@ -1081,9 +1348,7 @@ function checkTriggerFile(context, filePath) {
     }
 }
 
-function handleFeedbackGateToolCall(context, toolData) {
-    // Silent tool call processing
-    
+function handleFeedbackGateToolCall(context, toolData, mcpPid) {
     let popupOptions = {};
     
     switch (toolData.tool) {
@@ -1178,6 +1443,16 @@ function handleFeedbackGateToolCall(context, toolData) {
     const agentMsgForOutbox = toolData.message || toolData.prompt || '';
     if (agentMsgForOutbox) {
         maybeWriteOutbox(agentMsgForOutbox);
+    }
+    
+    // Record agent message to session history (skip webview push for active session
+    // since openFeedbackGatePopup will send newMessage to webview separately)
+    if (mcpPid && popupOptions.message) {
+        const session = getSessionByMcpPid(mcpPid);
+        if (session) {
+            session.messages.push({ text: popupOptions.message, type: 'system' });
+            if (session.messages.length > 200) session.messages = session.messages.slice(-200);
+        }
     }
     
     // Immediately open Feedback Gate popup when tools are triggered by Cursor Agent
@@ -1373,15 +1648,26 @@ function openFeedbackGatePopup(context, options = {}) {
     chatPanel.webview.onDidReceiveMessage(
         webviewMessage => {
             // Get trigger ID from current trigger data or passed options
-            const currentTriggerId = (currentTriggerData && currentTriggerData.trigger_id) || triggerId;
+            const activeSession = getActiveSession();
+            const activeTrigger = activeSession ? activeSession.triggerData : currentTriggerData;
+            const currentTriggerId = (activeTrigger && activeTrigger.trigger_id) || triggerId;
             
             switch (webviewMessage.command) {
                 case 'send':
-                    pendingRemoteReply = null;
+                    if (activeSession) activeSession.pendingRemoteReply = null;
+                    else pendingRemoteReply = null;
                     enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files);
                     logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
-                    if (currentTriggerData && currentTriggerData.trigger_id) {
+                    if (activeTrigger && activeTrigger.trigger_id) {
                         processQueueForPendingTrigger(true);
+                    }
+                    break;
+                case 'switchSession':
+                    if (webviewMessage.sessionKey) {
+                        if (activeSession && webviewMessage.draft !== undefined) {
+                            activeSession.draft = webviewMessage.draft || '';
+                        }
+                        switchToSession(webviewMessage.sessionKey);
                     }
                     break;
                 case 'removeQueueItem':
@@ -1425,14 +1711,16 @@ function openFeedbackGatePopup(context, options = {}) {
                 case 'showError':
                     vscode.window.showErrorMessage(webviewMessage.message);
                     break;
-                case 'ready':
+                case 'ready': {
+                    const readySession = getActiveSession();
+                    const hasTrigger = readySession ? !!readySession.triggerData : !!currentTriggerData;
                     postToWebview({
                         command: 'updateMcpStatus',
                         active: mcpIntegration ? true : mcpStatus,
-                        hasPendingTrigger: mcpIntegration ? !!currentTriggerData : false
+                        hasPendingTrigger: mcpIntegration ? hasTrigger : false
                     });
-                    // Only send welcome message for manual opens, not MCP tool calls
-                    // This prevents duplicate messages from repeated tool calls
+                    syncTabsToWebview();
+                    if (readySession) syncSessionToWebview(readySession);
                     if (message && !mcpIntegration && !message.includes("I have completed")) {
                         postToWebview({
                             command: 'addMessage',
@@ -1445,6 +1733,8 @@ function openFeedbackGatePopup(context, options = {}) {
                             specialHandling: specialHandling
                         });
                     }
+                    break;
+                }
                     syncQueueToWebview();
                     break;
             }
@@ -1475,20 +1765,25 @@ function openFeedbackGatePopup(context, options = {}) {
 
 
 function processQueueForPendingTrigger(directSend) {
-    if (!currentTriggerData || !currentTriggerData.trigger_id) return;
+    // Use active session's trigger, falling back to legacy global
+    const activeSession = getActiveSession();
+    const activeTrigger = activeSession ? activeSession.triggerData : currentTriggerData;
+    if (!activeTrigger || !activeTrigger.trigger_id) return;
     if (getPendingQueueCount() === 0) return;
 
     const queueItem = dequeueMessage();
     if (!queueItem) return;
 
     if (queueItem.source && queueItem.source !== 'local' && queueItem.chatId) {
-        pendingRemoteReply = { chatId: queueItem.chatId, source: queueItem.source, originalText: queueItem.text || '', enqueuedAt: Date.now() };
+        const rr = { chatId: queueItem.chatId, source: queueItem.source, originalText: queueItem.text || '', enqueuedAt: Date.now() };
+        if (activeSession) activeSession.pendingRemoteReply = rr;
+        else pendingRemoteReply = rr;
     } else {
-        pendingRemoteReply = null;
+        if (activeSession) activeSession.pendingRemoteReply = null;
+        else pendingRemoteReply = null;
     }
 
-    const triggerId = currentTriggerData.trigger_id;
-    const toolType = currentTriggerData.tool;
+    const triggerId = activeTrigger.trigger_id;
 
     try {
         const responseData = {
@@ -1517,25 +1812,54 @@ function processQueueForPendingTrigger(directSend) {
     markQueueItemDone(queueItem.id);
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
-    broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+    if (activeSession) {
+        addMessageToSession(activeSession.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+        // Name the tab after the user's first message (like Cursor conversations)
+        if (activeSession.label === `#${activeSession.index}` && queueItem.text) {
+            const preview = queueItem.text.replace(/\n/g, ' ').slice(0, 20);
+            activeSession.label = `#${activeSession.index} ${preview}${queueItem.text.length > 20 ? '…' : ''}`;
+            syncTabsToWebview();
+        }
+    } else {
+        broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+    }
 
     const isLocalDirect = directSend && (!queueItem.source || queueItem.source === 'local');
     if (!isLocalDirect) {
         const sourceTag = queueItem.sourceLabel
             ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
             : '⚡ 已从队列自动发送';
-        broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
+        if (activeSession) {
+            addMessageToSession(activeSession.key, { text: sourceTag, type: 'system', plain: true });
+        } else {
+            broadcastToAllWebviews({ command: 'addMessage', text: sourceTag, type: 'system', plain: true });
+        }
     }
 
     if (directSend) {
         handleFeedbackMessage(queueItem.text, queueItem.attachments, triggerId, true, null);
     } else {
-        currentTriggerData = null;
-        setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+        if (activeSession) {
+            clearSessionTrigger(activeSession.key);
+        } else {
+            currentTriggerData = null;
+        }
+        // Auto-switch to next pending session
+        const next = findNextPendingSession();
+        if (next) switchToSession(next.key);
+        setTimeout(() => {
+            const hasTrigger = [...sessions.values()].some(s => s.triggerData) || !!currentTriggerData;
+            broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: hasTrigger });
+        }, 1000);
     }
 }
 
 function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, specialHandling) {
+    // Clear trigger from active session and legacy global
+    const activeSession = getActiveSession();
+    if (activeSession) {
+        clearSessionTrigger(activeSession.key);
+    }
     currentTriggerData = null;
     
     const funnyResponses = [
@@ -1602,9 +1926,20 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
                 type: 'system',
                 plain: true
             });
-            setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
+            const hasTrigger = [...sessions.values()].some(s => s.triggerData) || !!currentTriggerData;
+            setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: hasTrigger }); }, 1000);
         }, 500);
     }
+
+    // Auto-switch to next session that has a pending trigger
+    setTimeout(() => {
+        const next = findNextPendingSession();
+        if (next) {
+            switchToSession(next.key);
+        } else {
+            syncTabsToWebview();
+        }
+    }, 1500);
 }
 
 function handleFileAttachment(triggerId) {

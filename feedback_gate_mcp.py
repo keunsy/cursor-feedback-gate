@@ -316,12 +316,12 @@ class FeedbackGateServer:
                 logger.warning(f"⚠️ [DIAG] Tool call CANCELLED for {name} | pending_trigger={self._pending_trigger_id} | This means Cursor IDE aborted the MCP call (possible IDE-level timeout or user Stop)")
                 _log_event("CANCELLED", f"tool={name} trigger={self._pending_trigger_id}")
                 if self._pending_trigger_id:
-                    # Do NOT clear trigger state on cancellation — the extension popup
-                    # is still alive and the user may respond later.  Clearing here caused
-                    # a race condition where the next feedback_gate_chat call would create
-                    # a NEW trigger while the extension was still bound to the old one,
-                    # resulting in lost user messages.
-                    logger.info(f"🔒 [DIAG] PRESERVING pending trigger {self._pending_trigger_id} despite cancellation — popup is still alive, user may respond later")
+                    response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
+                    if response_file.exists():
+                        logger.info(f"⚠️ [DIAG] Response file exists on cancel for trigger {self._pending_trigger_id} — marking for next-call delivery (NOT consuming now to avoid data loss)")
+                        _log_event("CANCEL_RESPONSE_PENDING", f"trigger={self._pending_trigger_id}")
+                    else:
+                        logger.info(f"🔒 [DIAG] PRESERVING pending trigger {self._pending_trigger_id} — no response file yet, popup is still alive")
                 raise
             except Exception as e:
                 logger.error(f"💥 Tool call error for {name}: {e}")
@@ -446,7 +446,7 @@ class FeedbackGateServer:
     # every N minutes so the call never hits the 1h limit.
     # Override with FEEDBACK_GATE_IDE_WAIT_SECONDS env var.
     _IDE_WAIT_SECONDS = int(os.environ.get("FEEDBACK_GATE_IDE_WAIT_SECONDS", "600"))
-    _IDE_MAX_TOTAL_SECONDS = 259200  # 72h max total wait for IDE
+    _IDE_MAX_TOTAL_SECONDS = 86400  # 24h max total wait for IDE
 
     # Heartbeat config file for dynamic (no-restart) configuration.
     # Falls back to env vars, then defaults.
