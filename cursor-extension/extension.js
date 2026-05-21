@@ -19,7 +19,7 @@ let lastTriggerTime = 0;
 const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 let statusCheckInterval = null;
 let currentTriggerData = null;
-let boundMcpPid = null;
+let boundMcpPids = new Set();
 let usePanelView = true;
 let feedbackGateEnabled = true;
 let statusBarItem = null;
@@ -161,6 +161,9 @@ class FeedbackGatePanelProvider {
                         break;
                     case 'editQueueItem':
                         editQueueItem(webviewMessage.itemId, webviewMessage.newText);
+                        break;
+                    case 'cancelEditQueueItem':
+                        syncQueueToWebview();
                         break;
                     case 'moveQueueItem':
                         moveQueueItem(webviewMessage.itemId, webviewMessage.direction);
@@ -526,20 +529,13 @@ function checkMcpStatus() {
         }
 
         if (!active) {
-            try {
-                const dir = path.dirname(getTempPath('x'));
-                const prefix = 'feedback_gate_mcp_';
-                const myPid = process.pid;
-                fs.readdirSync(dir).filter(f => f.startsWith(prefix) && f.endsWith('.pid')).forEach(f => {
-                    try {
-                        const data = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-                        if (data.pid && data.ppid === myPid) {
-                            process.kill(data.pid, 0);
-                            active = true;
-                        }
-                    } catch {}
-                });
-            } catch {}
+            for (const pid of boundMcpPids) {
+                try {
+                    process.kill(pid, 0);
+                    active = true;
+                    break;
+                } catch {}
+            }
         }
 
         const wasActive = mcpStatus;
@@ -571,21 +567,20 @@ function updateChatPanelStatus() {
     }
 }
 
-function discoverMcpPid() {
+function discoverMcpPids() {
     /**
-     * Discover the MCP server PID that belongs to THIS Cursor window.
+     * Discover ALL MCP server PIDs that belong to THIS Cursor window.
      *
-     * The MCP server is spawned by the extension-host process (our process.pid).
-     * The MCP writes a PID file containing its own PID and its PPID (the extension-host).
-     * We match by: PID-file.ppid === process.pid (exact parent match).
-     *
-     * Fallback: if no PPID match (old PID files without ppid), pick the newest alive process.
+     * A single Cursor window can have multiple agent conversations, each spawning
+     * its own MCP server process. All share the same extension-host parent (process.pid).
+     * We return a Set of all alive MCP PIDs whose PPID matches ours.
      */
+    const discovered = new Set();
     try {
         const tempDir = process.platform === 'win32' ? os.tmpdir() : '/tmp';
         const files = fs.readdirSync(tempDir).filter(f => f.startsWith('feedback_gate_mcp_') && f.endsWith('.pid'));
         
-        if (files.length === 0) return null;
+        if (files.length === 0) return discovered;
         
         const myPid = process.pid;
         const entries = files
@@ -599,37 +594,41 @@ function discoverMcpPid() {
             })
             .filter(Boolean);
         
-        // Primary: find the MCP whose parent is this extension-host process
         for (const entry of entries) {
             if (entry.ppid === myPid) {
                 try {
                     process.kill(entry.pid, 0);
-                    console.log(`Feedback Gate: matched MCP PID ${entry.pid} via PPID ${myPid}`);
-                    return entry.pid;
+                    discovered.add(entry.pid);
                 } catch {
                     try { fs.unlinkSync(entry.fullPath); } catch {}
                 }
             }
         }
         
-        // Fallback: old PID files without ppid field — pick newest alive process
-        const sorted = entries
-            .filter(e => !e.ppid)
-            .sort((a, b) => b.mtime - a.mtime);
-        
-        for (const entry of sorted) {
-            try {
-                process.kill(entry.pid, 0);
-                console.log(`Feedback Gate: fallback bound to MCP PID ${entry.pid} (no PPID in file)`);
-                return entry.pid;
-            } catch {
-                try { fs.unlinkSync(entry.fullPath); } catch {}
+        // Fallback: old PID files without ppid field — add newest alive process
+        if (discovered.size === 0) {
+            const sorted = entries
+                .filter(e => !e.ppid)
+                .sort((a, b) => b.mtime - a.mtime);
+            
+            for (const entry of sorted) {
+                try {
+                    process.kill(entry.pid, 0);
+                    discovered.add(entry.pid);
+                    console.log(`Feedback Gate: fallback bound to MCP PID ${entry.pid} (no PPID in file)`);
+                    break;
+                } catch {
+                    try { fs.unlinkSync(entry.fullPath); } catch {}
+                }
             }
         }
     } catch (e) {
         console.log(`MCP PID discovery error: ${e.message}`);
     }
-    return null;
+    if (discovered.size > 0 && discovered.size !== boundMcpPids.size) {
+        console.log(`Feedback Gate: discovered ${discovered.size} MCP PIDs: [${[...discovered].join(', ')}]`);
+    }
+    return discovered;
 }
 
 // ── IDE Queue processing ───────────────────────────
@@ -834,21 +833,19 @@ function cleanupOrphanPidFiles() {
 function startFeedbackGateIntegration(context) {
     cleanupOrphanPidFiles();
     
-    boundMcpPid = discoverMcpPid();
-    if (boundMcpPid) {
-        console.log(`Feedback Gate bound to MCP PID: ${boundMcpPid}`);
+    boundMcpPids = discoverMcpPids();
+    if (boundMcpPids.size > 0) {
+        console.log(`Feedback Gate bound to MCP PIDs: [${[...boundMcpPids].join(', ')}]`);
     }
     
     const pollInterval = setInterval(() => {
-        if (!boundMcpPid) {
-            boundMcpPid = discoverMcpPid();
-            if (boundMcpPid) {
-                console.log(`Feedback Gate discovered MCP PID: ${boundMcpPid}`);
-            }
-        }
+        // Re-discover all MCP PIDs belonging to this window on every poll cycle.
+        // This is cheap (readdir + stat) and ensures we pick up new conversations
+        // as well as prune dead ones.
+        boundMcpPids = discoverMcpPids();
         
-        if (boundMcpPid) {
-            checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${boundMcpPid}.json`));
+        for (const pid of boundMcpPids) {
+            checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${pid}.json`));
         }
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
         checkIdeQueueFile();
@@ -879,9 +876,9 @@ function startFeedbackGateIntegration(context) {
     });
     
     setTimeout(() => {
-        boundMcpPid = discoverMcpPid();
-        if (boundMcpPid) {
-            checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${boundMcpPid}.json`));
+        boundMcpPids = discoverMcpPids();
+        for (const pid of boundMcpPids) {
+            checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${pid}.json`));
         }
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
     }, 100);
@@ -911,7 +908,7 @@ function checkTriggerFile(context, filePath) {
             
             // Instance isolation: only consume triggers that belong to this Cursor window.
             // Match by PPID (the MCP's parent process should be our extension-host PID),
-            // or by boundMcpPid if already established.
+            // or by boundMcpPids set if already established.
             const triggerPid = triggerData.pid;
             const triggerPpid = triggerData.ppid;
             const isPidNamespaced = filePath.includes('_pid');
@@ -923,29 +920,21 @@ function checkTriggerFile(context, filePath) {
                 return;
             }
             
-            if (boundMcpPid && triggerPid && triggerPid !== boundMcpPid) {
+            if (triggerPid && !boundMcpPids.has(triggerPid)) {
                 if (triggerPpid === myPid) {
-                    boundMcpPid = triggerPid;
-                    console.log(`Feedback Gate: switched to MCP PID ${triggerPid} (same window, PPID match)`);
-                } else {
-                    return;
-                }
-            }
-            
-            // If we have no bound PID yet, try to bind via PPID match or process check
-            if (!boundMcpPid && triggerPid) {
-                if (triggerPpid === myPid) {
-                    boundMcpPid = triggerPid;
-                    console.log(`Feedback Gate auto-bound to MCP PID: ${boundMcpPid} (PPID match)`);
-                } else {
+                    boundMcpPids.add(triggerPid);
+                    console.log(`Feedback Gate: added MCP PID ${triggerPid} (PPID match)`);
+                } else if (boundMcpPids.size === 0) {
                     try {
                         process.kill(triggerPid, 0);
-                        boundMcpPid = triggerPid;
-                        console.log(`Feedback Gate auto-bound to MCP PID: ${boundMcpPid} (legacy)`);
+                        boundMcpPids.add(triggerPid);
+                        console.log(`Feedback Gate: fallback added MCP PID ${triggerPid} (legacy)`);
                     } catch {
                         try { fs.unlinkSync(filePath); } catch {}
                         return;
                     }
+                } else {
+                    return;
                 }
             }
             
@@ -1400,6 +1389,9 @@ function openFeedbackGatePopup(context, options = {}) {
                     break;
                 case 'editQueueItem':
                     editQueueItem(webviewMessage.itemId, webviewMessage.newText);
+                    break;
+                case 'cancelEditQueueItem':
+                    syncQueueToWebview();
                     break;
                 case 'moveQueueItem':
                     moveQueueItem(webviewMessage.itemId, webviewMessage.direction);
