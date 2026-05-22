@@ -55,7 +55,9 @@ function loadQueue() {
 function saveQueue() {
     try {
         const queueFile = getQueueFilePath();
-        fs.writeFileSync(queueFile, JSON.stringify({ items: messageQueue }, null, 2));
+        const tmpFile = queueFile + '.tmp';
+        fs.writeFileSync(tmpFile, JSON.stringify({ items: messageQueue }, null, 2));
+        fs.renameSync(tmpFile, queueFile);
     } catch (e) {
         console.log(`Failed to save queue: ${e.message}`);
     }
@@ -124,7 +126,7 @@ function enqueueMessage(text, attachments, files, meta) {
         source: meta?.source || 'local',
         sourceLabel: meta?.sourceLabel || '',
         chatId: meta?.chatId || '',
-        sessionKey: meta?.sessionKey || _activeSessionKey || '',
+        sessionKey: (meta?.sessionKey != null ? meta.sessionKey : _activeSessionKey) || '',
     };
     messageQueue.push(item);
     saveQueue();
@@ -227,15 +229,19 @@ function editQueueItem(id, newText) {
 }
 
 function reorderQueue(orderedIds) {
+    const sk = _activeSessionKey || '';
+    const pendingInSession = messageQueue.filter(m => m.status === 'pending' && (m.sessionKey || '') === sk);
     const pendingMap = new Map();
-    messageQueue.filter(m => m.status === 'pending').forEach(m => pendingMap.set(m.id, m));
-    
-    const nonPending = messageQueue.filter(m => m.status !== 'pending');
+    pendingInSession.forEach(m => pendingMap.set(m.id, m));
+
+    const idSet = new Set(orderedIds);
     const reordered = orderedIds.map(id => pendingMap.get(id)).filter(Boolean);
-    
-    messageQueue = [...nonPending, ...reordered];
+    const rest = pendingInSession.filter(m => !idSet.has(m.id));
+
+    const others = messageQueue.filter(m => !(m.status === 'pending' && (m.sessionKey || '') === sk));
+    messageQueue = [...others, ...reordered, ...rest];
     saveQueue();
-    syncToWebview();
+    syncToWebview(sk);
 }
 
 function getPendingQueueCount(sessionKey) {

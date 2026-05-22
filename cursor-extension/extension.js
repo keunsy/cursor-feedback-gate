@@ -92,10 +92,10 @@ function getAllSessionsByMcpPid(mcpPid) {
 function getOrCreateSessionForTrigger(mcpPid, sessionId) {
     const now = Date.now();
 
-    // Phase 0: exact session_id match — always the most reliable path
+    // Phase 0: exact session_id + PID match
     if (sessionId) {
         for (const s of sessions.values()) {
-            if (s.sessionId === sessionId) {
+            if (s.sessionId === sessionId && s.mcpPid === mcpPid) {
                 s.lastActiveAt = now;
                 return s;
             }
@@ -310,12 +310,16 @@ function setCurrentTriggerData(triggerData, mcpPid) {
 function clearSessionTrigger(sessionKey) {
     const session = sessions.get(sessionKey);
     if (session) {
+        const tid = session.triggerData && session.triggerData.trigger_id;
         session.triggerData = null;
         session.lastResponseTime = Date.now();
         session.lastActiveAt = Date.now();
+        if (currentTriggerData && currentTriggerData.trigger_id === tid) {
+            currentTriggerData = null;
+        }
+    } else {
+        currentTriggerData = null;
     }
-    // Also clear legacy global
-    currentTriggerData = null;
     syncTabsToWebview();
 }
 
@@ -460,7 +464,7 @@ class FeedbackGatePanelProvider {
                 const currentTriggerId = (activeTrigger && activeTrigger.trigger_id) || null;
                 switch (webviewMessage.command) {
                     case 'send': {
-                        const sendSessionKey = webviewMessage.sessionKey || activeSessionKey || '';
+                        const sendSessionKey = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
                         const sendSession = sendSessionKey ? sessions.get(sendSessionKey) : activeSession;
                         if (sendSession) sendSession.pendingRemoteReply = null;
                         else if (activeSession) activeSession.pendingRemoteReply = null;
@@ -752,6 +756,7 @@ function activate(context) {
                     }
                 }
                 syncTabsToWebview();
+                updateChatPanelStatus();
             }
         })
     );
@@ -838,43 +843,9 @@ function logUserInput(inputText, eventType = 'MESSAGE', triggerId = null, attach
         outputChannel.appendLine(logMsg);
     }
     
-    // Write to file for external monitoring
     try {
         const logFile = getTempPath('feedback_gate_user_inputs.log');
         fs.appendFileSync(logFile, `${logMsg}\n`);
-        
-        // Write response file for MCP server integration if we have a trigger ID
-        if (triggerId && eventType === 'MCP_RESPONSE') {
-            const responsePatterns = [
-                getTempPath(`feedback_gate_response_${triggerId}.json`),
-                getTempPath('feedback_gate_response.json'),
-            ];
-            
-            const responseData = {
-                timestamp: timestamp,
-                trigger_id: triggerId,
-                user_input: inputText,
-                response: inputText,
-                message: inputText,
-                attachments: attachments,
-                files: enrichFiles(files),
-                event_type: eventType,
-                source: 'feedback_gate_extension'
-            };
-            
-            const responseJson = JSON.stringify(responseData, null, 2);
-            
-            // Write to all response file patterns
-            responsePatterns.forEach(responseFile => {
-                try {
-                    fs.writeFileSync(responseFile, responseJson);
-                    logMessage(`MCP response written: ${responseFile}`);
-                } catch (writeError) {
-                    logMessage(`Failed to write response file ${responseFile}: ${writeError.message}`);
-                }
-            });
-        }
-        
     } catch (error) {
         logMessage(`Could not write to Feedback Gate log file: ${error.message}`);
     }
@@ -1344,19 +1315,10 @@ function checkTriggerFile(context, filePath) {
                 }
             }
             
-            // Deduplicate: skip if we already processed this trigger_id
             const triggerId = triggerData.data && triggerData.data.trigger_id;
             if (triggerId && processedTriggerIds.has(triggerId)) {
                 try { fs.unlinkSync(filePath); } catch {}
                 return;
-            }
-            if (triggerId) {
-                processedTriggerIds.add(triggerId);
-                // Prevent unbounded growth: keep only the last 50 entries
-                if (processedTriggerIds.size > 50) {
-                    const first = processedTriggerIds.values().next().value;
-                    processedTriggerIds.delete(first);
-                }
             }
             
             lastTriggerTime = Date.now();
@@ -1392,7 +1354,7 @@ function checkTriggerFile(context, filePath) {
             let targetSession = null;
             let targetMatchedBySessionId = false;
             if (targetSessionId) {
-                for (const s of sessions.values()) { if (s.sessionId === targetSessionId) { targetSession = s; targetMatchedBySessionId = true; break; } }
+                for (const s of sessions.values()) { if (s.sessionId === targetSessionId && (!triggerPid || s.mcpPid === triggerPid)) { targetSession = s; targetMatchedBySessionId = true; break; } }
             }
             if (!targetSession && !targetSessionId && triggerPid) {
                 const pidSessions = getAllSessionsByMcpPid(triggerPid);
@@ -1468,6 +1430,13 @@ function checkTriggerFile(context, filePath) {
                         queue.saveQueue();
                         console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id`);
                     }
+                    if (triggerId) {
+                        processedTriggerIds.add(triggerId);
+                        if (processedTriggerIds.size > 50) {
+                            const first = processedTriggerIds.values().next().value;
+                            processedTriggerIds.delete(first);
+                        }
+                    }
                     try { fs.unlinkSync(filePath); } catch {}
                     console.log(`Feedback Gate: auto-consumed queue item "${queueItem.text}"`);
                     return;
@@ -1480,6 +1449,7 @@ function checkTriggerFile(context, filePath) {
                 if (s.mcpPid === triggerPid) continue;
                 try { process.kill(s.mcpPid, 0); } catch {
                     console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
+                    queue.migrateSessionKey(sKey, '');
                     sessions.delete(sKey);
                     if (activeSessionKey === sKey) {
                         activeSessionKey = null;
@@ -1509,7 +1479,14 @@ function checkTriggerFile(context, filePath) {
             
             handleFeedbackGateToolCall(context, triggerData.data, triggerPid);
             
-            // Clean up trigger file immediately
+            // Mark as processed only after successful handling
+            if (triggerId) {
+                processedTriggerIds.add(triggerId);
+                if (processedTriggerIds.size > 50) {
+                    const first = processedTriggerIds.values().next().value;
+                    processedTriggerIds.delete(first);
+                }
+            }
             try {
                 fs.unlinkSync(filePath);
             } catch (cleanupError) {
@@ -1695,7 +1672,7 @@ function openFeedbackGatePopup(context, options = {}) {
         _skipNewMessage = false
     } = options;
     
-    if (triggerId) {
+    if (triggerId && sessions.size === 0) {
         currentTriggerData = { ...toolData, trigger_id: triggerId };
     }
 
@@ -1849,7 +1826,7 @@ function openFeedbackGatePopup(context, options = {}) {
             
             switch (webviewMessage.command) {
                 case 'send': {
-                    const sendSessionKey2 = webviewMessage.sessionKey || activeSessionKey || '';
+                    const sendSessionKey2 = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
                     const sendSession2 = sendSessionKey2 ? sessions.get(sendSessionKey2) : activeSession;
                     if (sendSession2) sendSession2.pendingRemoteReply = null;
                     else if (activeSession) activeSession.pendingRemoteReply = null;
@@ -2055,11 +2032,14 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
             }
         }
     }
-    if (!cleared) {
+    if (!cleared && !triggerId) {
         const activeSession = getActiveSession();
         if (activeSession) clearSessionTrigger(activeSession.key);
+        else currentTriggerData = null;
     }
-    currentTriggerData = null;
+    if (!cleared && triggerId && currentTriggerData && currentTriggerData.trigger_id === triggerId) {
+        currentTriggerData = null;
+    }
     
     const funnyResponses = [
         "Cursor 已读已回，正在疯狂敲键盘中 ⌨️",
@@ -2129,8 +2109,12 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
         }, 500);
     }
 
-    // Auto-switch to next session that has a pending trigger
     setTimeout(() => {
+        const recentManualSwitch = (Date.now() - lastManualSwitchAt) < MANUAL_SWITCH_GUARD_MS;
+        if (recentManualSwitch) {
+            syncTabsToWebview();
+            return;
+        }
         const next = findNextPendingSession();
         if (next) {
             switchToSession(next.key);

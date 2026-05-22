@@ -975,6 +975,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         function addCodeReference(codeRef) {
+            if (!codeRef || !codeRef.content) return;
+            if (!inputSessionKey) inputSessionKey = currentSessionKey;
             const refId = 'cref_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
             codeRef.id = refId;
             codeReferences.push(codeRef);
@@ -1076,7 +1078,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             imagePreview.innerHTML = \`
                 <div class="message-bubble image-container">
                     <div class="image-header">
-                        <span class="image-filename">\${imageData.fileName}</span>
+                        <span class="image-filename">\${escapeHtml(imageData.fileName)}</span>
                         <button class="remove-image-btn" onclick="removeImage('\${imageId}')" title="Remove image">
                             <i class="fas fa-times"></i>
                         </button>
@@ -1300,12 +1302,12 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             filePreview.innerHTML = \`
                 <div class="message-bubble" style="max-width: 90%;">
                     <div class="image-header">
-                        <span class="image-filename" style="font-family: monospace;"><i class="fas \${iconClass}" style="margin-right: 4px; color: \${iconColor};"></i>\${fileData.fileName}</span>
+                        <span class="image-filename" style="font-family: monospace;"><i class="fas \${iconClass}" style="margin-right: 4px; color: \${iconColor};"></i>\${escapeHtml(fileData.fileName)}</span>
                         <button class="remove-image-btn" onclick="removeFile('\${fileId}')" title="Remove file">
                             <i class="fas fa-times"></i>
                         </button>
                     </div>
-                    <div style="margin-top: 4px; font-size: 11px; opacity: 0.6;">\${fileData.filePath}</div>
+                    <div style="margin-top: 4px; font-size: 11px; opacity: 0.6;">\${escapeHtml(fileData.filePath)}</div>
                 </div>
             \`;
             messagesContainer.appendChild(filePreview);
@@ -1325,7 +1327,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             adjustTextareaHeight();
             if (messageInput.value.trim() && !inputSessionKey) {
                 inputSessionKey = currentSessionKey;
-            } else if (!messageInput.value.trim()) {
+            } else if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
                 inputSessionKey = null;
             }
         });
@@ -1423,9 +1425,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 const imgCount = (item.attachments || []).length;
                 const fileCount = (item.files || []).length;
                 const badges = [
-                    item.sourceLabel ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;">📨\${item.sourceLabel}</span>\` : '',
+                    item.sourceLabel ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;">📨\${escapeHtml(item.sourceLabel)}</span>\` : '',
                     imgCount ? \`<span class="queue-img-badge" style="font-size:10px;opacity:0.6;margin-right:3px;cursor:default;" data-queue-id="\${item.id}" title="\${imgCount}张图片">🖼️\${imgCount > 1 ? imgCount : ''}</span>\` : '',
-                    fileCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${(item.files||[]).map(f=>f.name||f.path||'文件').join(', ')}">📎\${fileCount > 1 ? fileCount : ''}</span>\` : '',
+                    fileCount ? \`<span style="font-size:10px;opacity:0.6;margin-right:3px;" title="\${escapeHtml((item.files||[]).map(f=>f.name||f.path||'文件').join(', '))}">📎\${fileCount > 1 ? fileCount : ''}</span>\` : '',
                 ].filter(Boolean).join('');
                 if (imgCount) _queueAttachmentsMap.set(item.id, item.attachments);
                 _queueTextMap.set(item.id, item.text || '');
@@ -1438,7 +1440,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                         </span>
                     \` : ''}
                     <span class="queue-item-num">\${i + 1}</span>
-                    <span class="queue-item-text" \${isPending ? \`onclick="startEditQueueItem(this, \${item.id})" title="点击编辑"\` : ''}>\${badges}\${item.text || (imgCount ? '图片' : '文件')}</span>
+                    <span class="queue-item-text" \${isPending ? \`onclick="startEditQueueItem(this, \${item.id})" title="点击编辑"\` : ''}>\${badges}\${escapeHtml(item.text || (imgCount ? '图片' : '文件'))}</span>
                     \${isPending ? \`
                         <span class="queue-item-actions">
                             \${pi > 0 ? \`<button class="queue-item-pin" onclick="pinQueueItem(\${item.id})" title="置顶">📌</button>\` : ''}
@@ -1466,7 +1468,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                         const thumbs = atts.map(att => {
                             const src = att.dataUrl || (att.base64Data && att.base64Data !== '[TOO_LARGE_FOR_QUEUE]' ? \`data:\${att.mimeType || 'image/png'};base64,\${att.base64Data}\` : '') || (att.data && att.data !== '[TOO_LARGE_FOR_QUEUE]' ? att.data : '');
                             if (!src) return '<div class="img-placeholder">🖼️</div>';
-                            return \`<img src="\${src}" alt="\${att.fileName || '图片'}">\`;
+                            return \`<img src="\${src}" alt="\${escapeHtml(att.fileName || '图片')}">\`;
                         });
                         tooltip.innerHTML = thumbs.join('');
                         const rect = badge.getBoundingClientRect();
@@ -1588,25 +1590,26 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         function loadSession(sessionKey, label, messages, draft, hasPendingTrigger) {
-            // Keep inputSessionKey if user has pending content (text or attachments)
-            const hasPendingContent = (messageInput.value.trim() || attachedImages.length > 0 || attachedFiles.length > 0) && inputSessionKey;
-            if (!hasPendingContent) {
-                inputSessionKey = null;
+            const hasPendingAttachments = (attachedImages.length > 0 || attachedFiles.length > 0 || codeReferences.length > 0);
+            if (!hasPendingAttachments) {
+                attachedImages.length = 0;
+                attachedFiles.length = 0;
+                codeReferences.length = 0;
+                document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
+                document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
+                if (codeRefsArea) codeRefsArea.innerHTML = '';
             }
+            inputSessionKey = null;
             currentSessionKey = sessionKey;
-            // Clear current messages
             messagesContainer.innerHTML = '';
             messageCount = 0;
-            // Replay session messages
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
                     addMessage(msg.text, msg.type || 'system', null, msg.plain || false, false, msg.attachments, msg.files);
                 });
             }
-            // Restore draft
             messageInput.value = draft || '';
             adjustTextareaHeight();
-            // Update trigger status
             updateMcpStatus(mcpActive, hasPendingTrigger);
             messageInput.focus();
         }

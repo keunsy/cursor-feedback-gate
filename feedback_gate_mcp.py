@@ -371,7 +371,8 @@ class FeedbackGateServer:
             user_input = ""
             if file_content.startswith('{'):
                 data = json.loads(file_content)
-                user_input = data.get("user_input", data.get("response", data.get("message", ""))).strip()
+                raw = data.get("user_input") or data.get("response") or data.get("message") or ""
+                user_input = str(raw).strip()
                 attachments = data.get("attachments", [])
                 files = data.get("files", [])
 
@@ -544,41 +545,8 @@ class FeedbackGateServer:
         #
         # _active_triggers: { trigger_id: { session_id, message, created_at, heartbeat_count } }
         
-        # Clean up stale triggers first
-        stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
-        if not is_remote:
-            _, _, _, stale_override = self._load_heartbeat_config()
-            if stale_override is not None:
-                stale_limit = stale_override
+        # Session match FIRST, then cleanup (so we never evict the re-entering trigger)
         now = time.time()
-        stale_ids = [tid for tid, info in self._active_triggers.items()
-                     if (now - info.get("created_at", 0)) > stale_limit]
-        for tid in stale_ids:
-            logger.warning(f"🧹 Clearing stale trigger {tid}")
-            _log_event("TRIGGER_EXPIRED", f"trigger={tid}")
-            del self._active_triggers[tid]
-        
-        _MAX_ACTIVE_TRIGGERS = 20
-        if len(self._active_triggers) >= _MAX_ACTIVE_TRIGGERS:
-            oldest_tid = min(self._active_triggers, key=lambda t: self._active_triggers[t].get("created_at", 0))
-            logger.warning(f"🧹 Evicting oldest trigger {oldest_tid} (cap={_MAX_ACTIVE_TRIGGERS})")
-            del self._active_triggers[oldest_tid]
-        
-        # Prune _last_responded_by_session to avoid unbounded growth
-        _SESSION_COOLDOWN_TTL = 3600  # 1 hour
-        stale_sessions = [k for k, t in self._last_responded_by_session.items()
-                          if (now - t) > _SESSION_COOLDOWN_TTL]
-        for k in stale_sessions:
-            del self._last_responded_by_session[k]
-        
-        # Also clean up legacy single-trigger state
-        if self._pending_trigger_id and self._pending_trigger_id not in self._active_triggers:
-            stale_age = now - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
-            if stale_age > stale_limit:
-                self._clear_trigger_state(responded=False)
-        
-        # Try to find an existing trigger for this conversation.
-        # Priority: session_id match > message match (fallback).
         my_trigger_id = None
         my_trigger_info = None
         if session_id:
@@ -588,13 +556,46 @@ class FeedbackGateServer:
                     my_trigger_info = info
                     break
         if not my_trigger_id and not session_id:
-            # Fallback without session_id: only safe when there's exactly one active trigger.
             if len(self._active_triggers) == 1:
                 tid, info = next(iter(self._active_triggers.items()))
                 my_trigger_id = tid
                 my_trigger_info = info
             elif len(self._active_triggers) > 1:
                 logger.warning(f"⚠️ Multiple active triggers ({len(self._active_triggers)}) without session_id — cannot safely match, creating new trigger")
+        
+        # Clean up stale triggers (skip the one we just matched)
+        stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
+        if not is_remote:
+            _, _, _, stale_override = self._load_heartbeat_config()
+            if stale_override is not None:
+                stale_limit = stale_override
+        stale_ids = [tid for tid, info in self._active_triggers.items()
+                     if tid != my_trigger_id and (now - info.get("created_at", 0)) > stale_limit]
+        for tid in stale_ids:
+            logger.warning(f"🧹 Clearing stale trigger {tid}")
+            _log_event("TRIGGER_EXPIRED", f"trigger={tid}")
+            del self._active_triggers[tid]
+        
+        _MAX_ACTIVE_TRIGGERS = 20
+        if len(self._active_triggers) >= _MAX_ACTIVE_TRIGGERS:
+            evict_candidates = [t for t in self._active_triggers if t != my_trigger_id]
+            if evict_candidates:
+                oldest_tid = min(evict_candidates, key=lambda t: self._active_triggers[t].get("created_at", 0))
+                logger.warning(f"🧹 Evicting oldest trigger {oldest_tid} (cap={_MAX_ACTIVE_TRIGGERS})")
+                del self._active_triggers[oldest_tid]
+                if self._pending_trigger_id == oldest_tid:
+                    self._clear_trigger_state(responded=False)
+        
+        _SESSION_COOLDOWN_TTL = 3600
+        stale_sessions = [k for k, t in self._last_responded_by_session.items()
+                          if (now - t) > _SESSION_COOLDOWN_TTL]
+        for k in stale_sessions:
+            del self._last_responded_by_session[k]
+        
+        if self._pending_trigger_id and self._pending_trigger_id not in self._active_triggers:
+            stale_age = now - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
+            if stale_age > stale_limit:
+                self._clear_trigger_state(responded=False)
         
         if my_trigger_id:
             # Same conversation re-entering — check for ready response
@@ -629,7 +630,15 @@ class FeedbackGateServer:
             local_wait_task = asyncio.ensure_future(
                 self._wait_for_user_input(my_trigger_id, timeout=wait_secs)
             )
-            user_input = await local_wait_task
+            try:
+                user_input = await local_wait_task
+            except asyncio.CancelledError:
+                local_wait_task.cancel()
+                try:
+                    await local_wait_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
             
             if user_input:
                 _resp_sid = (my_trigger_info or {}).get("session_id", "") or session_id
@@ -696,7 +705,7 @@ class FeedbackGateServer:
         logger.info(f"📄 Message: {message}")
         
         # Create trigger file for Cursor extension IMMEDIATELY
-        trigger_id = f"fg_{int(time.time() * 1000)}"  # Use milliseconds for uniqueness
+        trigger_id = f"fg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         
         # Force immediate trigger creation with enhanced debugging
         success = await self._trigger_cursor_popup_immediately({
@@ -762,11 +771,18 @@ class FeedbackGateServer:
             label = "CLI" if is_remote else "IDE"
             logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
             
-            # Use a LOCAL wait task — no shared _current_wait_task to avoid cross-conversation interference
             local_wait_task = asyncio.ensure_future(
                 self._wait_for_user_input(trigger_id, timeout=wait_secs)
             )
-            user_input = await local_wait_task
+            try:
+                user_input = await local_wait_task
+            except asyncio.CancelledError:
+                local_wait_task.cancel()
+                try:
+                    await local_wait_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
             
             if user_input:
                 self._active_triggers.pop(trigger_id, None)
@@ -834,7 +850,8 @@ class FeedbackGateServer:
                                 # Handle JSON format
                                 if file_content.startswith('{'):
                                     data = json.loads(file_content)
-                                    user_input = data.get("user_input", data.get("response", data.get("message", ""))).strip()
+                                    raw = data.get("user_input") or data.get("response") or data.get("message") or ""
+                                    user_input = str(raw).strip()
                                 # Handle plain text format
                                 else:
                                     user_input = file_content
@@ -1217,34 +1234,9 @@ class FeedbackGateServer:
             except Exception as sync_error:
                 logger.debug(f"fsync skipped: {sync_error}")
             
-            logger.info(f"🔥 IMMEDIATE trigger created for Cursor: {trigger_file}")
-            logger.info(f"📁 Trigger file path: {trigger_file.absolute()}")
-            logger.info(f"📊 Trigger file size: {file_size} bytes")
+            logger.info(f"🔥 Trigger created: {trigger_file} ({file_size} bytes)")
             
             await asyncio.sleep(0.05)
-            
-            # Note: Trigger file may have been consumed by extension already, which is good!
-            try:
-                if trigger_file.exists():
-                    logger.info(f"✅ Trigger file still exists: {trigger_file}")
-                else:
-                    logger.info(f"✅ Trigger file was consumed by extension: {trigger_file}")
-                    logger.info(f"🎯 This is expected behavior - extension is working properly")
-            except Exception as check_error:
-                logger.info(f"✅ Cannot check trigger file status (likely consumed): {check_error}")
-                logger.info(f"🎯 This is expected behavior - extension is working properly")
-            
-            # Check if extension might be watching
-            log_file = Path(get_temp_path("feedback_gate.log"))
-            if log_file.exists():
-                logger.info(f"📝 MCP log file exists: {log_file}")
-            else:
-                logger.warning(f"⚠️ MCP log file missing: {log_file}")
-            
-            # Force log flush
-            for handler in logger.handlers:
-                if hasattr(handler, 'flush'):
-                    handler.flush()
             
             return True
             
@@ -1255,28 +1247,6 @@ class FeedbackGateServer:
             # Wait before returning failure
             await asyncio.sleep(1.0)  # Wait 1 second before confirming failure
             return False
-
-    async def _create_backup_triggers(self, data: dict):
-        """Create backup trigger files for better reliability (PID-namespaced)"""
-        try:
-            for i in range(3):
-                backup_trigger = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}_{i}.json"))
-                backup_data = {
-                    "backup_id": i,
-                    "timestamp": datetime.now().isoformat(),
-                    "system": "feedback-gate",
-                    "data": data,
-                    "pid": self._server_pid,
-                    "ppid": os.getppid(),
-                    "mcp_integration": True,
-                    "immediate_activation": True
-                }
-                backup_trigger.write_text(json.dumps(backup_data, indent=2))
-            
-            logger.info(f"🔄 PID-namespaced backup triggers created (PID: {self._server_pid})")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Backup trigger creation failed: {e}")
 
     async def run(self):
         """Run the Feedback Gate server with immediate activation capability and shutdown monitoring"""
