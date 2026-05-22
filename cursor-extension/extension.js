@@ -8,6 +8,12 @@ const { getTempPath, getMimeType } = require('./utils');
 const queue = require('./queue-manager');
 const { getFeedbackGateHTML } = require('./webview-template');
 
+function isProcessAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch (e) {
+        return e.code !== 'ESRCH';
+    }
+}
+
 let chatPanel = null;
 let chatViewProvider = null;
 let sidebarViewProvider = null;
@@ -107,9 +113,13 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
         const pidSessions = getAllSessionsByMcpPid(mcpPid);
         const idleSessions = pidSessions.filter(s => !s.triggerData);
         if (idleSessions.length > 0) {
-            const adopt = idleSessions.length === 1
-                ? idleSessions[0]
-                : [...idleSessions].sort((a, b) => b.lastActiveAt - a.lastActiveAt)[0];
+            const activeIdle = activeSessionKey
+                ? idleSessions.find(s => s.key === activeSessionKey)
+                : null;
+            const adopt = activeIdle
+                || (idleSessions.length === 1
+                    ? idleSessions[0]
+                    : [...idleSessions].sort((a, b) => b.lastActiveAt - a.lastActiveAt)[0]);
             adopt.sessionId = sessionId;
             adopt.lastActiveAt = now;
             return adopt;
@@ -216,8 +226,7 @@ function cleanupStaleSessions() {
     const toRemove = [];
     for (const [key, session] of sessions) {
         const age = now - session.lastActiveAt;
-        let processAlive = false;
-        try { process.kill(session.mcpPid, 0); processAlive = true; } catch {}
+        const processAlive = isProcessAlive(session.mcpPid);
 
         if (session.triggerData) {
             // Has pending trigger — only clean if MCP process is dead
@@ -238,7 +247,6 @@ function cleanupStaleSessions() {
         }
     }
     for (const key of toRemove) {
-        if (sessions.size <= 1) break;
         console.log(`Feedback Gate: cleaning stale session ${key}`);
         queue.migrateSessionKey(key, '');
         sessions.delete(key);
@@ -248,7 +256,7 @@ function cleanupStaleSessions() {
             queue.setActiveSessionKey(activeSessionKey || '');
         }
     }
-    if (toRemove.length > 0 && sessions.size > 0) syncTabsToWebview();
+    if (toRemove.length > 0) syncTabsToWebview();
 }
 
 function findNextPendingSession() {
@@ -464,8 +472,9 @@ class FeedbackGatePanelProvider {
                 const currentTriggerId = (activeTrigger && activeTrigger.trigger_id) || null;
                 switch (webviewMessage.command) {
                     case 'send': {
-                        const sendSessionKey = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
-                        const sendSession = sendSessionKey ? sessions.get(sendSessionKey) : activeSession;
+                        const rawSessionKey = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
+                        const sendSession = (rawSessionKey ? sessions.get(rawSessionKey) : null) || activeSession;
+                        const sendSessionKey = sendSession ? sendSession.key : '';
                         if (sendSession) sendSession.pendingRemoteReply = null;
                         else if (activeSession) activeSession.pendingRemoteReply = null;
                         else pendingRemoteReply = null;
@@ -805,10 +814,21 @@ function writeResponseForTrigger(triggerId, queueItem, source) {
     const responseJson = JSON.stringify(responseData, null, 2);
     let written = false;
     const primaryPath = getTempPath(`feedback_gate_response_${triggerId}.json`);
-    try { fs.writeFileSync(primaryPath, responseJson); written = true; } catch (e) {
+    const tmpPath = primaryPath + '.tmp';
+    try {
+        fs.writeFileSync(tmpPath, responseJson);
+        fs.renameSync(tmpPath, primaryPath);
+        written = true;
+    } catch (e) {
         console.log(`Feedback Gate: CRITICAL response write failed for ${triggerId}: ${e.message}`);
+        try { fs.unlinkSync(tmpPath); } catch {}
     }
-    try { fs.writeFileSync(getTempPath('feedback_gate_response.json'), responseJson); } catch (e) {}
+    try {
+        const fallbackPath = getTempPath('feedback_gate_response.json');
+        const tmpFallback = fallbackPath + '.tmp';
+        fs.writeFileSync(tmpFallback, responseJson);
+        fs.renameSync(tmpFallback, fallbackPath);
+    } catch (e) {}
     if (!written) {
         queueItem.status = 'pending';
         delete queueItem.processingAt;
@@ -1331,7 +1351,6 @@ function checkTriggerFile(context, filePath) {
             
             // Auto-passthrough when disabled
             if (!feedbackGateEnabled) {
-                const triggerId = triggerData.data && triggerData.data.trigger_id;
                 if (triggerId) {
                     const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
                     fs.writeFileSync(responseFile, JSON.stringify({
@@ -1428,7 +1447,7 @@ function checkTriggerFile(context, filePath) {
                         queueItem.status = 'pending';
                         delete queueItem.processingAt;
                         queue.saveQueue();
-                        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id`);
+                        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id, falling through to popup`);
                     }
                     if (triggerId) {
                         processedTriggerIds.add(triggerId);
@@ -1436,10 +1455,10 @@ function checkTriggerFile(context, filePath) {
                             const first = processedTriggerIds.values().next().value;
                             processedTriggerIds.delete(first);
                         }
+                        try { fs.unlinkSync(filePath); } catch {}
+                        console.log(`Feedback Gate: auto-consumed queue item "${queueItem.text}"`);
+                        return;
                     }
-                    try { fs.unlinkSync(filePath); } catch {}
-                    console.log(`Feedback Gate: auto-consumed queue item "${queueItem.text}"`);
-                    return;
                 }
             }
             
@@ -1447,7 +1466,7 @@ function checkTriggerFile(context, filePath) {
             let cleaned = false;
             for (const [sKey, s] of sessions) {
                 if (s.mcpPid === triggerPid) continue;
-                try { process.kill(s.mcpPid, 0); } catch {
+                if (!isProcessAlive(s.mcpPid)) {
                     console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
                     queue.migrateSessionKey(sKey, '');
                     sessions.delete(sKey);
@@ -1477,9 +1496,12 @@ function checkTriggerFile(context, filePath) {
                 }
             }
             
-            handleFeedbackGateToolCall(context, triggerData.data, triggerPid);
+            try {
+                handleFeedbackGateToolCall(context, triggerData.data, triggerPid);
+            } catch (handleError) {
+                console.log(`Feedback Gate: handleFeedbackGateToolCall error: ${handleError.message}`);
+            }
             
-            // Mark as processed only after successful handling
             if (triggerId) {
                 processedTriggerIds.add(triggerId);
                 if (processedTriggerIds.size > 50) {
@@ -1791,6 +1813,18 @@ function openFeedbackGatePopup(context, options = {}) {
                 });
             }, 100);
         }
+
+        if (mcpIntegration && message && !_skipNewMessage) {
+            setTimeout(() => {
+                broadcastToAllWebviews({
+                    command: 'newMessage',
+                    text: message,
+                    type: 'system',
+                    toolData: toolData,
+                    mcpIntegration: mcpIntegration
+                });
+            }, 150);
+        }
         
         if (autoFocus) {
             setTimeout(() => {
@@ -1826,8 +1860,9 @@ function openFeedbackGatePopup(context, options = {}) {
             
             switch (webviewMessage.command) {
                 case 'send': {
-                    const sendSessionKey2 = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
-                    const sendSession2 = sendSessionKey2 ? sessions.get(sendSessionKey2) : activeSession;
+                    const rawSessionKey2 = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
+                    const sendSession2 = (rawSessionKey2 ? sessions.get(rawSessionKey2) : null) || activeSession;
+                    const sendSessionKey2 = sendSession2 ? sendSession2.key : '';
                     if (sendSession2) sendSession2.pendingRemoteReply = null;
                     else if (activeSession) activeSession.pendingRemoteReply = null;
                     else pendingRemoteReply = null;
@@ -1934,7 +1969,9 @@ function openFeedbackGatePopup(context, options = {}) {
     chatPanel.onDidDispose(
         () => {
             chatPanel = null;
-            currentTriggerData = null;
+            if (sessions.size === 0) {
+                currentTriggerData = null;
+            }
         },
         null,
         context.subscriptions
@@ -1974,6 +2011,7 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
     const triggerId = activeTrigger.trigger_id;
 
     if (!writeResponseForTrigger(triggerId, queueItem, directSend ? 'feedback_gate_direct' : 'feedback_gate_queue')) {
+        queue.requeueItem(queueItem.id);
         return;
     }
 
@@ -2011,9 +2049,10 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
         } else {
             currentTriggerData = null;
         }
-        // Auto-switch to next pending session
         const next = findNextPendingSession();
-        if (next) switchToSession(next.key);
+        if (next && (Date.now() - lastManualSwitchAt >= MANUAL_SWITCH_GUARD_MS)) {
+            switchToSession(next.key);
+        }
         setTimeout(() => {
             updateChatPanelStatus();
         }, 1000);

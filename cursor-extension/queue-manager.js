@@ -48,7 +48,9 @@ function loadQueue() {
         }
     } catch (e) {
         console.log(`Failed to load queue: ${e.message}`);
-        messageQueue = [];
+        if (messageQueue.length === 0) {
+            messageQueue = [];
+        }
     }
 }
 
@@ -164,6 +166,16 @@ function recoverStaleProcessing() {
     if (changed) saveQueue();
 }
 
+function requeueItem(id) {
+    const item = messageQueue.find(m => m.id === id);
+    if (item && item.status === 'processing') {
+        item.status = 'pending';
+        delete item.processingAt;
+        saveQueue();
+        syncToWebview(item.sessionKey);
+    }
+}
+
 function markQueueItemDone(id) {
     const item = messageQueue.find(m => m.id === id);
     if (item) {
@@ -261,6 +273,7 @@ module.exports = {
     saveQueue,
     enqueueMessage,
     dequeueMessage,
+    requeueItem,
     markQueueItemDone,
     removeQueueItem,
     moveQueueItem,

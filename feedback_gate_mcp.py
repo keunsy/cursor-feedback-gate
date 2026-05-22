@@ -550,7 +550,7 @@ class FeedbackGateServer:
         my_trigger_id = None
         my_trigger_info = None
         if session_id:
-            for tid, info in self._active_triggers.items():
+            for tid, info in list(self._active_triggers.items()):
                 if info.get("session_id") == session_id:
                     my_trigger_id = tid
                     my_trigger_info = info
@@ -907,7 +907,7 @@ class FeedbackGateServer:
         logger.info(f"⚡ ACTIVATING Quick Feedback IMMEDIATELY for Cursor Agent: {prompt}")
         
         # Create trigger for quick input IMMEDIATELY
-        trigger_id = f"quick_{int(time.time() * 1000)}"
+        trigger_id = f"quick_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         success = await self._trigger_cursor_popup_immediately({
             "tool": "quick_feedback",
             "prompt": prompt,
@@ -944,7 +944,7 @@ class FeedbackGateServer:
         logger.info(f"📁 ACTIVATING File Feedback IMMEDIATELY for Cursor Agent: {instruction}")
         
         # Create trigger for file picker IMMEDIATELY
-        trigger_id = f"file_{int(time.time() * 1000)}"
+        trigger_id = f"file_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         success = await self._trigger_cursor_popup_immediately({
             "tool": "file_feedback",
             "instruction": instruction,
@@ -986,7 +986,7 @@ class FeedbackGateServer:
         logger.info(f"📍 Source: {source}, Context: {context}, Mode: {processing_mode}")
         
         # Create trigger for ingest_text IMMEDIATELY (consistent with other tools)
-        trigger_id = f"ingest_{int(time.time() * 1000)}"
+        trigger_id = f"ingest_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         success = await self._trigger_cursor_popup_immediately({
             "tool": "ingest_text",
             "text_content": text_content,
@@ -1042,7 +1042,7 @@ class FeedbackGateServer:
         logger.info(f"🛑 ACTIVATING shutdown_mcp IMMEDIATELY for Cursor Agent: {reason}")
         
         # Create trigger for shutdown_mcp IMMEDIATELY
-        trigger_id = f"shutdown_{int(time.time() * 1000)}"
+        trigger_id = f"shutdown_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         success = await self._trigger_cursor_popup_immediately({
             "tool": "shutdown_mcp",
             "reason": reason,
@@ -1204,35 +1204,12 @@ class FeedbackGateServer:
             logger.info(f"🎯 CREATING trigger files (PID: {self._server_pid}, trigger_id: {trigger_id})")
             
             trigger_json = json.dumps(trigger_data, indent=2)
-            trigger_file.write_text(trigger_json)
-            legacy_trigger_file.write_text(trigger_json)
+            file_size = len(trigger_json.encode('utf-8'))
             
-            # Verify file was written successfully
-            if not trigger_file.exists():
-                logger.error(f"❌ Failed to create trigger file: {trigger_file}")
-                return False
-                
-            try:
-                file_size = trigger_file.stat().st_size
-                if file_size == 0:
-                    logger.error(f"❌ Trigger file is empty: {trigger_file}")
-                    return False
-            except FileNotFoundError:
-                # File may have been consumed by the extension already - this is OK
-                logger.info(f"✅ Trigger file was consumed immediately by extension: {trigger_file}")
-                file_size = len(json.dumps(trigger_data, indent=2))
-            
-            # Flush trigger file to disk (single-file flush, not full os.sync())
-            try:
-                fd = os.open(str(trigger_file), os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            except FileNotFoundError:
-                pass
-            except Exception as sync_error:
-                logger.debug(f"fsync skipped: {sync_error}")
+            for target in (trigger_file, legacy_trigger_file):
+                tmp = target.with_suffix('.json.tmp')
+                tmp.write_text(trigger_json)
+                tmp.replace(target)
             
             logger.info(f"🔥 Trigger created: {trigger_file} ({file_size} bytes)")
             

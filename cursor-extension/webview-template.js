@@ -1006,6 +1006,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             codeReferences = codeReferences.filter(r => r.id !== refId);
             const el = document.querySelector('[data-cref-id="' + refId + '"]');
             if (el) el.remove();
+            if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
+                inputSessionKey = null;
+            }
         }
         window.removeCodeReference = removeCodeReference;
         
@@ -1096,10 +1099,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         // Remove image function
         function removeImage(imageId) {
-            // Remove from attachments array
             attachedImages = attachedImages.filter(img => img.id !== imageId);
             
-            // Remove from DOM
             const imagePreview = document.querySelector(\`[data-image-id="\${imageId}"]\`);
             if (imagePreview) {
                 imagePreview.remove();
@@ -1107,7 +1108,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
             updateImageCounter();
             
-            // Log removal
+            if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
+                inputSessionKey = null;
+            }
+            
             console.log(\`🗑️ Image removed: \${imageId}\`);
             vscode.postMessage({
                 command: 'logImageRemoved',
@@ -1318,6 +1322,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             attachedFiles = attachedFiles.filter(f => f.id !== fileId);
             const preview = document.querySelector(\`[data-file-id="\${fileId}"]\`);
             if (preview) preview.remove();
+            if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
+                inputSessionKey = null;
+            }
         }
         
         window.removeFile = removeFile;
@@ -1467,8 +1474,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                         if (!atts || atts.length === 0) return;
                         const thumbs = atts.map(att => {
                             const src = att.dataUrl || (att.base64Data && att.base64Data !== '[TOO_LARGE_FOR_QUEUE]' ? \`data:\${att.mimeType || 'image/png'};base64,\${att.base64Data}\` : '') || (att.data && att.data !== '[TOO_LARGE_FOR_QUEUE]' ? att.data : '');
-                            if (!src) return '<div class="img-placeholder">🖼️</div>';
-                            return \`<img src="\${src}" alt="\${escapeHtml(att.fileName || '图片')}">\`;
+                            if (!src || !/^data:image\\/[a-zA-Z0-9.+-]+;base64,/.test(src)) return '<div class="img-placeholder">🖼️</div>';
+                            return \`<img src="\${escapeHtml(src)}" alt="\${escapeHtml(att.fileName || '图片')}">\`;
                         });
                         tooltip.innerHTML = thumbs.join('');
                         const rect = badge.getBoundingClientRect();
@@ -1590,15 +1597,12 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         function loadSession(sessionKey, label, messages, draft, hasPendingTrigger) {
-            const hasPendingAttachments = (attachedImages.length > 0 || attachedFiles.length > 0 || codeReferences.length > 0);
-            if (!hasPendingAttachments) {
-                attachedImages.length = 0;
-                attachedFiles.length = 0;
-                codeReferences.length = 0;
-                document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
-                document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
-                if (codeRefsArea) codeRefsArea.innerHTML = '';
-            }
+            attachedImages.length = 0;
+            attachedFiles.length = 0;
+            codeReferences.length = 0;
+            document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
+            document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
+            if (codeRefsArea) codeRefsArea.innerHTML = '';
             inputSessionKey = null;
             currentSessionKey = sessionKey;
             messagesContainer.innerHTML = '';
