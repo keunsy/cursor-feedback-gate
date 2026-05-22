@@ -5,6 +5,7 @@ let messageQueue = [];
 let _vscode = null;
 let _postToWebview = null;
 let _idCounter = 0;
+let _activeSessionKey = '';
 
 function init(vscode, postToWebviewFn) {
     _vscode = vscode;
@@ -48,12 +49,23 @@ function saveQueue() {
     }
 }
 
-function syncToWebview() {
+function setActiveSessionKey(key) {
+    _activeSessionKey = key || '';
+}
+
+function syncToWebview(sessionKey) {
     if (_postToWebview) {
+        const filterKey = sessionKey !== undefined ? sessionKey : _activeSessionKey;
+        let items = messageQueue.filter(m => m.status === 'pending' || m.status === 'processing');
+        if (filterKey) {
+            items = items.filter(m => m.sessionKey === filterKey);
+        } else {
+            items = items.filter(m => !m.sessionKey);
+        }
         _postToWebview({
             command: 'syncQueue',
-            items: messageQueue.filter(m => m.status === 'pending' || m.status === 'processing'),
-            pendingCount: getPendingQueueCount()
+            items,
+            pendingCount: items.filter(m => m.status === 'pending').length
         });
     }
 }
@@ -89,21 +101,28 @@ function enqueueMessage(text, attachments, files, meta) {
         source: meta?.source || 'local',
         sourceLabel: meta?.sourceLabel || '',
         chatId: meta?.chatId || '',
+        sessionKey: meta?.sessionKey || '',
     };
     messageQueue.push(item);
     saveQueue();
-    syncToWebview();
+    syncToWebview(meta?.sessionKey);
     return item;
 }
 
-function dequeueMessage() {
+function dequeueMessage(sessionKey) {
     recoverStaleProcessing();
-    const idx = messageQueue.findIndex(m => m.status === 'pending');
+    const idx = messageQueue.findIndex(m => {
+        if (m.status !== 'pending') return false;
+        if (sessionKey) {
+            return m.sessionKey === sessionKey;
+        }
+        return !m.sessionKey;
+    });
     if (idx === -1) return null;
     messageQueue[idx].status = 'processing';
     messageQueue[idx].processingAt = Date.now();
     saveQueue();
-    syncToWebview();
+    syncToWebview(sessionKey);
     return messageQueue[idx];
 }
 
@@ -123,17 +142,20 @@ function recoverStaleProcessing() {
 function markQueueItemDone(id) {
     const item = messageQueue.find(m => m.id === id);
     if (item) {
+        const sk = item.sessionKey;
         item.status = 'done';
         messageQueue = messageQueue.filter(m => m.status !== 'done');
         saveQueue();
-        syncToWebview();
+        syncToWebview(sk);
     }
 }
 
 function removeQueueItem(id) {
+    const item = messageQueue.find(m => m.id === id);
+    const sk = item ? item.sessionKey : undefined;
     messageQueue = messageQueue.filter(m => m.id !== id);
     saveQueue();
-    syncToWebview();
+    syncToWebview(sk);
 }
 
 function moveQueueItem(id, direction) {
@@ -188,9 +210,15 @@ function reorderQueue(orderedIds) {
     syncToWebview();
 }
 
-function getPendingQueueCount() {
+function getPendingQueueCount(sessionKey) {
     recoverStaleProcessing();
-    return messageQueue.filter(m => m.status === 'pending').length;
+    let pending = messageQueue.filter(m => m.status === 'pending');
+    if (sessionKey) {
+        pending = pending.filter(m => m.sessionKey === sessionKey);
+    } else {
+        pending = pending.filter(m => !m.sessionKey);
+    }
+    return pending.length;
 }
 
 module.exports = {
@@ -206,4 +234,5 @@ module.exports = {
     reorderQueue,
     getPendingQueueCount,
     syncToWebview,
+    setActiveSessionKey,
 };
