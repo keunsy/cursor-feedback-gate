@@ -1069,6 +1069,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         function handleImageUploaded(imageData) {
+            if (!inputSessionKey) inputSessionKey = currentSessionKey;
             // Add image to attachments with unique ID
             const imageId = 'img_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             imageData.id = imageId;
@@ -1292,6 +1293,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         function addFileAttachment(fileData) {
+            if (!inputSessionKey) inputSessionKey = currentSessionKey;
             const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             fileData.id = fileId;
             attachedFiles.push(fileData);

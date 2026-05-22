@@ -558,6 +558,12 @@ class FeedbackGateServer:
             _log_event("TRIGGER_EXPIRED", f"trigger={tid}")
             del self._active_triggers[tid]
         
+        _MAX_ACTIVE_TRIGGERS = 20
+        if len(self._active_triggers) >= _MAX_ACTIVE_TRIGGERS:
+            oldest_tid = min(self._active_triggers, key=lambda t: self._active_triggers[t].get("created_at", 0))
+            logger.warning(f"🧹 Evicting oldest trigger {oldest_tid} (cap={_MAX_ACTIVE_TRIGGERS})")
+            del self._active_triggers[oldest_tid]
+        
         # Prune _last_responded_by_session to avoid unbounded growth
         _SESSION_COOLDOWN_TTL = 3600  # 1 hour
         stale_sessions = [k for k, t in self._last_responded_by_session.items()

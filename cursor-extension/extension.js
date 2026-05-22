@@ -137,13 +137,6 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
     }
 
     // Multiple sessions without session_id → cannot safely route.
-    // Check if all have pending triggers (concurrent conversations).
-    const allPending = pidSessions.every(s => !!s.triggerData);
-    if (allPending) {
-        return createSession(mcpPid, now);
-    }
-
-    // Multiple sessions, some idle — still ambiguous without session_id.
     // Create new session to avoid cross-talk.
     return createSession(mcpPid, now);
 }
@@ -357,6 +350,22 @@ const reorderQueue = (ids) => queue.reorderQueue(ids);
 const getPendingQueueCount = (sessionKey) => queue.getPendingQueueCount(sessionKey);
 const syncQueueToWebview = (sessionKey) => queue.syncToWebview(sessionKey);
 
+function closeSessionByKey(key) {
+    if (!key) return;
+    const toClose = sessions.get(key);
+    if (!toClose || toClose.triggerData) return;
+    queue.migrateSessionKey(key, '');
+    sessions.delete(key);
+    if (activeSessionKey === key) {
+        const next = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
+        activeSessionKey = next ? next.key : null;
+        queue.setActiveSessionKey(activeSessionKey || '');
+        if (next) syncSessionToWebview(next);
+    }
+    syncTabsToWebview();
+    syncQueueToWebview(activeSessionKey || '');
+}
+
 function getPreferredLocation() {
     try {
         return vscode.workspace.getConfiguration('feedbackGate').get('defaultLocation', 'panel');
@@ -475,21 +484,7 @@ class FeedbackGatePanelProvider {
                         }
                         break;
                     case 'closeSession':
-                        if (webviewMessage.sessionKey) {
-                            const toClose = sessions.get(webviewMessage.sessionKey);
-                            if (toClose && !toClose.triggerData) {
-                                queue.migrateSessionKey(webviewMessage.sessionKey, '');
-                                sessions.delete(webviewMessage.sessionKey);
-                                if (activeSessionKey === webviewMessage.sessionKey) {
-                                    const next = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
-                                    activeSessionKey = next ? next.key : null;
-                                    queue.setActiveSessionKey(activeSessionKey || '');
-                                    if (next) syncSessionToWebview(next);
-                                }
-                                syncTabsToWebview();
-                                syncQueueToWebview(activeSessionKey || '');
-                            }
-                        }
+                        closeSessionByKey(webviewMessage.sessionKey);
                         break;
                     case 'removeQueueItem':
                         removeQueueItem(webviewMessage.itemId);
@@ -787,6 +782,36 @@ function logMessage(message) {
         outputChannel.appendLine(logMsg);
         // Don't auto-show output channel to avoid stealing focus
     }
+}
+
+function writeResponseForTrigger(triggerId, queueItem, source) {
+    const responseData = {
+        timestamp: new Date().toISOString(),
+        trigger_id: triggerId,
+        user_input: queueItem.text,
+        response: queueItem.text,
+        message: queueItem.text,
+        attachments: queueItem.attachments || [],
+        files: enrichFiles(queueItem.files),
+        event_type: 'MCP_RESPONSE',
+        source,
+        queue_item_id: queueItem.id
+    };
+    const responseJson = JSON.stringify(responseData, null, 2);
+    let written = false;
+    const primaryPath = getTempPath(`feedback_gate_response_${triggerId}.json`);
+    try { fs.writeFileSync(primaryPath, responseJson); written = true; } catch (e) {
+        console.log(`Feedback Gate: CRITICAL response write failed for ${triggerId}: ${e.message}`);
+    }
+    try { fs.writeFileSync(getTempPath('feedback_gate_response.json'), responseJson); } catch (e) {}
+    if (!written) {
+        queueItem.status = 'pending';
+        delete queueItem.processingAt;
+        queue.saveQueue();
+        processedTriggerIds.delete(triggerId);
+        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — response write failed`);
+    }
+    return written;
 }
 
 function enrichFiles(files) {
@@ -1223,16 +1248,6 @@ function startFeedbackGateIntegration(context) {
         for (const pid of boundMcpPids) {
             checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${pid}.json`));
         }
-        // Scan per-trigger files (fg_* pattern) for concurrent multi-conversation support
-        try {
-            const tempDir = process.platform === 'win32' ? os.tmpdir() : '/tmp';
-            const triggerFiles = fs.readdirSync(tempDir).filter(f =>
-                f.startsWith('feedback_gate_trigger_fg_') && f.endsWith('.json')
-            );
-            for (const tf of triggerFiles) {
-                checkTriggerFile(context, path.join(tempDir, tf));
-            }
-        } catch {}
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
         checkIdeQueueFile();
         // Expire stale pendingRemoteReply (30 minutes)
@@ -1272,15 +1287,6 @@ function startFeedbackGateIntegration(context) {
         for (const pid of boundMcpPids) {
             checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${pid}.json`));
         }
-        try {
-            const tempDir = process.platform === 'win32' ? os.tmpdir() : '/tmp';
-            const triggerFiles = fs.readdirSync(tempDir).filter(f =>
-                f.startsWith('feedback_gate_trigger_fg_') && f.endsWith('.json')
-            );
-            for (const tf of triggerFiles) {
-                checkTriggerFile(context, path.join(tempDir, tf));
-            }
-        } catch {}
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
     }, 100);
     
@@ -1423,31 +1429,7 @@ function checkTriggerFile(context, filePath) {
 
                     const qTriggerId = triggerData.data && triggerData.data.trigger_id;
                     if (qTriggerId) {
-                        const responseData = {
-                            timestamp: new Date().toISOString(),
-                            trigger_id: qTriggerId,
-                            user_input: queueItem.text,
-                            response: queueItem.text,
-                            message: queueItem.text,
-                            attachments: queueItem.attachments || [],
-                            files: enrichFiles(queueItem.files),
-                            event_type: 'MCP_RESPONSE',
-                            source: 'feedback_gate_queue',
-                            queue_item_id: queueItem.id
-                        };
-                        const responseJson = JSON.stringify(responseData, null, 2);
-                        let responseWritten = false;
-                        const primaryPath = getTempPath(`feedback_gate_response_${qTriggerId}.json`);
-                        try { fs.writeFileSync(primaryPath, responseJson); responseWritten = true; } catch (e) {
-                            console.log(`Feedback Gate: CRITICAL response write failed: ${e.message}`);
-                        }
-                        try { fs.writeFileSync(getTempPath('feedback_gate_response.json'), responseJson); } catch (e) {}
-                        if (!responseWritten) {
-                            queueItem.status = 'pending';
-                            delete queueItem.processingAt;
-                            queue.saveQueue();
-                            processedTriggerIds.delete(qTriggerId);
-                            console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — response write failed, will retry on next poll`);
+                        if (!writeResponseForTrigger(qTriggerId, queueItem, 'feedback_gate_queue')) {
                             return;
                         }
                         markQueueItemDone(queueItem.id);
@@ -1518,9 +1500,7 @@ function checkTriggerFile(context, filePath) {
             // user manually switched tabs very recently (10s guard).
             if (session && session.key !== activeSessionKey) {
                 const recentManualSwitch = (Date.now() - lastManualSwitchAt) < MANUAL_SWITCH_GUARD_MS;
-                const active = getActiveSession();
-                const activeHasTrigger = active && active.triggerData;
-                if (!recentManualSwitch || !activeHasTrigger) {
+                if (!recentManualSwitch) {
                     switchToSession(session.key);
                 } else {
                     syncTabsToWebview();
@@ -1894,25 +1874,9 @@ function openFeedbackGatePopup(context, options = {}) {
                         switchToSession(webviewMessage.sessionKey, true);
                     }
                     break;
-                case 'closeSession': {
-                    const csKey = webviewMessage.sessionKey;
-                    if (csKey) {
-                        const csSession = sessions.get(csKey);
-                        if (csSession && !csSession.triggerData) {
-                            queue.migrateSessionKey(csKey, '');
-                            sessions.delete(csKey);
-                            if (activeSessionKey === csKey) {
-                                const csNext = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
-                                activeSessionKey = csNext ? csNext.key : null;
-                                queue.setActiveSessionKey(activeSessionKey || '');
-                                if (csNext) syncSessionToWebview(csNext);
-                            }
-                            syncTabsToWebview();
-                            syncQueueToWebview(activeSessionKey || '');
-                        }
-                    }
+                case 'closeSession':
+                    closeSessionByKey(webviewMessage.sessionKey);
                     break;
-                }
                 case 'removeQueueItem':
                     removeQueueItem(webviewMessage.itemId);
                     break;
@@ -2034,35 +1998,7 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
 
     const triggerId = activeTrigger.trigger_id;
 
-    let responseWritten = false;
-    try {
-        const responseData = {
-            timestamp: new Date().toISOString(),
-            trigger_id: triggerId,
-            user_input: queueItem.text,
-            response: queueItem.text,
-            message: queueItem.text,
-            attachments: queueItem.attachments || [],
-            files: enrichFiles(queueItem.files),
-            event_type: 'MCP_RESPONSE',
-            source: directSend ? 'feedback_gate_direct' : 'feedback_gate_queue',
-            queue_item_id: queueItem.id
-        };
-        const responseJson = JSON.stringify(responseData, null, 2);
-        const primaryPath = getTempPath(`feedback_gate_response_${triggerId}.json`);
-        try { fs.writeFileSync(primaryPath, responseJson); responseWritten = true; } catch (e) {
-            console.log(`Feedback Gate: CRITICAL processQueue response write failed: ${e.message}`);
-        }
-        try { fs.writeFileSync(getTempPath('feedback_gate_response.json'), responseJson); } catch (e) {}
-    } catch (e) {
-        console.log(`Feedback Gate: processQueue response build error: ${e.message}`);
-    }
-
-    if (!responseWritten) {
-        queueItem.status = 'pending';
-        delete queueItem.processingAt;
-        queue.saveQueue();
-        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — processQueue response write failed`);
+    if (!writeResponseForTrigger(triggerId, queueItem, directSend ? 'feedback_gate_direct' : 'feedback_gate_queue')) {
         return;
     }
 
