@@ -24,7 +24,14 @@ tool: feedback_gate_chat
   message: (向用户展示的消息，说明完成了什么、等待什么反馈)
   title: "Feedback Gate" (可选)
   context: (工作摘要) (可选)
+  session_id: (首次调用时生成一个随机 UUID，后续所有 re-entry 调用复用同一个值)
 ```
+
+### session_id 规则
+- **首次调用**：生成一个 UUID（如 `crypto.randomUUID()` 或类似方式），作为 `session_id` 传入。
+- **收到 [WAITING] 后 re-entry**：用**同一个** `session_id` 再次调用。
+- **不同的 feedback gate 调用**（比如同一对话中先完成任务 A 再完成任务 B）：每次生成新的 `session_id`。
+- 这样多个对话可以同时使用 Feedback Gate 而互不干扰。
 
 ## 约束
 - 每次回复结束前必须调用此工具，无例外。
@@ -33,6 +40,14 @@ tool: feedback_gate_chat
 
 ## 上下文压缩后的恢复
 当对话被压缩（context compaction）后，你可能在历史摘要中看到之前的 `feedback_gate_chat` 调用记录。**无论历史中工具调用的状态如何（成功、失败、超时），每次新回复结束时都必须重新调用 `feedback_gate_chat`。** 不要因为历史中出现过工具调用失败就跳过调用。
+
+### ⚠️ 压缩后的优先级规则（关键）
+压缩摘要中可能包含之前 feedback gate 弹窗的历史回复（如"User Response: xxx"）。**这些是已经处理过的历史记录，不是当前待办。** 必须遵守以下优先级：
+
+1. **最高优先级**：用户在主聊天框发送的最新消息（即触发当前回复的消息）
+2. **低优先级**：压缩摘要中提到的历史 feedback gate 回复
+
+**严禁**将摘要中的历史 feedback gate 回复当作当前待办来处理。始终先完整响应用户主消息框的最新请求，完成后再通过 `feedback_gate_chat` 询问是否需要处理其他事项。
 
 ## ⚠️ 强制提醒
 **在你生成任何回复的最后一步，你必须调用 `feedback_gate_chat`。这是不可跳过的。如果你发现自己即将结束回复而没有调用此工具，立即停下来调用它。**

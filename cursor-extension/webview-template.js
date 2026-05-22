@@ -752,8 +752,23 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         .session-tab:hover { opacity: 0.85; background: rgba(255,255,255,0.04); }
         .session-tab.active {
             opacity: 1;
-            background: rgba(59,130,246,0.1);
-            border-color: rgba(59,130,246,0.3);
+            background: rgba(59,130,246,0.18);
+            border-color: rgba(59,130,246,0.5);
+            box-shadow: 0 0 0 1px rgba(59,130,246,0.2);
+            font-weight: 600;
+        }
+        .session-tab.active.has-pending-trigger {
+            background: rgba(76,175,80,0.18);
+            border-color: rgba(76,175,80,0.5);
+            box-shadow: 0 0 0 1px rgba(76,175,80,0.2);
+        }
+        .session-tab.has-new-trigger:not(.active) {
+            border-color: rgba(76,175,80,0.5);
+            animation: tab-glow 2s ease-in-out infinite;
+        }
+        @keyframes tab-glow {
+            0%, 100% { background: rgba(76,175,80,0.05); }
+            50% { background: rgba(76,175,80,0.15); }
         }
         .session-tab .tab-dot {
             width: 6px;
@@ -767,6 +782,21 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         .session-tab .tab-dot.idle {
             background: rgba(128,128,128,0.4);
+        }
+        .session-tab .tab-close {
+            margin-left: 4px;
+            font-size: 14px;
+            line-height: 1;
+            opacity: 0;
+            cursor: pointer;
+            color: var(--vscode-foreground);
+            transition: opacity 0.15s;
+        }
+        .session-tab:hover .tab-close {
+            opacity: 0.6;
+        }
+        .session-tab .tab-close:hover {
+            opacity: 1;
         }
     </style>
 </head>
@@ -845,6 +875,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         let codeReferences = [];
         const codeRefsArea = document.getElementById('codeRefsArea');
         let currentSessionKey = null;
+        let inputSessionKey = null; // locked when user starts typing, used at send time
         
         function updateMcpStatus(active, hasPendingTrigger) {
             mcpActive = active;
@@ -1017,9 +1048,11 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 attachments: sentImages,
                 files: sentFiles,
                 timestamp: new Date().toISOString(),
-                mcpIntegration: mcpIntegration
+                mcpIntegration: mcpIntegration,
+                sessionKey: inputSessionKey || currentSessionKey || ''
             });
             
+            inputSessionKey = null;
             messageInput.value = '';
             attachedImages = [];
             attachedFiles = [];
@@ -1305,6 +1338,11 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         // Event listeners
         messageInput.addEventListener('input', () => {
             adjustTextareaHeight();
+            if (messageInput.value.trim() && !inputSessionKey) {
+                inputSessionKey = currentSessionKey;
+            } else if (!messageInput.value.trim()) {
+                inputSessionKey = null;
+            }
         });
         
         messageInput.addEventListener('keydown', (e) => {
@@ -1370,6 +1408,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     renderSessionTabs(message.tabs, message.activeKey);
                     break;
                 case 'loadSession':
+                    if (currentSessionKey && currentSessionKey !== message.sessionKey && messageInput.value.trim()) {
+                        vscode.postMessage({ command: 'saveDraft', sessionKey: currentSessionKey, draft: messageInput.value });
+                    }
                     loadSession(message.sessionKey, message.label, message.messages, message.draft, message.hasPendingTrigger);
                     break;
             }
@@ -1524,14 +1565,22 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             sessionTabs.innerHTML = tabs.map(t => {
                 const isActive = t.key === activeKey;
                 const dotClass = t.hasPendingTrigger ? 'pending' : 'idle';
+                const hasNewTrigger = t.hasPendingTrigger && !isActive;
                 const label = escapeHtml(t.label || '对话');
-                return \`<div class="session-tab\${isActive ? ' active' : ''}" data-session-key="\${t.key}" title="\${label}\${t.lastMessage ? '\\n' + escapeHtml(t.lastMessage) : ''}">
+                const closeBtn = t.hasPendingTrigger ? '' : \`<span class="tab-close" data-close-key="\${t.key}" title="关闭">&times;</span>\`;
+                const classes = ['session-tab'];
+                if (isActive) classes.push('active');
+                if (isActive && t.hasPendingTrigger) classes.push('has-pending-trigger');
+                if (hasNewTrigger) classes.push('has-new-trigger');
+                return \`<div class="\${classes.join(' ')}" data-session-key="\${t.key}" title="\${label}\${t.lastMessage ? '\\n' + escapeHtml(t.lastMessage) : ''}">
                     <span class="tab-dot \${dotClass}"></span>
-                    <span>\${label}</span>
+                    <span>\${isActive ? '▸ ' : ''}\${label}</span>
+                    \${closeBtn}
                 </div>\`;
             }).join('');
             sessionTabs.querySelectorAll('.session-tab').forEach(tab => {
-                tab.addEventListener('click', () => {
+                tab.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('tab-close')) return;
                     const key = tab.dataset.sessionKey;
                     if (key && key !== currentSessionKey) {
                         vscode.postMessage({
@@ -1542,9 +1591,23 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     }
                 });
             });
+            sessionTabs.querySelectorAll('.tab-close').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const key = btn.dataset.closeKey;
+                    if (key) {
+                        vscode.postMessage({ command: 'closeSession', sessionKey: key });
+                    }
+                });
+            });
         }
         
         function loadSession(sessionKey, label, messages, draft, hasPendingTrigger) {
+            // If user was mid-typing for the old tab, keep inputSessionKey so the
+            // message goes to the intended tab even after an auto-switch.
+            if (!(messageInput.value.trim() && inputSessionKey)) {
+                inputSessionKey = null;
+            }
             currentSessionKey = sessionKey;
             // Clear current messages
             messagesContainer.innerHTML = '';
@@ -1570,6 +1633,14 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         setTimeout(() => {
             messageInput.focus();
         }, 100);
+
+        // Auto-focus input when webview regains focus (fixes Cmd+V not working
+        // after switching back from editor or other apps)
+        window.addEventListener('focus', () => {
+            if (!messageInput.disabled) {
+                messageInput.focus();
+            }
+        });
     </script>
 </body>
 </html>`;

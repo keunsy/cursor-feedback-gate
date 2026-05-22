@@ -25,14 +25,26 @@ function loadQueue() {
         if (fs.existsSync(queueFile)) {
             const data = JSON.parse(fs.readFileSync(queueFile, 'utf8'));
             messageQueue = data.items || [];
+            let changed = false;
             messageQueue.forEach(m => {
                 if (m.status === 'processing') {
                     m.status = 'pending';
                     delete m.processingAt;
+                    changed = true;
+                }
+                // On reload, stale sessionKeys would prevent messages from being
+                // consumed since no in-memory session can match them.  Clear them
+                // so the next trigger for this PID can pick them up.
+                if (m.sessionKey) {
+                    m._prevSessionKey = m.sessionKey;
+                    m.sessionKey = '';
+                    changed = true;
                 }
             });
             messageQueue = messageQueue.filter(m => m.status !== 'done');
-            saveQueue();
+            if (changed || messageQueue.length !== (data.items || []).length) {
+                saveQueue();
+            }
         }
     } catch (e) {
         console.log(`Failed to load queue: ${e.message}`);
@@ -51,6 +63,17 @@ function saveQueue() {
 
 function setActiveSessionKey(key) {
     _activeSessionKey = key || '';
+}
+
+function migrateSessionKey(fromKey, toKey) {
+    let changed = false;
+    messageQueue.forEach(m => {
+        if (m.sessionKey === fromKey) {
+            m.sessionKey = toKey;
+            changed = true;
+        }
+    });
+    if (changed) saveQueue();
 }
 
 function syncToWebview(sessionKey) {
@@ -101,11 +124,11 @@ function enqueueMessage(text, attachments, files, meta) {
         source: meta?.source || 'local',
         sourceLabel: meta?.sourceLabel || '',
         chatId: meta?.chatId || '',
-        sessionKey: meta?.sessionKey || '',
+        sessionKey: meta?.sessionKey || _activeSessionKey || '',
     };
     messageQueue.push(item);
     saveQueue();
-    syncToWebview(meta?.sessionKey);
+    syncToWebview();
     return item;
 }
 
@@ -224,6 +247,7 @@ function getPendingQueueCount(sessionKey) {
 module.exports = {
     init,
     loadQueue,
+    saveQueue,
     enqueueMessage,
     dequeueMessage,
     markQueueItemDone,
@@ -235,4 +259,5 @@ module.exports = {
     getPendingQueueCount,
     syncToWebview,
     setActiveSessionKey,
+    migrateSessionKey,
 };

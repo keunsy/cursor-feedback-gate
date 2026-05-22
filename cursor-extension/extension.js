@@ -89,17 +89,10 @@ function getAllSessionsByMcpPid(mcpPid) {
     return result;
 }
 
-const SESSION_MATCH_WINDOW_MS = 15000; // 15s window to match follow-up triggers to same conversation
-
 function getOrCreateSessionForTrigger(mcpPid, sessionId) {
-    // Cursor shares a single MCP process across conversations in the same window.
-    // When a new trigger arrives we need to figure out which conversation it belongs to.
-    //
-    // Phase 0 (best): if the trigger carries a session_id, match it exactly.
-    // Fallback phases use timing heuristics when session_id is absent.
     const now = Date.now();
 
-    // Phase 0: exact session_id match — most reliable
+    // Phase 0: exact session_id match — always the most reliable path
     if (sessionId) {
         for (const s of sessions.values()) {
             if (s.sessionId === sessionId) {
@@ -107,65 +100,51 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
                 return s;
             }
         }
-        // No session with this session_id yet.
-        // Before creating a new one, try to adopt an existing session from the same PID
-        // that was recently replied to (likely the same conversation, just started using session_id).
+        // Unknown session_id — try to adopt an idle session from the same PID.
+        // Agents generate a new session_id per task, but the Cursor conversation
+        // (and its tab) stays the same.  Adopting avoids phantom tab creation.
+        // When multiple idle sessions exist, pick the most recently active one.
         const pidSessions = getAllSessionsByMcpPid(mcpPid);
-        for (const s of pidSessions) {
-            if (!s.sessionId && !s.triggerData && s.lastResponseTime && (now - s.lastResponseTime) < SESSION_MATCH_WINDOW_MS) {
-                s.sessionId = sessionId;
-                s.lastActiveAt = now;
-                return s;
-            }
+        const idleSessions = pidSessions.filter(s => !s.triggerData);
+        if (idleSessions.length > 0) {
+            const adopt = idleSessions.length === 1
+                ? idleSessions[0]
+                : [...idleSessions].sort((a, b) => b.lastActiveAt - a.lastActiveAt)[0];
+            adopt.sessionId = sessionId;
+            adopt.lastActiveAt = now;
+            return adopt;
         }
-        const newSession = createSession(mcpPid, now, sessionId);
-        return newSession;
+        // All sessions have pending triggers — truly concurrent, need a new tab
+        return createSession(mcpPid, now, sessionId);
     }
 
-    // No session_id — fall back to PID-based heuristics
+    // No session_id — only use heuristics when there's exactly ONE session for this PID.
+    // Multiple sessions without session_id = ambiguous → always create new.
     const pidSessions = getAllSessionsByMcpPid(mcpPid);
 
     if (pidSessions.length === 0) {
         return createSession(mcpPid, now);
     }
 
-    // Phase 1: prefer a session that was recently replied to (follow-up trigger)
-    let recentReply = null;
-    for (const s of pidSessions) {
-        if (!s.triggerData && s.lastResponseTime && (now - s.lastResponseTime) < SESSION_MATCH_WINDOW_MS) {
-            if (!recentReply || s.lastResponseTime > recentReply.lastResponseTime) recentReply = s;
+    if (pidSessions.length === 1) {
+        const only = pidSessions[0];
+        if (!only.triggerData) {
+            only.lastActiveAt = now;
+            return only;
         }
-    }
-    if (recentReply) {
-        recentReply.lastActiveAt = now;
-        return recentReply;
+        // Single session but has pending trigger → new concurrent conversation
+        return createSession(mcpPid, now);
     }
 
-    // Phase 2: all sessions have pending triggers — true concurrent conversations.
-    // Always create a new session to avoid overwriting an existing trigger (which
-    // would orphan the MCP-side wait loop for the old trigger_id).
+    // Multiple sessions without session_id → cannot safely route.
+    // Check if all have pending triggers (concurrent conversations).
     const allPending = pidSessions.every(s => !!s.triggerData);
     if (allPending) {
         return createSession(mcpPid, now);
     }
 
-    // Phase 3: reuse an idle session that has no session_id.
-    // Without session_id, we can't distinguish conversations, so prefer reusing
-    // an existing no-sid idle session over creating a new one.
-    const idleNoSid = pidSessions.filter(s => !s.triggerData && !s.sessionId);
-    if (idleNoSid.length === 1) {
-        idleNoSid[0].lastActiveAt = now;
-        return idleNoSid[0];
-    }
-
-    // Phase 4: if only one idle session exists (regardless of sessionId), reuse it.
-    const allIdle = pidSessions.filter(s => !s.triggerData);
-    if (allIdle.length === 1) {
-        allIdle[0].lastActiveAt = now;
-        return allIdle[0];
-    }
-
-    // Phase 5: multiple idle sessions or no idle sessions — new conversation.
+    // Multiple sessions, some idle — still ambiguous without session_id.
+    // Create new session to avoid cross-talk.
     return createSession(mcpPid, now);
 }
 
@@ -499,6 +478,7 @@ class FeedbackGatePanelProvider {
                         if (webviewMessage.sessionKey) {
                             const toClose = sessions.get(webviewMessage.sessionKey);
                             if (toClose && !toClose.triggerData) {
+                                queue.migrateSessionKey(webviewMessage.sessionKey, '');
                                 sessions.delete(webviewMessage.sessionKey);
                                 if (activeSessionKey === webviewMessage.sessionKey) {
                                     const next = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
@@ -1332,7 +1312,6 @@ function checkTriggerFile(context, filePath) {
             // or by boundMcpPids set if already established.
             const triggerPid = triggerData.pid;
             const triggerPpid = triggerData.ppid;
-            const isPidNamespaced = filePath.includes('_pid');
             const myPid = process.pid;
             
             // If trigger has PPID info, use it for precise matching
@@ -1405,12 +1384,11 @@ function checkTriggerFile(context, filePath) {
             // Never guess across multiple sessions — messages stay in their session queue.
             const targetSessionId = (triggerData.data && triggerData.data.session_id) || '';
             let targetSession = null;
+            let targetMatchedBySessionId = false;
             if (targetSessionId) {
-                for (const s of sessions.values()) { if (s.sessionId === targetSessionId) { targetSession = s; break; } }
+                for (const s of sessions.values()) { if (s.sessionId === targetSessionId) { targetSession = s; targetMatchedBySessionId = true; break; } }
             }
-            if (!targetSession && triggerPid) {
-                // Without session_id, only match if there's exactly ONE session for this PID.
-                // Multiple sessions = can't safely determine which one this trigger belongs to.
+            if (!targetSession && !targetSessionId && triggerPid) {
                 const pidSessions = getAllSessionsByMcpPid(triggerPid);
                 if (pidSessions.length === 1) {
                     targetSession = pidSessions[0];
@@ -1418,12 +1396,18 @@ function checkTriggerFile(context, filePath) {
             }
             const targetSessionKey = targetSession ? targetSession.key : '';
             let shouldAutoConsume = false;
-            if (targetSession) {
+            if (targetSession && targetMatchedBySessionId) {
                 shouldAutoConsume = getPendingQueueCount(targetSessionKey) > 0 && !targetSession.triggerData;
-            } else {
+            } else if (targetSession && !targetSessionId) {
+                // PID fallback (no session_id) — only safe when this is the sole session
+                shouldAutoConsume = getPendingQueueCount(targetSessionKey) > 0 && !targetSession.triggerData;
+            } else if (!targetSession && !targetSessionId) {
+                // No session matched, no session_id — consume untagged messages only
                 const anySessionHasTrigger = [...sessions.values()].some(s => s.triggerData);
                 shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData;
             }
+            // When trigger has session_id but didn't match any session (new conversation),
+            // never auto-consume from existing sessions — their messages belong elsewhere.
             if (shouldAutoConsume) {
                 const queueItem = dequeueMessage(targetSessionKey);
                 if (queueItem) {
@@ -1452,12 +1436,20 @@ function checkTriggerFile(context, filePath) {
                             queue_item_id: queueItem.id
                         };
                         const responseJson = JSON.stringify(responseData, null, 2);
-                        [
-                            getTempPath(`feedback_gate_response_${qTriggerId}.json`),
-                            getTempPath('feedback_gate_response.json'),
-                        ].forEach(f => {
-                            try { fs.writeFileSync(f, responseJson); } catch (e) {}
-                        });
+                        let responseWritten = false;
+                        const primaryPath = getTempPath(`feedback_gate_response_${qTriggerId}.json`);
+                        try { fs.writeFileSync(primaryPath, responseJson); responseWritten = true; } catch (e) {
+                            console.log(`Feedback Gate: CRITICAL response write failed: ${e.message}`);
+                        }
+                        try { fs.writeFileSync(getTempPath('feedback_gate_response.json'), responseJson); } catch (e) {}
+                        if (!responseWritten) {
+                            queueItem.status = 'pending';
+                            delete queueItem.processingAt;
+                            queue.saveQueue();
+                            processedTriggerIds.delete(qTriggerId);
+                            console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — response write failed, will retry on next poll`);
+                            return;
+                        }
                         markQueueItemDone(queueItem.id);
                         sendExtensionAcknowledgement(qTriggerId, triggerData.data.tool);
                         
@@ -1491,6 +1483,7 @@ function checkTriggerFile(context, filePath) {
                         if (!triggerPid) pendingRemoteReply = null;
                         queueItem.status = 'pending';
                         delete queueItem.processingAt;
+                        queue.saveQueue();
                         console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id`);
                     }
                     try { fs.unlinkSync(filePath); } catch {}
@@ -1521,12 +1514,13 @@ function checkTriggerFile(context, filePath) {
                 currentTriggerData = triggerData.data;
             }
             
-            // Decide whether to auto-switch to this session's tab
-            if (session) {
-                const active = getActiveSession();
+            // Auto-switch to the session that received the trigger, unless the
+            // user manually switched tabs very recently (10s guard).
+            if (session && session.key !== activeSessionKey) {
                 const recentManualSwitch = (Date.now() - lastManualSwitchAt) < MANUAL_SWITCH_GUARD_MS;
-                const shouldAutoSwitch = !active || (!active.triggerData && !recentManualSwitch);
-                if (shouldAutoSwitch) {
+                const active = getActiveSession();
+                const activeHasTrigger = active && active.triggerData;
+                if (!recentManualSwitch || !activeHasTrigger) {
                     switchToSession(session.key);
                 } else {
                     syncTabsToWebview();
@@ -1905,6 +1899,7 @@ function openFeedbackGatePopup(context, options = {}) {
                     if (csKey) {
                         const csSession = sessions.get(csKey);
                         if (csSession && !csSession.triggerData) {
+                            queue.migrateSessionKey(csKey, '');
                             sessions.delete(csKey);
                             if (activeSessionKey === csKey) {
                                 const csNext = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
@@ -2039,6 +2034,7 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
 
     const triggerId = activeTrigger.trigger_id;
 
+    let responseWritten = false;
     try {
         const responseData = {
             timestamp: new Date().toISOString(),
@@ -2053,14 +2049,21 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
             queue_item_id: queueItem.id
         };
         const responseJson = JSON.stringify(responseData, null, 2);
-        [
-            getTempPath(`feedback_gate_response_${triggerId}.json`),
-            getTempPath('feedback_gate_response.json'),
-        ].forEach(f => {
-            try { fs.writeFileSync(f, responseJson); } catch (e) {}
-        });
+        const primaryPath = getTempPath(`feedback_gate_response_${triggerId}.json`);
+        try { fs.writeFileSync(primaryPath, responseJson); responseWritten = true; } catch (e) {
+            console.log(`Feedback Gate: CRITICAL processQueue response write failed: ${e.message}`);
+        }
+        try { fs.writeFileSync(getTempPath('feedback_gate_response.json'), responseJson); } catch (e) {}
     } catch (e) {
-        console.log(`Feedback Gate: processQueue response write error: ${e.message}`);
+        console.log(`Feedback Gate: processQueue response build error: ${e.message}`);
+    }
+
+    if (!responseWritten) {
+        queueItem.status = 'pending';
+        delete queueItem.processingAt;
+        queue.saveQueue();
+        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — processQueue response write failed`);
+        return;
     }
 
     markQueueItemDone(queueItem.id);

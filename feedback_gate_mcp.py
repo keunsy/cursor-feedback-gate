@@ -139,8 +139,8 @@ class FeedbackGateServer:
         self._last_attachments = []
         self._last_files = []
         self._server_pid = os.getpid()
-        self._current_wait_task: Optional[asyncio.Task] = None
-        self._wait_task_lock = asyncio.Lock()
+        self._active_triggers = {}
+        self._last_responded_by_session = {}
         
         # Clean up stale files from dead MCP instances before writing our own PID
         self._cleanup_stale_files()
@@ -266,7 +266,7 @@ class FeedbackGateServer:
             tools = [
                 Tool(
                     name="feedback_gate_chat",
-                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply. WARNING: If you are a subagent (launched via Task tool), DO NOT call this tool — it will hang and block the main Agent. Return your result directly instead.",
+                    description="Open Feedback Gate chat popup in Cursor for feedback. Use this when you need user input, feedback, or feedback from the human user. The popup will appear in Cursor and wait for user response. IMPORTANT: If the tool returns a [WAITING] status, you MUST immediately re-call this tool with the same message AND the same session_id — the user is still being waited on and the request is active. Keep re-calling until you receive a 'User Response:' reply. WARNING: If you are a subagent (launched via Task tool), DO NOT call this tool — it will hang and block the main Agent. Return your result directly instead.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -289,6 +289,11 @@ class FeedbackGateServer:
                                 "type": "boolean",
                                 "description": "Whether this is an urgent feedback request",
                                 "default": False
+                            },
+                            "session_id": {
+                                "type": "string",
+                                "description": "Unique session identifier for this conversation. Generate a random UUID on your FIRST call and reuse the SAME value for all subsequent re-entry calls (when you receive [WAITING]). This ensures multiple conversations can use Feedback Gate simultaneously without interference.",
+                                "default": ""
                             }
                         }
                     }
@@ -327,17 +332,18 @@ class FeedbackGateServer:
                 logger.error(f"💥 Tool call error for {name}: {e}")
                 if self._pending_trigger_id:
                     logger.warning(f"🧹 Clearing pending trigger {self._pending_trigger_id} due to exception")
+                    self._active_triggers.pop(self._pending_trigger_id, None)
                     self._clear_trigger_state(responded=False)
                 await asyncio.sleep(1.0)
                 return [TextContent(type="text", text=f"ERROR: Tool {name} failed: {str(e)}")]
 
-    # Track whether a feedback gate trigger is currently pending
     _pending_trigger_id: str | None = None
     _pending_trigger_created_at: float = 0
+    _pending_trigger_message: str = ""
     _last_trigger_responded_at: float = 0
     _heartbeat_count: int = 0
-    _STALE_TRIGGER_SECONDS_CLI: int = 120   # 2min — stale for CLI mode (50s heartbeat)
-    _STALE_TRIGGER_SECONDS_IDE: int = 86400  # 24h default — dynamically overridable via config
+    _STALE_TRIGGER_SECONDS_CLI: int = 120
+    _STALE_TRIGGER_SECONDS_IDE: int = 86400
 
     def _clear_trigger_state(self, responded: bool = False):
         """Reset all trigger tracking fields consistently.
@@ -348,6 +354,7 @@ class FeedbackGateServer:
         """
         self._pending_trigger_id = None
         self._pending_trigger_created_at = 0
+        self._pending_trigger_message = ""
         self._heartbeat_count = 0
         self._last_trigger_responded_at = time.time() if responded else 0
 
@@ -479,7 +486,7 @@ class FeedbackGateServer:
         return mode, reply, wait_override, stale_override
 
     @staticmethod
-    def _build_heartbeat_message(count: int, elapsed_min: float) -> str:
+    def _build_heartbeat_message(count: int, elapsed_min: float, session_id: str = "") -> str:
         """Build a varied heartbeat message so the Agent doesn't give up after
         seeing the same text repeatedly.  The core instruction (re-call the tool)
         stays identical; only the preamble rotates."""
@@ -494,14 +501,15 @@ class FeedbackGateServer:
             f"Waiting cycle #{count}. The user has been notified and will reply when ready.",
         ]
         preamble = preambles[(count - 1) % len(preambles)]
+        sid_instruction = f' Use session_id="{session_id}".' if session_id else ""
         return (
             f"[WAITING] {preamble} "
             "You MUST immediately call feedback_gate_chat again with the same message "
-            "to continue waiting. Do NOT end your response or summarize — just call "
-            "the tool again now."
+            f"and the same session_id to continue waiting.{sid_instruction} "
+            "Do NOT end your response or summarize — just call the tool again now."
         )
 
-    def _build_heartbeat_response(self, count: int, elapsed_min: float) -> str:
+    def _build_heartbeat_response(self, count: int, elapsed_min: float, session_id: str = "") -> str:
         """Return heartbeat text based on configured mode (re-reads config file).
         - 'waiting' (default): [WAITING] + re-call instruction
         - 'user_response': fake User Response to keep a normal Agent cycle
@@ -510,7 +518,7 @@ class FeedbackGateServer:
         if mode == "user_response":
             logger.info(f"💓 Heartbeat using user_response mode: '{reply}'")
             return f"User Response: {reply}"
-        return self._build_heartbeat_message(count, elapsed_min)
+        return self._build_heartbeat_message(count, elapsed_min, session_id=session_id)
 
     async def _handle_feedback_gate_chat(self, args: dict) -> list[TextContent]:
         """Handle Feedback Gate chat popup and wait for user input with 5 minute timeout"""
@@ -518,110 +526,149 @@ class FeedbackGateServer:
         title = args.get("title", "Feedback Gate")
         context = args.get("context", "")
         urgent = args.get("urgent", False)
+        session_id = args.get("session_id", "").strip()
         
         self._last_attachments = []
         self._last_files = []
         
         call_entry_time = time.time()
-        logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | msg_preview={message[:80]}...")
-        _log_event("ENTERED", f"trigger={self._pending_trigger_id} hb={self._heartbeat_count} msg={message[:60]}")
+        logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | session_id={session_id or 'none'} | msg_preview={message[:80]}...")
+        _log_event("ENTERED", f"trigger={self._pending_trigger_id} hb={self._heartbeat_count} sid={session_id or 'none'} msg={message[:60]}")
         
         is_remote = bool(self._find_routing_file())
         
-        # If a previous trigger is still pending (no response yet), re-enter the
-        # wait loop instead of creating a new trigger.  After the heartbeat ceiling
-        # (50s for CLI, 55min for IDE) we return a WAITING message and the Agent
-        # calls feedback_gate_chat again — we resume waiting here.
-        if self._pending_trigger_id:
-            stale_age = time.time() - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
-            stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
-            if not is_remote:
-                _, _, _, stale_override = self._load_heartbeat_config()
-                if stale_override is not None:
-                    stale_limit = stale_override
+        # --- Multi-conversation support ---
+        # Match existing trigger by session_id (preferred) or message content (fallback).
+        # session_id: agent generates a UUID on first call and reuses on re-entry.
+        # message fallback: for agents that don't support session_id yet.
+        #
+        # _active_triggers: { trigger_id: { session_id, message, created_at, heartbeat_count } }
+        
+        # Clean up stale triggers first
+        stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
+        if not is_remote:
+            _, _, _, stale_override = self._load_heartbeat_config()
+            if stale_override is not None:
+                stale_limit = stale_override
+        now = time.time()
+        stale_ids = [tid for tid, info in self._active_triggers.items()
+                     if (now - info.get("created_at", 0)) > stale_limit]
+        for tid in stale_ids:
+            logger.warning(f"🧹 Clearing stale trigger {tid}")
+            _log_event("TRIGGER_EXPIRED", f"trigger={tid}")
+            del self._active_triggers[tid]
+        
+        # Prune _last_responded_by_session to avoid unbounded growth
+        _SESSION_COOLDOWN_TTL = 3600  # 1 hour
+        stale_sessions = [k for k, t in self._last_responded_by_session.items()
+                          if (now - t) > _SESSION_COOLDOWN_TTL]
+        for k in stale_sessions:
+            del self._last_responded_by_session[k]
+        
+        # Also clean up legacy single-trigger state
+        if self._pending_trigger_id and self._pending_trigger_id not in self._active_triggers:
+            stale_age = now - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
             if stale_age > stale_limit:
-                logger.warning(f"🧹 Clearing stale pending trigger {self._pending_trigger_id} (age: {stale_age:.0f}s)")
-                _log_event("TRIGGER_EXPIRED", f"trigger={self._pending_trigger_id} age={stale_age:.0f}s limit={stale_limit:.0f}s")
                 self._clear_trigger_state(responded=False)
-            else:
-                response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
-                if response_file.exists():
-                    ready_input = self._read_and_consume_response(response_file)
-                    if ready_input:
+        
+        # Try to find an existing trigger for this conversation.
+        # Priority: session_id match > message match (fallback).
+        my_trigger_id = None
+        my_trigger_info = None
+        if session_id:
+            for tid, info in self._active_triggers.items():
+                if info.get("session_id") == session_id:
+                    my_trigger_id = tid
+                    my_trigger_info = info
+                    break
+        if not my_trigger_id:
+            # Message-based fallback: only safe when there's exactly one active trigger,
+            # otherwise different conversations with similar messages would collide.
+            if len(self._active_triggers) == 1:
+                tid, info = next(iter(self._active_triggers.items()))
+                my_trigger_id = tid
+                my_trigger_info = info
+            elif not session_id and len(self._active_triggers) > 1:
+                logger.warning(f"⚠️ Multiple active triggers ({len(self._active_triggers)}) without session_id — cannot safely match, creating new trigger")
+                pass
+        
+        if my_trigger_id:
+            # Same conversation re-entering — check for ready response
+            response_file = Path(get_temp_path(f"feedback_gate_response_{my_trigger_id}.json"))
+            if response_file.exists():
+                ready_input = self._read_and_consume_response(response_file)
+                if ready_input:
+                    _resp_sid = (my_trigger_info or {}).get("session_id", "") or session_id
+                    del self._active_triggers[my_trigger_id]
+                    if self._pending_trigger_id == my_trigger_id:
                         self._clear_trigger_state(responded=True)
-                        logger.info(f"✅ Found ready response for pending trigger: {ready_input[:100]}...")
-                        _log_event("USER_RESPONSE", f"path=ready-file trigger={self._pending_trigger_id} input={ready_input[:60]}")
-                        result = [TextContent(type="text", text=f"User Response: {ready_input}")]
-                        self._append_media_to_response(result)
-                        return result
-                    logger.warning(f"⚠️ Response file existed but content was empty/unreadable for trigger={self._pending_trigger_id}, continuing to wait")
-                    _log_event("EMPTY_RESPONSE_FILE", f"trigger={self._pending_trigger_id}")
-
-                # Either no response file yet, or it was empty — continue waiting
-                wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-                _, _, wait_override, _ = self._load_heartbeat_config()
-                if wait_override is not None and not is_remote:
-                    wait_secs = wait_override
-                max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
-                label = "CLI" if is_remote else "IDE"
-                async with self._wait_task_lock:
-                    if self._current_wait_task:
-                        if self._current_wait_task.done():
-                            if not self._current_wait_task.cancelled():
-                                try:
-                                    old_result = self._current_wait_task.result()
-                                    if old_result:
-                                        logger.info(f"✅ [DIAG] Previous wait task completed with result, reusing | trigger={self._pending_trigger_id}")
-                                        self._current_wait_task = None
-                                        self._clear_trigger_state(responded=True)
-                                        wall_elapsed = time.time() - call_entry_time
-                                        logger.info(f"✅ [DIAG] RE-ENTER reused previous result after {wall_elapsed:.1f}s | trigger={self._pending_trigger_id} | input={old_result[:100]}...")
-                                        result = [TextContent(type="text", text=f"User Response: {old_result}")]
-                                        self._append_media_to_response(result)
-                                        return result
-                                except Exception as e:
-                                    logger.debug(f"[DIAG] Could not reuse previous wait result: {e}")
-                        else:
-                            logger.info(f"🔄 [DIAG] Cancelling previous wait task before re-entering wait for {self._pending_trigger_id}")
-                            self._current_wait_task.cancel()
-                            try:
-                                await self._current_wait_task
-                            except asyncio.CancelledError:
-                                pass
-                            except Exception as e:
-                                logger.debug(f"[DIAG] Previous wait task raised on cancel: {e}")
-                    logger.info(f"🔄 Re-entering wait for pending trigger {self._pending_trigger_id} ({label}, {wait_secs}s)")
-                    self._current_wait_task = asyncio.ensure_future(
-                        self._wait_for_user_input(self._pending_trigger_id, timeout=wait_secs)
-                    )
-                user_input = await self._current_wait_task
-                if user_input:
-                    self._clear_trigger_state(responded=True)
-                    wall_elapsed = time.time() - call_entry_time
-                    logger.info(f"✅ [DIAG] RE-ENTER got user feedback after {wall_elapsed:.1f}s wall-time | trigger={self._pending_trigger_id} | input={user_input[:100]}...")
-                    _log_event("USER_RESPONSE", f"path=re-enter trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
-                    result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                    else:
+                        self._last_trigger_responded_at = time.time()
+                    self._last_responded_by_session[_resp_sid or "__global__"] = time.time()
+                    logger.info(f"✅ Found ready response for trigger {my_trigger_id}: {ready_input[:100]}...")
+                    _log_event("USER_RESPONSE", f"path=ready-file trigger={my_trigger_id} input={ready_input[:60]}")
+                    result = [TextContent(type="text", text=f"User Response: {ready_input}")]
                     self._append_media_to_response(result)
                     return result
+            
+            # Re-enter wait loop for this trigger
+            wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
+            _, _, wait_override, _ = self._load_heartbeat_config()
+            if wait_override is not None and not is_remote:
+                wait_secs = wait_override
+            max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
+            label = "CLI" if is_remote else "IDE"
+            
+            hb_count = my_trigger_info.get("heartbeat_count", 0)
+            logger.info(f"🔄 Re-entering wait for trigger {my_trigger_id} (hb={hb_count}, {label}, {wait_secs}s)")
+            
+            local_wait_task = asyncio.ensure_future(
+                self._wait_for_user_input(my_trigger_id, timeout=wait_secs)
+            )
+            user_input = await local_wait_task
+            
+            if user_input:
+                _resp_sid = (my_trigger_info or {}).get("session_id", "") or session_id
+                del self._active_triggers[my_trigger_id]
+                if self._pending_trigger_id == my_trigger_id:
+                    self._clear_trigger_state(responded=True)
                 else:
-                    self._heartbeat_count += 1
-                    elapsed_total = self._heartbeat_count * wait_secs
-                    elapsed_min = elapsed_total / 60
-                    wall_elapsed = time.time() - call_entry_time
-                    if elapsed_total >= max_secs:
+                    self._last_trigger_responded_at = time.time()
+                self._last_responded_by_session[_resp_sid or "__global__"] = time.time()
+                wall_elapsed = time.time() - call_entry_time
+                logger.info(f"✅ RE-ENTER got feedback for {my_trigger_id} after {wall_elapsed:.1f}s | input={user_input[:100]}...")
+                _log_event("USER_RESPONSE", f"path=re-enter trigger={my_trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
+                result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                self._append_media_to_response(result)
+                return result
+            else:
+                hb_count += 1
+                my_trigger_info["heartbeat_count"] = hb_count
+                elapsed_total = hb_count * wait_secs
+                elapsed_min = elapsed_total / 60
+                wall_elapsed = time.time() - call_entry_time
+                if elapsed_total >= max_secs:
+                    del self._active_triggers[my_trigger_id]
+                    if self._pending_trigger_id == my_trigger_id:
                         self._clear_trigger_state(responded=False)
-                        max_hours = max_secs / 3600
-                        logger.warning(f"⏰ [DIAG] RE-ENTER {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
-                        return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
-                    logger.info(f"⏳ [DIAG] RE-ENTER heartbeat #{self._heartbeat_count} | trigger={self._pending_trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative | {label}")
-                    _log_event("HEARTBEAT", f"#{self._heartbeat_count} trigger={self._pending_trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
-                    return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
+                    max_hours = max_secs / 3600
+                    logger.warning(f"⏰ RE-ENTER {label} wait exceeded {max_hours:.0f}h ({elapsed_min:.0f}min) for {my_trigger_id}")
+                    return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
+                logger.info(f"⏳ RE-ENTER heartbeat #{hb_count} | trigger={my_trigger_id} | {wait_secs}s | ~{elapsed_min:.1f}min cumulative")
+                _log_event("HEARTBEAT", f"#{hb_count} trigger={my_trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
+                trigger_sid = my_trigger_info.get("session_id", "") if my_trigger_info else ""
+                return [TextContent(type="text", text=self._build_heartbeat_response(hb_count, elapsed_min, session_id=trigger_sid))]
         
-        # Brief cooldown: avoid rapid re-trigger right after receiving a response.
-        # Only 2 seconds — long enough to let Agent process feedback, short enough to
-        # allow a quick follow-up feedback gate in the same turn.
-        if self._last_trigger_responded_at and (time.time() - self._last_trigger_responded_at) < 2:
-            logger.info("⏭️ Feedback Gate skipped: brief cooldown after recent response")
+        # Brief per-session cooldown: avoid rapid re-trigger right after receiving a response.
+        # Uses session_id when available; falls back to global only when no session_id is given
+        # (single-conversation mode).  With session_id, never fall back to global — that would
+        # let conversation A's cooldown block conversation B.
+        _cooldown_key = session_id or "__global__"
+        _cooldown_last = self._last_responded_by_session.get(_cooldown_key, 0)
+        if not _cooldown_last and not session_id:
+            _cooldown_last = self._last_responded_by_session.get("__global__", 0)
+        if _cooldown_last and (time.time() - _cooldown_last) < 2:
+            logger.info(f"⏭️ Feedback Gate skipped: brief cooldown after recent response (key={_cooldown_key})")
             return [TextContent(type="text", text="SKIP: Processing recent feedback. You MUST call feedback_gate_chat again in 2 seconds. Do NOT end your turn.")]
         
         # Model gate: only activate for specific model if FEEDBACK_GATE_MODEL is set
@@ -655,39 +702,51 @@ class FeedbackGateServer:
             "context": context,
             "urgent": urgent,
             "trigger_id": trigger_id,
+            "session_id": session_id,
             "timestamp": datetime.now().isoformat(),
             "immediate_activation": True
         })
         
         if success:
+            # Register in both legacy state and new per-trigger tracking
             self._pending_trigger_id = trigger_id
             self._pending_trigger_created_at = time.time()
+            self._pending_trigger_message = message
             self._heartbeat_count = 0
-            logger.info(f"🔥 POPUP TRIGGERED IMMEDIATELY - waiting for user input (trigger_id: {trigger_id})")
-            _log_event("NEW_TRIGGER", f"trigger={trigger_id} msg={message[:60]}")
+            self._active_triggers[trigger_id] = {
+                "session_id": session_id,
+                "message": message,
+                "created_at": time.time(),
+                "heartbeat_count": 0,
+            }
+            logger.info(f"🔥 POPUP TRIGGERED - waiting for user input (trigger_id: {trigger_id}, session_id={session_id or 'none'}, active_triggers={len(self._active_triggers)})")
+            _log_event("NEW_TRIGGER", f"trigger={trigger_id} active={len(self._active_triggers)} msg={message[:60]}")
             
             # Quick check: is the extension alive?
             # The extension polls every 250ms and deletes trigger files immediately.
-            # If the trigger file still exists after 5s, no extension is running.
-            trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
+            # Check both the per-trigger file and the PID-namespaced file — the extension
+            # may consume either one first depending on its poll cycle.
+            per_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_{trigger_id}.json"))
+            pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
             extension_alive = False
             for _ in range(10):
                 await asyncio.sleep(0.5)
-                if not trigger_file.exists():
+                if not per_trigger_file.exists() or not pid_trigger_file.exists():
                     extension_alive = True
                     break
             
             if not extension_alive:
                 logger.warning("⚠️ Trigger file not consumed — no Feedback Gate extension detected")
+                self._active_triggers.pop(trigger_id, None)
                 self._clear_trigger_state(responded=False)
                 try:
-                    trigger_file.unlink(missing_ok=True)
+                    per_trigger_file.unlink(missing_ok=True)
+                    pid_trigger_file.unlink(missing_ok=True)
                     Path(get_temp_path("feedback_gate_trigger.json")).unlink(missing_ok=True)
                 except Exception:
                     pass
                 return [TextContent(type="text", text="SKIP: Feedback Gate extension is not active (no GUI detected). Continuing without user feedback.")]
             
-            # Wait for extension acknowledgement
             ack_received = await self._wait_for_extension_acknowledgement(trigger_id, timeout=15)
             if ack_received:
                 logger.info("📨 Extension acknowledged popup activation")
@@ -701,45 +760,46 @@ class FeedbackGateServer:
             max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
             label = "CLI" if is_remote else "IDE"
             logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
-            async with self._wait_task_lock:
-                if self._current_wait_task and not self._current_wait_task.done():
-                    logger.info(f"🔄 [DIAG] Cancelling previous wait task before starting new wait for {trigger_id}")
-                    self._current_wait_task.cancel()
-                    try:
-                        await self._current_wait_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.debug(f"[DIAG] Previous wait task raised on cancel: {e}")
-                self._current_wait_task = asyncio.ensure_future(
-                    self._wait_for_user_input(trigger_id, timeout=wait_secs)
-                )
-            user_input = await self._current_wait_task
+            
+            # Use a LOCAL wait task — no shared _current_wait_task to avoid cross-conversation interference
+            local_wait_task = asyncio.ensure_future(
+                self._wait_for_user_input(trigger_id, timeout=wait_secs)
+            )
+            user_input = await local_wait_task
             
             if user_input:
-                self._clear_trigger_state(responded=True)
+                self._active_triggers.pop(trigger_id, None)
+                if self._pending_trigger_id == trigger_id:
+                    self._clear_trigger_state(responded=True)
+                else:
+                    self._last_trigger_responded_at = time.time()
+                self._last_responded_by_session[session_id or "__global__"] = time.time()
                 wall_elapsed = time.time() - call_entry_time
-                logger.info(f"✅ [DIAG] RETURNING USER FEEDBACK after {wall_elapsed:.1f}s wall-time | trigger={trigger_id} | input={user_input[:100]}...")
+                logger.info(f"✅ Got feedback for {trigger_id} after {wall_elapsed:.1f}s | input={user_input[:100]}...")
                 _log_event("USER_RESPONSE", f"path=first-wait trigger={trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
-                
-                response_content = [TextContent(type="text", text=f"User Response: {user_input}")]
-                
-                self._append_media_to_response(response_content)
-                
-                return response_content
+                result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                self._append_media_to_response(result)
+                return result
             else:
-                self._heartbeat_count += 1
-                elapsed_total = self._heartbeat_count * wait_secs
+                trigger_info = self._active_triggers.get(trigger_id)
+                if trigger_info:
+                    trigger_info["heartbeat_count"] = trigger_info.get("heartbeat_count", 0) + 1
+                    hb_count = trigger_info["heartbeat_count"]
+                else:
+                    hb_count = 1
+                elapsed_total = hb_count * wait_secs
                 elapsed_min = elapsed_total / 60
                 wall_elapsed = time.time() - call_entry_time
                 if elapsed_total >= max_secs:
-                    self._clear_trigger_state(responded=False)
+                    self._active_triggers.pop(trigger_id, None)
+                    if self._pending_trigger_id == trigger_id:
+                        self._clear_trigger_state(responded=False)
                     max_hours = max_secs / 3600
-                    logger.warning(f"⏰ [DIAG] {label} wait exceeded {max_hours:.0f}h limit ({elapsed_min:.0f}min) | wall={wall_elapsed:.1f}s")
+                    logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h ({elapsed_min:.0f}min) for {trigger_id}")
                     return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
-                logger.info(f"⏳ [DIAG] {label} wait timed out, returning heartbeat #{self._heartbeat_count} | trigger={trigger_id} | config_timeout={wait_secs}s | wall={wall_elapsed:.1f}s | ~{elapsed_min:.1f}min cumulative")
-                _log_event("HEARTBEAT", f"#{self._heartbeat_count} trigger={trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min (first-wait)")
-                return [TextContent(type="text", text=self._build_heartbeat_response(self._heartbeat_count, elapsed_min))]
+                logger.info(f"⏳ {label} heartbeat #{hb_count} | trigger={trigger_id} | {wait_secs}s | ~{elapsed_min:.1f}min cumulative")
+                _log_event("HEARTBEAT", f"#{hb_count} trigger={trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
+                return [TextContent(type="text", text=self._build_heartbeat_response(hb_count, elapsed_min, session_id=session_id))]
         else:
             response = f"ERROR: Failed to trigger Feedback Gate popup"
             logger.error("❌ Failed to trigger Feedback Gate popup")
@@ -1077,9 +1137,10 @@ class FeedbackGateServer:
     async def _trigger_cursor_popup_immediately(self, data: dict) -> bool:
         """Create trigger file for Cursor extension with immediate activation and instance isolation"""
         try:
-            # PID-namespaced trigger file for multi-instance isolation
+            # PID-namespaced trigger file for multi-instance isolation.
+            # The extension polls for feedback_gate_trigger_pid*.json — only this
+            # and the legacy file are consumed; per-trigger files would become orphans.
             trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
-            # Also write legacy trigger for backward compatibility
             legacy_trigger_file = Path(get_temp_path("feedback_gate_trigger.json"))
             
             # Build routing info: try env vars first, then fall back to routing file.
@@ -1122,12 +1183,12 @@ class FeedbackGateServer:
             if routing:
                 trigger_data["routing"] = routing
             
-            logger.info(f"🎯 CREATING PID-namespaced trigger file (PID: {self._server_pid})")
+            trigger_id = data.get("trigger_id", "")
+            logger.info(f"🎯 CREATING trigger files (PID: {self._server_pid}, trigger_id: {trigger_id})")
             
-            # Write PID-namespaced trigger file
-            trigger_file.write_text(json.dumps(trigger_data, indent=2))
-            # Also write legacy trigger for backward compatibility
-            legacy_trigger_file.write_text(json.dumps(trigger_data, indent=2))
+            trigger_json = json.dumps(trigger_data, indent=2)
+            trigger_file.write_text(trigger_json)
+            legacy_trigger_file.write_text(trigger_json)
             
             # Verify file was written successfully
             if not trigger_file.exists():
