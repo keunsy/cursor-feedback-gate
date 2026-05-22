@@ -238,9 +238,9 @@ function cleanupStaleSessions() {
         }
     }
     for (const key of toRemove) {
-        // Never remove the last remaining session
         if (sessions.size <= 1) break;
         console.log(`Feedback Gate: cleaning stale session ${key}`);
+        queue.migrateSessionKey(key, '');
         sessions.delete(key);
         if (activeSessionKey === key) {
             const next = findNextPendingSession();
@@ -1609,8 +1609,6 @@ function handleFeedbackGateToolCall(context, toolData, mcpPid) {
     
     // Add trigger ID to popup options
     popupOptions.triggerId = toolData.trigger_id;
-    console.log(`🔍 DEBUG: Setting popup triggerId to: ${toolData.trigger_id}`);
-    
     // Force consistent title regardless of tool call
     popupOptions.title = "Feedback Gate";
     

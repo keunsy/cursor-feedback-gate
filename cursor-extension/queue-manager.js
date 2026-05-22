@@ -182,7 +182,10 @@ function removeQueueItem(id) {
 }
 
 function moveQueueItem(id, direction) {
-    const pendingItems = messageQueue.filter(m => m.status === 'pending');
+    const item = messageQueue.find(m => m.id === id);
+    if (!item) return;
+    const sk = item.sessionKey || '';
+    const pendingItems = messageQueue.filter(m => m.status === 'pending' && (m.sessionKey || '') === sk);
     const idx = pendingItems.findIndex(m => m.id === id);
     if (idx === -1) return;
     
@@ -194,22 +197,24 @@ function moveQueueItem(id, direction) {
     
     [messageQueue[actualIdx], messageQueue[actualTarget]] = [messageQueue[actualTarget], messageQueue[actualIdx]];
     saveQueue();
-    syncToWebview();
+    syncToWebview(sk);
 }
 
 function pinQueueItem(id) {
-    const pendingItems = messageQueue.filter(m => m.status === 'pending');
+    const item = messageQueue.find(m => m.id === id);
+    if (!item) return;
+    const sk = item.sessionKey || '';
+    const pendingItems = messageQueue.filter(m => m.status === 'pending' && (m.sessionKey || '') === sk);
     const idx = pendingItems.findIndex(m => m.id === id);
     if (idx <= 0) return;
 
-    const item = pendingItems[idx];
-    const actualIdx = messageQueue.indexOf(item);
+    const actualIdx = messageQueue.indexOf(pendingItems[idx]);
     const firstPendingActualIdx = messageQueue.indexOf(pendingItems[0]);
 
     messageQueue.splice(actualIdx, 1);
     messageQueue.splice(firstPendingActualIdx, 0, item);
     saveQueue();
-    syncToWebview();
+    syncToWebview(sk);
 }
 
 function editQueueItem(id, newText) {

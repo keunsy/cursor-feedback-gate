@@ -587,16 +587,14 @@ class FeedbackGateServer:
                     my_trigger_id = tid
                     my_trigger_info = info
                     break
-        if not my_trigger_id:
-            # Message-based fallback: only safe when there's exactly one active trigger,
-            # otherwise different conversations with similar messages would collide.
+        if not my_trigger_id and not session_id:
+            # Fallback without session_id: only safe when there's exactly one active trigger.
             if len(self._active_triggers) == 1:
                 tid, info = next(iter(self._active_triggers.items()))
                 my_trigger_id = tid
                 my_trigger_info = info
-            elif not session_id and len(self._active_triggers) > 1:
+            elif len(self._active_triggers) > 1:
                 logger.warning(f"⚠️ Multiple active triggers ({len(self._active_triggers)}) without session_id — cannot safely match, creating new trigger")
-                pass
         
         if my_trigger_id:
             # Same conversation re-entering — check for ready response
@@ -730,14 +728,12 @@ class FeedbackGateServer:
             
             # Quick check: is the extension alive?
             # The extension polls every 250ms and deletes trigger files immediately.
-            # Check both the per-trigger file and the PID-namespaced file — the extension
-            # may consume either one first depending on its poll cycle.
-            per_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_{trigger_id}.json"))
+            # We only check the PID-namespaced file since that's what we actually write.
             pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
             extension_alive = False
             for _ in range(10):
                 await asyncio.sleep(0.5)
-                if not per_trigger_file.exists() or not pid_trigger_file.exists():
+                if not pid_trigger_file.exists():
                     extension_alive = True
                     break
             
@@ -746,7 +742,6 @@ class FeedbackGateServer:
                 self._active_triggers.pop(trigger_id, None)
                 self._clear_trigger_state(responded=False)
                 try:
-                    per_trigger_file.unlink(missing_ok=True)
                     pid_trigger_file.unlink(missing_ok=True)
                     Path(get_temp_path("feedback_gate_trigger.json")).unlink(missing_ok=True)
                 except Exception:
@@ -822,7 +817,6 @@ class FeedbackGateServer:
             get_temp_path("feedback_gate_response.json"),
         ]
         
-        import glob
         start_time = time.time()
         
         while time.time() - start_time < timeout:
@@ -856,7 +850,7 @@ class FeedbackGateServer:
                                             cf.unlink(missing_ok=True)
                                         except Exception:
                                             pass
-                                    logger.info(f"🧹 Response files cleaned up for trigger {trigger_id}")
+                                    logger.info(f"🧹 Response files cleaned up")
                                     
                                     logger.info(f"✅ RETRIEVED USER INPUT: {user_input[:100]}...")
                                     
@@ -1088,7 +1082,7 @@ class FeedbackGateServer:
                     try:
                         ack_file.unlink()
                         logger.info(f"🧹 Acknowledgement file cleaned up")
-                    except:
+                    except Exception:
                         pass
                     
                     if ack_status:

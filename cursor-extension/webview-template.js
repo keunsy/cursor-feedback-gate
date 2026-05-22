@@ -974,12 +974,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             typingIndicator.style.display = 'none';
         }
         
-        function simulateResponse(userMessage) {
-            // Don't simulate response - the backend handles acknowledgments now
-            // This avoids duplicate messages
-            hideTyping();
-        }
-        
         function addCodeReference(codeRef) {
             const refId = 'cref_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
             codeRef.id = refId;
@@ -1326,17 +1320,6 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         
         window.removeFile = removeFile;
         
-        function hasImageFiles(dataTransfer) {
-            if (dataTransfer.types) {
-                for (let i = 0; i < dataTransfer.types.length; i++) {
-                    if (dataTransfer.types[i] === 'Files') {
-                        return true; // We'll check for images on drop
-                    }
-                }
-            }
-            return false;
-        }
-        
         // Event listeners
         messageInput.addEventListener('input', () => {
             adjustTextareaHeight();
@@ -1605,9 +1588,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         }
         
         function loadSession(sessionKey, label, messages, draft, hasPendingTrigger) {
-            // If user was mid-typing for the old tab, keep inputSessionKey so the
-            // message goes to the intended tab even after an auto-switch.
-            if (!(messageInput.value.trim() && inputSessionKey)) {
+            // Keep inputSessionKey if user has pending content (text or attachments)
+            const hasPendingContent = (messageInput.value.trim() || attachedImages.length > 0 || attachedFiles.length > 0) && inputSessionKey;
+            if (!hasPendingContent) {
                 inputSessionKey = null;
             }
             currentSessionKey = sessionKey;
