@@ -104,6 +104,11 @@ try:
 except Exception:
     pass
 
+_FEEDBACK_REPLY_SUFFIX = (
+    "\n\n[This is a feedback reply, NOT a new task. "
+    "Continue current work. Do NOT re-answer earlier requests.]"
+)
+
 _last_entered_time: float = 0.0
 _last_event_time: float = 0.0
 
@@ -518,7 +523,7 @@ class FeedbackGateServer:
         mode, reply, _, _ = self._load_heartbeat_config()
         if mode == "user_response":
             logger.info(f"💓 Heartbeat using user_response mode: '{reply}'")
-            return f"User Response: {reply}"
+            return f"User Response: {reply}{_FEEDBACK_REPLY_SUFFIX}"
         return self._build_heartbeat_message(count, elapsed_min, session_id=session_id)
 
     async def _handle_feedback_gate_chat(self, args: dict) -> list[TextContent]:
@@ -612,7 +617,7 @@ class FeedbackGateServer:
                     self._last_responded_by_session[_resp_sid or "__global__"] = time.time()
                     logger.info(f"✅ Found ready response for trigger {my_trigger_id}: {ready_input[:100]}...")
                     _log_event("USER_RESPONSE", f"path=ready-file trigger={my_trigger_id} input={ready_input[:60]}")
-                    result = [TextContent(type="text", text=f"User Response: {ready_input}")]
+                    result = [TextContent(type="text", text=f"User Response: {ready_input}{_FEEDBACK_REPLY_SUFFIX}")]
                     self._append_media_to_response(result)
                     return result
             
@@ -651,7 +656,7 @@ class FeedbackGateServer:
                 wall_elapsed = time.time() - call_entry_time
                 logger.info(f"✅ RE-ENTER got feedback for {my_trigger_id} after {wall_elapsed:.1f}s | input={user_input[:100]}...")
                 _log_event("USER_RESPONSE", f"path=re-enter trigger={my_trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
-                result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                result = [TextContent(type="text", text=f"User Response: {user_input}{_FEEDBACK_REPLY_SUFFIX}")]
                 self._append_media_to_response(result)
                 return result
             else:
@@ -794,7 +799,7 @@ class FeedbackGateServer:
                 wall_elapsed = time.time() - call_entry_time
                 logger.info(f"✅ Got feedback for {trigger_id} after {wall_elapsed:.1f}s | input={user_input[:100]}...")
                 _log_event("USER_RESPONSE", f"path=first-wait trigger={trigger_id} wall={wall_elapsed:.1f}s input={user_input[:60]}")
-                result = [TextContent(type="text", text=f"User Response: {user_input}")]
+                result = [TextContent(type="text", text=f"User Response: {user_input}{_FEEDBACK_REPLY_SUFFIX}")]
                 self._append_media_to_response(result)
                 return result
             else:

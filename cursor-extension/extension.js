@@ -107,19 +107,13 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
             }
         }
         // Unknown session_id — try to adopt an idle session from the same PID.
-        // Agents generate a new session_id per task, but the Cursor conversation
-        // (and its tab) stays the same.  Adopting avoids phantom tab creation.
-        // When multiple idle sessions exist, pick the most recently active one.
+        // Safe ONLY when exactly one idle session exists (no ambiguity about which
+        // conversation the new session_id belongs to).  With multiple idle sessions,
+        // adopting the wrong one causes cross-talk (messages in wrong tab).
         const pidSessions = getAllSessionsByMcpPid(mcpPid);
         const idleSessions = pidSessions.filter(s => !s.triggerData);
-        if (idleSessions.length > 0) {
-            const activeIdle = activeSessionKey
-                ? idleSessions.find(s => s.key === activeSessionKey)
-                : null;
-            const adopt = activeIdle
-                || (idleSessions.length === 1
-                    ? idleSessions[0]
-                    : [...idleSessions].sort((a, b) => b.lastActiveAt - a.lastActiveAt)[0]);
+        if (idleSessions.length === 1) {
+            const adopt = idleSessions[0];
             adopt.sessionId = sessionId;
             adopt.lastActiveAt = now;
             return adopt;
@@ -1483,6 +1477,66 @@ function checkTriggerFile(context, filePath) {
             const session = triggerPid ? setCurrentTriggerData(triggerData.data, triggerPid) : null;
             if (!session) {
                 currentTriggerData = triggerData.data;
+            }
+            
+            // Post-route queue consumption: covers two cases the pre-route check misses:
+            // 1. New session_id that didn't match any existing session (session was
+            //    created or adopted after pre-route, inheriting queued messages).
+            // 2. Session matched by session_id but already had a pending trigger
+            //    (pre-route skipped due to !targetSession.triggerData being false;
+            //    setCurrentTriggerData then overwrote triggerData with the new one).
+            if (!shouldAutoConsume && session && session.triggerData) {
+                const postRouteCount = getPendingQueueCount(session.key);
+                if (postRouteCount > 0) {
+                    const postItem = dequeueMessage(session.key);
+                    if (postItem) {
+                        if (postItem.source && postItem.source !== 'local' && postItem.chatId) {
+                            session.pendingRemoteReply = { chatId: postItem.chatId, source: postItem.source, originalText: postItem.text || '', enqueuedAt: Date.now() };
+                        } else {
+                            session.pendingRemoteReply = null;
+                        }
+                        const postTriggerId = session.triggerData.trigger_id;
+                        if (postTriggerId && writeResponseForTrigger(postTriggerId, postItem, 'feedback_gate_queue')) {
+                            markQueueItemDone(postItem.id);
+                            logUserInput(postItem.text, 'MCP_RESPONSE', postTriggerId, postItem.attachments || [], postItem.files || []);
+                            sendExtensionAcknowledgement(postTriggerId, session.triggerData.tool || (triggerData.data && triggerData.data.tool));
+                            const agentMsg = session.triggerData.message || session.triggerData.prompt || '';
+                            if (agentMsg) {
+                                addMessageToSession(session.key, { text: agentMsg, type: 'system' });
+                                maybeWriteOutbox(agentMsg);
+                            }
+                            addMessageToSession(session.key, { text: postItem.text, type: 'user', attachments: postItem.attachments, files: postItem.files });
+                            if (postItem.text || (postItem.attachments && postItem.attachments.length > 0)) {
+                                session.label = _buildTabLabel(session.index, postItem.text, postItem.attachments);
+                                session._labelSource = 'user';
+                                syncTabsToWebview();
+                            }
+                            const sourceTag = postItem.sourceLabel
+                                ? `⚡ 已从队列自动发送（来自${postItem.sourceLabel}）`
+                                : '⚡ 已从队列自动发送';
+                            addMessageToSession(session.key, { text: sourceTag, type: 'system', plain: true });
+                            clearSessionTrigger(session.key);
+                            if (session.key !== activeSessionKey) {
+                                const recentManualSwitch = (Date.now() - lastManualSwitchAt) < MANUAL_SWITCH_GUARD_MS;
+                                if (!recentManualSwitch) {
+                                    switchToSession(session.key);
+                                }
+                            }
+                            if (triggerId) {
+                                processedTriggerIds.add(triggerId);
+                                if (processedTriggerIds.size > 50) {
+                                    const first = processedTriggerIds.values().next().value;
+                                    processedTriggerIds.delete(first);
+                                }
+                            }
+                            try { fs.unlinkSync(filePath); } catch {}
+                            console.log(`Feedback Gate: post-route auto-consumed queue item "${postItem.text}" for session ${session.key}`);
+                            return;
+                        } else {
+                            queue.requeueItem(postItem.id);
+                        }
+                    }
+                }
             }
             
             // Auto-switch to the session that received the trigger, unless the
