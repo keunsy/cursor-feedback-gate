@@ -48,9 +48,8 @@ tool: feedback_gate_chat
 
 ### session_id 规则
 - **首次调用**：生成一个 UUID（如 `crypto.randomUUID()` 或类似方式），作为 `session_id` 传入。
-- **收到 [WAITING] 后 re-entry**：用**同一个** `session_id` 再次调用。
-- **不同的 feedback gate 调用**（比如同一对话中先完成任务 A 再完成任务 B）：每次生成新的 `session_id`。
-- 这样多个对话可以同时使用 Feedback Gate 而互不干扰。
+- **后续所有调用**：复用**同一个** `session_id`，包括 [WAITING] 后的 re-entry 和后续新任务的 feedback gate 调用。
+- **一个对话 = 一个 session_id**，整个对话生命周期不变。不同的 Cursor agent chat 使用不同的 session_id。
 
 ## 约束
 - 每次回复结束前必须调用此工具，无例外。

@@ -106,21 +106,10 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
                 return s;
             }
         }
-        // Unknown session_id — try to adopt an idle session from the same PID.
-        // One MCP PID can serve multiple concurrent conversations in the same
-        // Cursor window. Only adopt when the session has NO pending trigger
-        // (i.e. the agent rotated session_id within the same conversation).
-        // If the session has a pending trigger, it's a truly concurrent
-        // conversation that needs its own tab.
-        const pidSessions = getAllSessionsByMcpPid(mcpPid);
-        const idleSessions = pidSessions.filter(s => !s.triggerData);
-        if (idleSessions.length === 1) {
-            const adopt = idleSessions[0];
-            adopt.sessionId = sessionId;
-            adopt.lastActiveAt = now;
-            return adopt;
-        }
-        // All sessions have pending triggers or multiple idle — create new
+        // Unknown session_id — always create a new session.
+        // With the "one conversation = one session_id" rule, an unknown
+        // session_id means a genuinely new conversation, not a rotation.
+        // Idle-session adoption is reserved for the no-session_id legacy path.
         return createSession(mcpPid, now, sessionId);
     }
 
