@@ -1394,7 +1394,7 @@ function checkTriggerFile(context, filePath) {
             let targetSession = null;
             let targetMatchedBySessionId = false;
             if (targetSessionId) {
-                for (const s of sessions.values()) { if (s.sessionId === targetSessionId && (!triggerPid || s.mcpPid === triggerPid)) { targetSession = s; targetMatchedBySessionId = true; break; } }
+                for (const s of sessions.values()) { if (s.sessionId === targetSessionId) { targetSession = s; targetMatchedBySessionId = true; break; } }
             }
             if (!targetSession && !targetSessionId && triggerPid) {
                 const pidSessions = getAllSessionsByMcpPid(triggerPid);
