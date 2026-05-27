@@ -98,10 +98,16 @@ function getAllSessionsByMcpPid(mcpPid) {
 function getOrCreateSessionForTrigger(mcpPid, sessionId) {
     const now = Date.now();
 
-    // Phase 0: exact session_id + PID match
+    // Phase 0: match by session_id (PID-independent).
+    // A conversation may hop between MCP PIDs (e.g. after Cursor restarts
+    // a PID or when the same window uses different MCP instances). We track
+    // the latest PID so lifecycle cleanup still works.
     if (sessionId) {
         for (const s of sessions.values()) {
-            if (s.sessionId === sessionId && s.mcpPid === mcpPid) {
+            if (s.sessionId === sessionId) {
+                if (s.mcpPid !== mcpPid) {
+                    s.mcpPid = mcpPid;
+                }
                 s.lastActiveAt = now;
                 return s;
             }
