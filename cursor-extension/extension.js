@@ -284,10 +284,40 @@ function setCurrentTriggerData(triggerData, mcpPid) {
     if (mcpPid) {
         const sessionId = (triggerData && triggerData.session_id) || '';
         const session = getOrCreateSessionForTrigger(mcpPid, sessionId);
+        // If the session already has a pending trigger with a different trigger_id,
+        // auto-respond to the old one to avoid MCP hanging indefinitely.
+        const oldTrigger = session.triggerData;
+        const newTriggerId = triggerData && triggerData.trigger_id;
+        if (oldTrigger && oldTrigger.trigger_id && oldTrigger.trigger_id !== newTriggerId) {
+            const oldResponseFile = getTempPath(`feedback_gate_response_${oldTrigger.trigger_id}.json`);
+            if (!fs.existsSync(oldResponseFile)) {
+                try {
+                    const tmpPath = oldResponseFile + '.tmp';
+                    fs.writeFileSync(tmpPath, JSON.stringify({
+                        response: "[SUPERSEDED] A newer trigger arrived for the same session.",
+                        auto_response: true,
+                        superseded_by: newTriggerId,
+                        timestamp: new Date().toISOString(),
+                        trigger_id: oldTrigger.trigger_id
+                    }, null, 2));
+                    fs.renameSync(tmpPath, oldResponseFile);
+                    console.log(`Feedback Gate: auto-responded to superseded trigger ${oldTrigger.trigger_id} (replaced by ${newTriggerId})`);
+                } catch (e) {
+                    console.log(`Feedback Gate: failed to auto-respond to superseded trigger: ${e.message}`);
+                }
+            }
+        }
         session.triggerData = triggerData;
         session.lastActiveAt = Date.now();
         if (sessionId && !session.sessionId) {
             session.sessionId = sessionId;
+        }
+        // Adopt untagged queue messages when this is the sole active session.
+        // This prevents the global-pool fallback in post-route from being
+        // needed — messages are tagged to the session at creation time.
+        if (getPendingQueueCount('') > 0 && sessions.size === 1) {
+            queue.migrateSessionKey('', session.key);
+            console.log(`Feedback Gate: migrated untagged messages to session ${session.key}`);
         }
         // Name the tab from the latest interaction content
         if (triggerData && triggerData.message) {
@@ -1481,13 +1511,19 @@ function checkTriggerFile(context, filePath) {
             //    setCurrentTriggerData then overwrote triggerData with the new one).
             if (!shouldAutoConsume && session && session.triggerData) {
                 let postRouteCount = getPendingQueueCount(session.key);
-                // Also check untagged messages — they may have been enqueued before
-                // this session existed (e.g. user typed before first trigger arrived).
-                if (postRouteCount === 0) {
+                // Also check untagged messages — but only when no OTHER session has
+                // a pending trigger, to avoid cross-talk between concurrent conversations.
+                const otherSessionHasTrigger = [...sessions.values()].some(
+                    s => s.key !== session.key && s.triggerData
+                );
+                const canFallbackToUntagged = postRouteCount === 0 && !otherSessionHasTrigger;
+                if (canFallbackToUntagged) {
                     postRouteCount = getPendingQueueCount('');
                 }
                 if (postRouteCount > 0) {
-                    const postItem = dequeueMessage(session.key) || dequeueMessage('');
+                    const postItem = canFallbackToUntagged
+                        ? (dequeueMessage(session.key) || dequeueMessage(''))
+                        : dequeueMessage(session.key);
                     if (postItem) {
                         if (postItem.source && postItem.source !== 'local' && postItem.chatId) {
                             session.pendingRemoteReply = { chatId: postItem.chatId, source: postItem.source, originalText: postItem.text || '', enqueuedAt: Date.now() };
