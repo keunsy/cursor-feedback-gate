@@ -107,9 +107,11 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
             }
         }
         // Unknown session_id — try to adopt an idle session from the same PID.
-        // Safe ONLY when exactly one idle session exists (no ambiguity about which
-        // conversation the new session_id belongs to).  With multiple idle sessions,
-        // adopting the wrong one causes cross-talk (messages in wrong tab).
+        // One MCP PID can serve multiple concurrent conversations in the same
+        // Cursor window. Only adopt when the session has NO pending trigger
+        // (i.e. the agent rotated session_id within the same conversation).
+        // If the session has a pending trigger, it's a truly concurrent
+        // conversation that needs its own tab.
         const pidSessions = getAllSessionsByMcpPid(mcpPid);
         const idleSessions = pidSessions.filter(s => !s.triggerData);
         if (idleSessions.length === 1) {
@@ -118,7 +120,7 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
             adopt.lastActiveAt = now;
             return adopt;
         }
-        // All sessions have pending triggers — truly concurrent, need a new tab
+        // All sessions have pending triggers or multiple idle — create new
         return createSession(mcpPid, now, sessionId);
     }
 
@@ -1386,9 +1388,12 @@ function checkTriggerFile(context, filePath) {
                 // No session matched, no session_id — consume untagged messages only
                 const anySessionHasTrigger = [...sessions.values()].some(s => s.triggerData);
                 shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData;
+            } else if (!targetSession && targetSessionId) {
+                // Has session_id but no matching session yet (first trigger or session was cleaned).
+                // Check for untagged queue messages that were enqueued before any session existed.
+                const anySessionHasTrigger = [...sessions.values()].some(s => s.triggerData);
+                shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData;
             }
-            // When trigger has session_id but didn't match any session (new conversation),
-            // never auto-consume from existing sessions — their messages belong elsewhere.
             if (shouldAutoConsume) {
                 const queueItem = dequeueMessage(targetSessionKey);
                 if (queueItem) {
@@ -1486,9 +1491,14 @@ function checkTriggerFile(context, filePath) {
             //    (pre-route skipped due to !targetSession.triggerData being false;
             //    setCurrentTriggerData then overwrote triggerData with the new one).
             if (!shouldAutoConsume && session && session.triggerData) {
-                const postRouteCount = getPendingQueueCount(session.key);
+                let postRouteCount = getPendingQueueCount(session.key);
+                // Also check untagged messages — they may have been enqueued before
+                // this session existed (e.g. user typed before first trigger arrived).
+                if (postRouteCount === 0) {
+                    postRouteCount = getPendingQueueCount('');
+                }
                 if (postRouteCount > 0) {
-                    const postItem = dequeueMessage(session.key);
+                    const postItem = dequeueMessage(session.key) || dequeueMessage('');
                     if (postItem) {
                         if (postItem.source && postItem.source !== 'local' && postItem.chatId) {
                             session.pendingRemoteReply = { chatId: postItem.chatId, source: postItem.source, originalText: postItem.text || '', enqueuedAt: Date.now() };
