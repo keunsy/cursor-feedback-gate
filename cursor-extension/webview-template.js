@@ -1051,6 +1051,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 sessionKey: inputSessionKey || currentSessionKey || ''
             });
             
+            const sentSessionKey = inputSessionKey || currentSessionKey || '';
             inputSessionKey = null;
             messageInput.value = '';
             attachedImages = [];
@@ -1060,6 +1061,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
             document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
             adjustTextareaHeight();
+            if (sentSessionKey) {
+                vscode.postMessage({ command: 'saveDraft', sessionKey: sentSessionKey, draft: '' });
+            }
         }
         
         function adjustTextareaHeight() {
@@ -1402,8 +1406,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     renderSessionTabs(message.tabs, message.activeKey);
                     break;
                 case 'loadSession':
-                    if (currentSessionKey && currentSessionKey !== message.sessionKey && messageInput.value.trim()) {
-                        vscode.postMessage({ command: 'saveDraft', sessionKey: currentSessionKey, draft: messageInput.value });
+                    if (currentSessionKey && currentSessionKey !== message.sessionKey) {
+                        vscode.postMessage({ command: 'saveDraft', sessionKey: currentSessionKey, draft: messageInput.value || '' });
                     }
                     loadSession(message.sessionKey, message.label, message.messages, message.draft, message.hasPendingTrigger);
                     break;

@@ -112,10 +112,20 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
                 return s;
             }
         }
-        // Unknown session_id — always create a new session.
-        // With the "one conversation = one session_id" rule, an unknown
-        // session_id means a genuinely new conversation, not a rotation.
-        // Idle-session adoption is reserved for the no-session_id legacy path.
+        // Unknown session_id — likely a new conversation, but context compaction
+        // can cause agents to generate a fresh UUID for the same conversation.
+        // Safe to adopt ONLY when there is exactly ONE session globally and it is
+        // idle with matching PID.  When multiple sessions exist, we cannot tell
+        // which one the new session_id belongs to, so always create new.
+        if (sessions.size === 1) {
+            const only = sessions.values().next().value;
+            if (!only.triggerData && only.mcpPid === mcpPid) {
+                console.log(`Feedback Gate: adopting sole idle session ${only.key} for new session_id=${sessionId} (was ${only.sessionId || 'none'})`);
+                only.sessionId = sessionId;
+                only.lastActiveAt = now;
+                return only;
+            }
+        }
         return createSession(mcpPid, now, sessionId);
     }
 
@@ -775,13 +785,15 @@ function activate(context) {
                 for (const triggerId of pendingTriggers) {
                     const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
                     if (!fs.existsSync(responseFile)) {
-                        fs.writeFileSync(responseFile, JSON.stringify({
+                        const tmpPath = responseFile + '.tmp';
+                        fs.writeFileSync(tmpPath, JSON.stringify({
                             response: "TASK_COMPLETE",
                             auto_response: true,
                             feedback_gate_disabled: true,
                             timestamp: new Date().toISOString(),
                             trigger_id: triggerId
                         }, null, 2));
+                        fs.renameSync(tmpPath, responseFile);
                         console.log(`Feedback Gate: auto-responded TASK_COMPLETE for pending trigger ${triggerId}`);
                     }
                 }
@@ -1374,13 +1386,15 @@ function checkTriggerFile(context, filePath) {
             if (!feedbackGateEnabled) {
                 if (triggerId) {
                     const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
-                    fs.writeFileSync(responseFile, JSON.stringify({
+                    const tmpPath = responseFile + '.tmp';
+                    fs.writeFileSync(tmpPath, JSON.stringify({
                         response: "TASK_COMPLETE",
                         auto_response: true,
                         feedback_gate_disabled: true,
                         timestamp: new Date().toISOString(),
                         trigger_id: triggerId
                     }, null, 2));
+                    fs.renameSync(tmpPath, responseFile);
                 }
                 try { fs.unlinkSync(filePath); } catch {}
                 console.log('Feedback Gate disabled — auto-passthrough sent');

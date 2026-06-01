@@ -209,6 +209,7 @@ class FeedbackGateServer:
             for pattern in [
                 "feedback_gate_mcp_*.pid",
                 "feedback_gate_trigger_pid*.json",
+                "feedback_gate_trigger_fg_*.json",
                 "feedback_gate_trigger.json",
                 "feedback_gate_response_*.json",
                 "feedback_gate_response.json",
@@ -277,7 +278,8 @@ class FeedbackGateServer:
                         "properties": {
                             "message": {
                                 "type": "string",
-                                "description": "The message to display in the Feedback Gate popup - this is what the user will see",
+                                "description": "Short summary (≤100 chars) shown in the popup. Put detailed results in your main Cursor chat reply, NOT here. Example: '已完成数据库迁移。需要调整吗？'",
+                                "maxLength": 200,
                                 "default": "请提供你的反馈："
                             },
                             "title": {
