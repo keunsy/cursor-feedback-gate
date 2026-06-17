@@ -787,12 +787,10 @@ class FeedbackGatePanelProvider {
                         const sendTrigger = sendSession ? sendSession.triggerData : null;
                         if (sendTrigger && sendTrigger.trigger_id) {
                             processQueueForPendingTrigger(true, sendSession.key);
-                        } else if (sendSession) {
-                            addMessageToSession(sendSession.key, { text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files, _queued: true });
-                            if (enqueuedItem) { enqueuedItem._displayed = true; queue.saveQueue(); }
                         } else {
-                            broadcastToAllWebviews({ command: 'addMessage', text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files });
-                            if (enqueuedItem) { enqueuedItem._displayed = true; queue.saveQueue(); }
+                            // No active trigger — message goes to queue only.
+                            // Do NOT display yet; it will be shown in correct order
+                            // (after agentMsg) when the next trigger auto-consumes it.
                         }
                         break;
                     }
@@ -1533,8 +1531,9 @@ function consumeIdeQueueFile(filePath) {
 
 // ── IDE Reply (V2 bidirectional) ───────────────────
 
-function maybeWriteOutbox(agentMessage) {
-    if (!pendingRemoteReply) return;
+function maybeWriteOutbox(agentMessage, session) {
+    const rr = (session && session.pendingRemoteReply) || pendingRemoteReply;
+    if (!rr) return;
     if (!agentMessage || agentMessage.trim().length < 1) return;
 
     const MAX_LEN = 500;
@@ -1544,14 +1543,15 @@ function maybeWriteOutbox(agentMessage) {
 
     try {
         const entry = JSON.stringify({
-            chatId: pendingRemoteReply.chatId,
-            platform: pendingRemoteReply.source,
-            originalText: pendingRemoteReply.originalText || '',
+            chatId: rr.chatId,
+            platform: rr.source,
+            originalText: rr.originalText || '',
             agentMessage: truncated,
             ts: new Date().toISOString()
         });
         fs.appendFileSync(IDE_REPLY_PATH, entry + '\n');
-        pendingRemoteReply = null;
+        if (session && session.pendingRemoteReply) session.pendingRemoteReply = null;
+        else pendingRemoteReply = null;
     } catch {}
 }
 
@@ -1958,7 +1958,7 @@ function checkTriggerFile(context, filePath) {
                         if (session) {
                             if (agentMsg) {
                                 addMessageToSession(session.key, { text: agentMsg, type: 'system' });
-                                maybeWriteOutbox(agentMsg);
+                                maybeWriteOutbox(agentMsg, session);
                             }
                             if (!queueItem._displayed) {
                                 addMessageToSession(session.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
@@ -1974,7 +1974,7 @@ function checkTriggerFile(context, filePath) {
                         } else {
                             if (agentMsg) {
                                 broadcastToAllWebviews({ command: 'newMessage', text: agentMsg, type: 'system', toolData: triggerData.data, mcpIntegration: false });
-                                maybeWriteOutbox(agentMsg);
+                                maybeWriteOutbox(agentMsg, null);
                             }
                             if (!queueItem._displayed) {
                                 broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
@@ -2063,7 +2063,7 @@ function checkTriggerFile(context, filePath) {
                             const agentMsg = session.triggerData.message || session.triggerData.prompt || '';
                             if (agentMsg) {
                                 addMessageToSession(session.key, { text: agentMsg, type: 'system' });
-                                maybeWriteOutbox(agentMsg);
+                                maybeWriteOutbox(agentMsg, session);
                             }
                             if (!postItem._displayed) {
                                 addMessageToSession(session.key, { text: postItem.text, type: 'user', attachments: postItem.attachments, files: postItem.files });
@@ -2223,18 +2223,12 @@ function handleFeedbackGateToolCall(context, toolData, mcpPid) {
     // Force consistent title regardless of tool call
     popupOptions.title = "Feedback Gate";
     
-    // V2: write Agent message to IDE reply for remote source
-    const agentMsgForOutbox = toolData.message || toolData.prompt || '';
-    if (agentMsgForOutbox) {
-        maybeWriteOutbox(agentMsgForOutbox);
-    }
-    
     // Record agent message to session history (skip webview push for active session
     // since openFeedbackGatePopup will send newMessage to webview separately)
+    let targetSession = null;
     if (mcpPid && popupOptions.message) {
         // Find the session that owns this trigger (may be one of several with same PID)
         const triggerId = toolData && toolData.trigger_id;
-        let targetSession = null;
         if (triggerId) {
             for (const s of sessions.values()) {
                 if (s.triggerData && s.triggerData.trigger_id === triggerId) {
@@ -2248,6 +2242,12 @@ function handleFeedbackGateToolCall(context, toolData, mcpPid) {
             targetSession.messages.push({ text: popupOptions.message, type: 'system', timestamp: Date.now() });
             if (targetSession.messages.length > 200) targetSession.messages = targetSession.messages.slice(-200);
         }
+    }
+
+    // V2: write Agent message to IDE reply for remote source
+    const agentMsgForOutbox = toolData.message || toolData.prompt || '';
+    if (agentMsgForOutbox) {
+        maybeWriteOutbox(agentMsgForOutbox, targetSession);
     }
     
     // Only broadcast newMessage to webview if this trigger belongs to the active session.
