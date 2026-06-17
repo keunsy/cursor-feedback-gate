@@ -108,7 +108,8 @@ function createExtension() {
         messagesDisplayed.push({ sessionKey, ...msg });
     }
 
-    // Simulates case 'send' (provider path)
+    // Simulates case 'send' (provider path) — matches current extension.js behavior:
+    // With trigger → processQueue (immediate). Without trigger → queue only, no display.
     function handleSend(text, sessionKey) {
         const sendSession = sessions.get(sessionKey) || null;
         const enqueuedItem = queue.enqueueMessage(text, [], [], { sessionKey: sessionKey || '' });
@@ -116,10 +117,8 @@ function createExtension() {
         const sendTrigger = sendSession ? sendSession.triggerData : null;
         if (sendTrigger && sendTrigger.trigger_id) {
             processQueueForPendingTrigger(true, sendSession.key);
-        } else if (sendSession) {
-            addMessageToSession(sendSession.key, { text, type: 'user', _queued: true });
-            if (enqueuedItem) { enqueuedItem._displayed = true; queue.saveQueue(); }
         }
+        // No active trigger → message stays in queue only, NOT displayed yet.
         return enqueuedItem;
     }
 
@@ -213,55 +212,55 @@ for (let i = 1; i <= 10; i++) {
     });
 }
 
-// --- Group 2: Send without trigger (new behavior) ---
+// --- Group 2: Send without trigger → queue only, no immediate display ---
 for (let i = 1; i <= 10; i++) {
-    scenario(`G2-${i}: Send without trigger displays immediately`, () => {
+    scenario(`G2-${i}: Send without trigger goes to queue only`, () => {
         const ext = createExtension();
         const s = ext.createSession('s1', 'uuid-1');
         ext.handleSend(`no-trigger-${i}`, 's1');
-        assert.strictEqual(s.messages.length, 1);
-        assert.strictEqual(s.messages[0]._queued, true);
+        assert.strictEqual(s.messages.length, 0, 'should NOT display without trigger');
         assert.strictEqual(ext.queue.getPendingQueueCount('s1'), 1);
     });
 }
 
-// --- Group 3: No duplicate when trigger arrives later ---
+// --- Group 3: Trigger arrives → auto-consume shows queued message exactly once ---
 for (let i = 1; i <= 10; i++) {
-    scenario(`G3-${i}: No duplicate when trigger consumes displayed message`, () => {
+    scenario(`G3-${i}: Trigger auto-consumes queued message (shown once)`, () => {
         const ext = createExtension();
         const s = ext.createSession('s1', 'uuid-1');
         ext.handleSend(`dedup-${i}`, 's1');
-        assert.strictEqual(s.messages.length, 1);
+        assert.strictEqual(s.messages.length, 0, 'not shown yet');
 
-        // Trigger arrives
+        // Trigger arrives → auto-consume
         const consumed = ext.autoConsume({ trigger_id: `t-${i}` }, 's1');
         assert.strictEqual(consumed, true);
-        assert.strictEqual(s.messages.length, 1, 'should NOT add duplicate');
+        assert.strictEqual(s.messages.length, 1, 'shown exactly once via auto-consume');
+        assert.strictEqual(s.messages[0].text, `dedup-${i}`);
     });
 }
 
-// --- Group 4: Multiple sends without trigger ---
+// --- Group 4: Multiple sends without trigger → all queued, none displayed ---
 for (let i = 1; i <= 10; i++) {
-    scenario(`G4-${i}: ${i} messages without trigger all display`, () => {
+    scenario(`G4-${i}: ${i} messages without trigger all queued only`, () => {
         const ext = createExtension();
         const s = ext.createSession('s1', 'uuid-1');
         for (let j = 0; j < i; j++) {
             ext.handleSend(`multi-${j}`, 's1');
         }
-        assert.strictEqual(s.messages.length, i);
+        assert.strictEqual(s.messages.length, 0, 'none displayed without trigger');
         assert.strictEqual(ext.queue.getPendingQueueCount('s1'), i);
     });
 }
 
-// --- Group 5: Queue visibility (syncToWebview behavior) ---
+// --- Group 5: Queue visibility — items without trigger remain visible in queue UI ---
 for (let i = 1; i <= 10; i++) {
-    scenario(`G5-${i}: Displayed messages hidden from queue UI`, () => {
+    scenario(`G5-${i}: Queued items visible in queue UI (not displayed in chat)`, () => {
         const ext = createExtension();
         ext.createSession('s1', 'uuid-1');
         ext.handleSend(`queue-vis-${i}`, 's1');
         const visible = ext.queue.getVisibleQueueItems('s1');
-        assert.strictEqual(visible.length, 0, 'displayed items should be hidden from queue UI');
-        assert.strictEqual(ext.queue.getPendingQueueCount('s1'), 1, 'but still pending for consumption');
+        assert.strictEqual(visible.length, 1, 'visible in queue UI since not _displayed');
+        assert.strictEqual(ext.queue.getPendingQueueCount('s1'), 1);
     });
 }
 
@@ -280,20 +279,20 @@ for (let i = 1; i <= 5; i++) {
     });
 }
 
-// --- Group 7: Multi-session isolation ---
+// --- Group 7: Multi-session isolation (queued, not displayed) ---
 for (let i = 1; i <= 10; i++) {
-    scenario(`G7-${i}: Messages don't cross sessions`, () => {
+    scenario(`G7-${i}: Messages queued per-session, not cross-contaminated`, () => {
         const ext = createExtension();
         ext.createSession('s1', 'uuid-1');
         ext.createSession('s2', 'uuid-2');
         ext.handleSend(`s1-msg-${i}`, 's1');
         ext.handleSend(`s2-msg-${i}`, 's2');
+        assert.strictEqual(ext.queue.getPendingQueueCount('s1'), 1);
+        assert.strictEqual(ext.queue.getPendingQueueCount('s2'), 1);
         const s1 = ext.sessions.get('s1');
         const s2 = ext.sessions.get('s2');
-        assert.strictEqual(s1.messages.length, 1);
-        assert.strictEqual(s2.messages.length, 1);
-        assert.strictEqual(s1.messages[0].text, `s1-msg-${i}`);
-        assert.strictEqual(s2.messages[0].text, `s2-msg-${i}`);
+        assert.strictEqual(s1.messages.length, 0, 'not displayed without trigger');
+        assert.strictEqual(s2.messages.length, 0, 'not displayed without trigger');
     });
 }
 
@@ -312,18 +311,16 @@ for (let i = 1; i <= 10; i++) {
     });
 }
 
-// --- Group 9: Reload simulation (sessionKey cleared) ---
+// --- Group 9: Reload simulation (sessionKey cleared, _displayed not set without trigger) ---
 for (let i = 1; i <= 10; i++) {
-    scenario(`G9-${i}: Displayed flag survives sessionKey clear`, () => {
+    scenario(`G9-${i}: Queue item sessionKey cleared on reload, _displayed stays false`, () => {
         const ext = createExtension();
         ext.createSession('s1', 'uuid-1');
         ext.handleSend(`reload-${i}`, 's1');
         const items = ext.queue.items;
-        assert.strictEqual(items[0]._displayed, true);
-        // Simulate loadQueue clearing sessionKeys
+        assert.strictEqual(items[0]._displayed, undefined, 'not displayed (no trigger)');
         ext.queue.loadAndClearSessionKeys();
         assert.strictEqual(items[0].sessionKey, '');
-        assert.strictEqual(items[0]._displayed, true, '_displayed survives reload');
     });
 }
 
@@ -332,33 +329,33 @@ for (let i = 1; i <= 10; i++) {
     scenario(`G10-${i}: Mixed trigger/no-trigger sequence`, () => {
         const ext = createExtension();
         const s = ext.createSession('s1', 'uuid-1');
-        // First send with trigger
+        // First send with trigger → immediate consume
         ext.setTrigger('s1', `t1-${i}`);
         ext.handleSend(`with-trigger-${i}`, 's1');
         assert.strictEqual(s.messages.length, 1);
-        // Trigger consumed, now send without
+        // Trigger consumed, now send without → queue only
         ext.handleSend(`no-trigger-${i}`, 's1');
-        assert.strictEqual(s.messages.length, 2);
-        assert.strictEqual(s.messages[1]._queued, true);
-        // New trigger arrives, auto-consumes
+        assert.strictEqual(s.messages.length, 1, 'second msg not displayed');
+        // New trigger arrives, auto-consumes the queued message
         const consumed = ext.autoConsume({ trigger_id: `t2-${i}` }, 's1');
         assert.strictEqual(consumed, true);
-        assert.strictEqual(s.messages.length, 2, 'no duplicate from auto-consume');
+        assert.strictEqual(s.messages.length, 2, 'now shown via auto-consume');
+        assert.strictEqual(s.messages[1].text, `no-trigger-${i}`);
     });
 }
 
 // --- Group 11: Rapid sends (stress test) ---
 for (let i = 1; i <= 5; i++) {
-    scenario(`G11-${i}: Rapid ${i * 10} sends without trigger`, () => {
+    scenario(`G11-${i}: Rapid ${i * 10} sends without trigger → all queued`, () => {
         const ext = createExtension();
         const s = ext.createSession('s1', 'uuid-1');
         const count = i * 10;
         for (let j = 0; j < count; j++) {
             ext.handleSend(`rapid-${j}`, 's1');
         }
-        assert.strictEqual(s.messages.length, count);
+        assert.strictEqual(s.messages.length, 0, 'none displayed without trigger');
         assert.strictEqual(ext.queue.getPendingQueueCount('s1'), count);
-        assert.strictEqual(ext.queue.getVisibleQueueItems('s1').length, 0);
+        assert.strictEqual(ext.queue.getVisibleQueueItems('s1').length, count, 'all visible in queue');
     });
 }
 

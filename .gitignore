@@ -346,6 +346,7 @@ dist/
 *.claude 
 *CLAUDE.md
 *.cursor
+.cursor/
 # Compiled files
 *.o
 *.a
