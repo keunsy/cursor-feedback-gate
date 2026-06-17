@@ -30,8 +30,8 @@ class MockFeedbackGateState:
         self._pending_trigger_message = None
         self._heartbeat_count = 0
         self._last_trigger_responded_at = 0
-        self._STALE_TRIGGER_SECONDS_IDE = 5 * 60
-        self._STALE_TRIGGER_SECONDS_CLI = 30 * 60
+        self._STALE_TRIGGER_SECONDS_IDE = 86400  # 24h (matches actual code)
+        self._STALE_TRIGGER_SECONDS_CLI = 120    # 2min (matches actual code)
         self._IDE_WAIT_SECONDS = 5 * 60
         self._IDE_MAX_TOTAL_SECONDS = 8 * 3600
         self._fake_now = time.time()
@@ -303,25 +303,32 @@ def _(s):
     assert len(cleaned) == 0
     assert t1 in s._active_triggers
 
-@scenario("SC-2: Trigger beyond IDE TTL (5min) cleaned")
+@scenario("SC-2: Trigger beyond IDE TTL (24h) cleaned")
 def _(s):
     t1 = s.create_trigger(session_id="sid-1")
-    s.advance(301)  # 5min + 1s
+    s.advance(86401)  # 24h + 1s
     cleaned = s.clean_stale_triggers(is_remote=False)
     assert t1 in cleaned
     assert t1 not in s._active_triggers
 
-@scenario("SC-3: CLI mode uses longer TTL (30min)")
+@scenario("SC-3: CLI mode uses shorter TTL (2min)")
 def _(s):
     t1 = s.create_trigger(session_id="sid-1")
-    s.advance(6 * 60)  # 6min — stale for IDE but fresh for CLI
+    s.advance(121)  # 2min + 1s → stale for CLI
+    cleaned = s.clean_stale_triggers(is_remote=True)
+    assert t1 in cleaned
+
+@scenario("SC-3b: CLI trigger within 2min not cleaned")
+def _(s):
+    t1 = s.create_trigger(session_id="sid-1")
+    s.advance(60)  # 1min — fresh for CLI
     cleaned = s.clean_stale_triggers(is_remote=True)
     assert len(cleaned) == 0
 
 @scenario("SC-4: Excluded trigger not cleaned even if stale")
 def _(s):
     t1 = s.create_trigger(session_id="sid-1")
-    s.advance(600)
+    s.advance(90000)  # beyond 24h IDE limit
     cleaned = s.clean_stale_triggers(is_remote=False, exclude_tid=t1)
     assert len(cleaned) == 0
 
@@ -532,7 +539,7 @@ def _(s):
 @scenario("E2E-MCP-5: Stale cleanup during new trigger creation")
 def _(s):
     t_old = s.create_trigger(session_id="sid-old")
-    s.advance(400)  # Over IDE stale limit
+    s.advance(90000)  # Over IDE 24h stale limit
     t_new = s.create_trigger(session_id="sid-new")
     cleaned = s.clean_stale_triggers(is_remote=False, exclude_tid=t_new)
     assert t_old in cleaned

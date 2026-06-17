@@ -82,8 +82,8 @@
 | M2 | Heartbeat 未超时 | 返回 WAITING，heartbeat_count++ | HB-1, HB-4 |
 | M3 | Heartbeat 超过 max_total | 返回 TIMEOUT，清理 trigger | HB-3, E2E-MCP-2 |
 | M4 | Trigger 被驱逐后心跳 | 返回 EVICTED（不再干扰新 trigger） | HB-2 |
-| M5 | IDE stale limit (5min) | 超过 5min 未响应的 trigger 被清理 | SC-2 |
-| M6 | CLI stale limit (30min) | 超过 30min 未响应的 trigger 被清理 | SC-3 |
+| M5 | IDE stale limit (24h) | 超过 24h 未响应的 trigger 被清理（可通过配置文件覆盖） | SC-2 |
+| M6 | CLI stale limit (2min) | 超过 2min 未响应的 trigger 被清理 | SC-3 |
 | M7 | Cooldown (2s) | 响应后 2s 内重复调用返回 SKIP | CD-1, CD-2 |
 | M8 | 多 session 互不影响 | 不同 session 的 trigger 可并存 | MC-1, MC-2 |
 | M9 | _active_triggers 上限 (20) | 超限时驱逐最旧的 trigger | EV-3 |
