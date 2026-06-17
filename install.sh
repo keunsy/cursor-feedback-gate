@@ -75,11 +75,19 @@ cp "$SCRIPT_DIR/feedback_gate_mcp.py" "$INSTALL_DIR/"
 # --- Python 虚拟环境 ---
 log "配置 Python 虚拟环境..."
 if [[ "$OS" == "linux" ]]; then
-    PY_MINOR_VER=$($PYTHON_CMD -c 'import sys; print(sys.version_info.minor)')
-    dpkg -s "python3.${PY_MINOR_VER}-venv" >/dev/null 2>&1 || \
-        dpkg -s python3-venv >/dev/null 2>&1 || \
-        sudo apt-get install -y "python3.${PY_MINOR_VER}-venv" || \
-        sudo apt-get install -y python3-venv
+    if ! $PYTHON_CMD -m venv --help >/dev/null 2>&1; then
+        PY_MINOR_VER=$($PYTHON_CMD -c 'import sys; print(sys.version_info.minor)')
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get install -y "python3.${PY_MINOR_VER}-venv" 2>/dev/null || \
+                sudo apt-get install -y python3-venv
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y "python3.${PY_MINOR_VER}-libs" 2>/dev/null || true
+        elif command -v pacman &> /dev/null; then
+            : # Arch includes venv in base python package
+        else
+            warn "无法自动安装 python3-venv，请手动安装后重试"
+        fi
+    fi
 fi
 
 if [[ -d "$INSTALL_DIR/venv" ]]; then
@@ -166,23 +174,20 @@ with open(config_file, 'w') as f:
 ok "MCP 配置已更新: $CURSOR_MCP_FILE"
 
 # --- 构建并安装 Cursor 扩展 ---
-VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/dev/null)
-
-if [[ -z "$VSIX_FILE" ]]; then
-    log "未找到 .vsix，正在构建扩展..."
-    if command -v npx &> /dev/null; then
-        rm -f "$SCRIPT_DIR/cursor-extension/"*.vsix 2>/dev/null || true
-        (cd "$SCRIPT_DIR/cursor-extension" && npx @vscode/vsce package --no-dependencies)
-        VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/dev/null)
-        if [[ -n "$VSIX_FILE" ]]; then
-            ok "扩展构建成功: $(basename "$VSIX_FILE")"
-        else
-            warn "扩展构建失败 — 请手动安装"
-        fi
+log "构建扩展..."
+rm -f "$SCRIPT_DIR/cursor-extension/"*.vsix 2>/dev/null || true
+if command -v npx &> /dev/null; then
+    (cd "$SCRIPT_DIR/cursor-extension" && npx @vscode/vsce package --no-dependencies)
+    VSIX_FILE=$(find "$SCRIPT_DIR/cursor-extension" -name "*.vsix" -print -quit 2>/dev/null)
+    if [[ -n "$VSIX_FILE" ]]; then
+        ok "扩展构建成功: $(basename "$VSIX_FILE")"
     else
-        warn "未找到 npx — 无法自动构建扩展"
-        echo -e "  ${C_YELLOW}请安装 Node.js 后执行: cd cursor-extension && npx @vscode/vsce package --no-dependencies${C_NC}"
+        warn "扩展构建失败 — 请手动安装"
     fi
+else
+    warn "未找到 npx — 无法自动构建扩展"
+    echo -e "  ${C_YELLOW}请安装 Node.js 后执行: cd cursor-extension && npx @vscode/vsce package --no-dependencies${C_NC}"
+    VSIX_FILE=""
 fi
 
 if [[ -n "$VSIX_FILE" ]]; then
@@ -217,10 +222,16 @@ if [[ -f "$SCRIPT_DIR/FeedbackGate.mdc" ]]; then
     mkdir -p "$CURSOR_RULES_DIR"
     cp "$SCRIPT_DIR/FeedbackGate.mdc" "$CURSOR_RULES_DIR/"
     ok "规则已安装: $CURSOR_RULES_DIR/FeedbackGate.mdc"
+    echo ""
+    echo -e "  ${C_YELLOW}建议：将规则内容也复制到 Cursor Settings → User Rules 中${C_NC}"
+    echo -e "  ${C_YELLOW}（Cmd+Shift+P → 'Cursor Settings' → Rules → User Rules）${C_NC}"
+    echo -e "  ${C_YELLOW}原因：~/.cursor/rules/ 下的规则文件可能因 Cursor 版本差异未被加载，${C_NC}"
+    echo -e "  ${C_YELLOW}而 User Rules（设置项）是 Cursor 官方支持的全局规则入口，稳定生效。${C_NC}"
 fi
 
-# --- 清理临时文件 ---
-rm -f /tmp/feedback_gate_* /tmp/mcp_response* 2>/dev/null || true
+# --- 清理临时文件（仅清理旧的 trigger 文件，保留可能正在使用的 response 文件） ---
+find /tmp -name "feedback_gate_trigger_*.json" -mmin +5 -delete 2>/dev/null || true
+rm -f /tmp/feedback_gate.log /tmp/feedback_gate_v2.log 2>/dev/null || true
 
 # --- 完成 ---
 echo ""
@@ -231,5 +242,6 @@ echo "  MCP 配置   : $CURSOR_MCP_FILE"
 echo ""
 echo -e "${C_BLUE}下一步:${C_NC}"
 echo "  1. 重新加载 Cursor（Cmd+Shift+P → Reload Window）"
-echo "  2. 检查状态栏是否有绿色 'FeedBack' 指示"
+echo "  2. 打开 Feedback Gate 面板（侧边栏 → Feedback Gate）"
+echo "  3. 确认状态显示「等待 Cursor 调用」"
 echo ""
