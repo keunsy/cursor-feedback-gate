@@ -104,7 +104,7 @@
 node cursor-extension/test/scenario-simulation.js \
   && node cursor-extension/test/queue-display-simulation.js \
   && node cursor-extension/test/integration-scenarios.js \
-  && python3 test/test_mcp_scenarios.py
+  && python3 test/mcp-scenarios.py
 ```
 
 全部通过 = 行为契约满足。任何修改后必须跑此命令。
