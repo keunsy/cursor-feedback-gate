@@ -1438,7 +1438,7 @@ function recoverIdeQueueProcessing() {
             }
             if (!isFile) continue;
             console.log('Feedback Gate: recovering leftover IDE queue processing file', f);
-            consumeIdeQueueFile(full);
+            consumeIdeQueueFile(full, true);
         }
     } catch {}
 }
@@ -1447,7 +1447,7 @@ function clearLegacyIdeQueueProcessingIfPresent() {
     try {
         if (fs.existsSync(IDE_QUEUE_GLOBAL_PROCESSING_PATH)) {
             console.log('Feedback Gate: clearing legacy IDE queue .processing file');
-            consumeIdeQueueFile(IDE_QUEUE_GLOBAL_PROCESSING_PATH);
+            consumeIdeQueueFile(IDE_QUEUE_GLOBAL_PROCESSING_PATH, true);
         }
     } catch {}
 }
@@ -1472,7 +1472,7 @@ function consumeQueueIfExists(queuePath) {
     consumeIdeQueueFile(processingPath);
 }
 
-function consumeIdeQueueFile(filePath) {
+function consumeIdeQueueFile(filePath, isRecovery) {
     try {
         const content = fs.readFileSync(filePath, 'utf8');
         const lines = content.split('\n').filter(l => l.trim());
@@ -1484,14 +1484,16 @@ function consumeIdeQueueFile(filePath) {
                 const item = JSON.parse(line);
                 if (!item.text) continue;
 
-                if (item.ts && new Date(item.ts).getTime() < extensionActivatedAt) {
+                if (!isRecovery && item.ts && new Date(item.ts).getTime() < extensionActivatedAt) {
                     stale++;
                     continue;
                 }
 
-                // Route remote messages to the session that's waiting for a reply,
-                // falling back to the active session if none is waiting.
-                const pendingSession = findNextPendingSession();
+                // Route remote messages: prefer active session if it has a pending trigger,
+                // then any other pending session, then active session key as fallback.
+                const activeSession = activeSessionKey ? sessions.get(activeSessionKey) : null;
+                const preferActive = activeSession && activeSession.triggerData;
+                const pendingSession = preferActive ? activeSession : findNextPendingSession();
                 const remoteSessionKey = pendingSession ? pendingSession.key : (activeSessionKey || '');
                 enqueueMessage(item.text, [], [], {
                     source: item.source,
@@ -2006,9 +2008,13 @@ function checkTriggerFile(context, filePath) {
             
             // Eagerly clean dead sessions before routing new trigger
             // Skip restored sessions (mcpPid=0) — they haven't been bound yet.
+            // Skip sessions whose sessionId matches the incoming trigger — those will
+            // be rebound to the new PID by getOrCreateSessionForTrigger (PID hop).
+            const triggerSessionId = triggerData.data && triggerData.data.session_id;
             let cleaned = false;
             for (const [sKey, s] of sessions) {
                 if (s.mcpPid === 0 || s.mcpPid === triggerPid) continue;
+                if (triggerSessionId && s.sessionId === triggerSessionId) continue;
                 if (!isProcessAlive(s.mcpPid)) {
                     console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
                     queue.migrateSessionKey(sKey, '');
