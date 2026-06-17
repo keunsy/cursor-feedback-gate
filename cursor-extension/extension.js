@@ -2010,7 +2010,6 @@ function checkTriggerFile(context, filePath) {
             // Skip restored sessions (mcpPid=0) — they haven't been bound yet.
             // Skip sessions whose sessionId matches the incoming trigger — those will
             // be rebound to the new PID by getOrCreateSessionForTrigger (PID hop).
-            const triggerSessionId = triggerData.data && triggerData.data.session_id;
             let cleaned = false;
             for (const [sKey, s] of sessions) {
                 if (s.mcpPid === 0 || s.mcpPid === triggerPid) continue;
