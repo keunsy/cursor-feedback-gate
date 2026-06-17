@@ -9,6 +9,7 @@ const queue = require('./queue-manager');
 const { getFeedbackGateHTML } = require('./webview-template');
 
 function isProcessAlive(pid) {
+    if (!pid || pid <= 0) return false;
     try { process.kill(pid, 0); return true; } catch (e) {
         return e.code !== 'ESRCH';
     }
@@ -38,6 +39,112 @@ const processedTriggerIds = new Set();
 const sessions = new Map(); // sessionKey → SessionState
 let activeSessionKey = null;
 let sessionCounter = 0;
+let _globalState = null; // set in activate(), used for session persistence
+
+const PERSIST_KEY = 'feedbackGateSessions';
+const PERSIST_MAX_MESSAGES = 200; // per session
+const PERSIST_MAX_SESSIONS = 30;
+const PERSIST_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // 7 days
+
+function _persistenceScopeSuffix() {
+    try {
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length === 0) return '__no_workspace__';
+        return folders.map(f => f.uri.fsPath).sort().join('\0');
+    } catch { return '__no_workspace__'; }
+}
+
+function _scopedPersistKey(base) {
+    return `${base}:${_persistenceScopeSuffix()}`;
+}
+
+function _stripBinaryFromMessages(messages) {
+    return messages.map(m => {
+        if (!m.attachments || m.attachments.length === 0) return m;
+        const cleaned = m.attachments.map(a => {
+            const { base64Data, dataUrl, data, ...rest } = a;
+            return rest;
+        });
+        return { ...m, attachments: cleaned };
+    });
+}
+
+let _persistTimer = null;
+function _flushSessionsToGlobalState() {
+    if (!_globalState) return;
+    try {
+        const arr = [];
+        for (const s of sessions.values()) {
+            arr.push({
+                key: s.key, sessionId: s.sessionId, index: s.index,
+                label: s.label,
+                messages: _stripBinaryFromMessages(s.messages.slice(-PERSIST_MAX_MESSAGES)),
+                draft: s.draft || '', createdAt: s.createdAt,
+                lastActiveAt: s.lastActiveAt,
+            });
+        }
+        arr.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+        _globalState.update(_scopedPersistKey(PERSIST_KEY), arr.slice(0, PERSIST_MAX_SESSIONS));
+        _globalState.update(_scopedPersistKey('feedbackGateActiveSession'), activeSessionKey);
+        _globalState.update(_scopedPersistKey('feedbackGateSessionCounter'), sessionCounter);
+    } catch (e) {
+        console.log(`Feedback Gate: persist failed: ${e.message}`);
+    }
+}
+
+function persistSessions() {
+    if (!_globalState) return;
+    if (_persistTimer) clearTimeout(_persistTimer);
+    _persistTimer = setTimeout(() => {
+        _persistTimer = null;
+        _flushSessionsToGlobalState();
+    }, 500);
+}
+
+function restoreSessions() {
+    if (!_globalState) return;
+    try {
+        let arr = _globalState.get(_scopedPersistKey(PERSIST_KEY));
+        if (!Array.isArray(arr) || arr.length === 0) {
+            const legacy = _globalState.get(PERSIST_KEY);
+            if (Array.isArray(legacy) && legacy.length > 0) arr = legacy;
+        }
+        if (!Array.isArray(arr) || arr.length === 0) return;
+        const now = Date.now();
+        let restored = 0;
+        for (const s of arr) {
+            if (now - (s.lastActiveAt || s.createdAt || 0) > PERSIST_MAX_AGE_MS) continue;
+            if (!s.key || sessions.has(s.key)) continue;
+            sessions.set(s.key, {
+                key: s.key, mcpPid: 0, pidTimestamp: s.createdAt || now,
+                sessionId: s.sessionId || null, index: s.index || 0,
+                label: s.label || `#${s.index || 0}`,
+                triggerData: null, messages: s.messages || [],
+                draft: s.draft || '', attachedImages: [], attachedFiles: [],
+                codeReferences: [], createdAt: s.createdAt || now,
+                lastActiveAt: s.lastActiveAt || now, lastResponseTime: 0,
+                restoredAt: now, // in-memory only: grace window for mcpPid=0 cleanup
+                pendingRemoteReply: null,
+            });
+            restored++;
+        }
+        const savedCounter = _globalState.get(_scopedPersistKey('feedbackGateSessionCounter'));
+        if (typeof savedCounter === 'number' && savedCounter > sessionCounter) {
+            sessionCounter = savedCounter;
+        }
+        const savedActive = _globalState.get(_scopedPersistKey('feedbackGateActiveSession'));
+        if (savedActive && sessions.has(savedActive)) {
+            activeSessionKey = savedActive;
+        } else if (sessions.size > 0) {
+            activeSessionKey = sessions.keys().next().value;
+        }
+        if (restored > 0) {
+            console.log(`Feedback Gate: restored ${restored} sessions from persistence`);
+        }
+    } catch (e) {
+        console.log(`Feedback Gate: restore failed: ${e.message}`);
+    }
+}
 
 function createSessionKey(mcpPid, timestamp, counter) {
     return `${mcpPid}_${timestamp}_${counter}`;
@@ -77,6 +184,7 @@ function createSession(mcpPid, pidTimestamp, sessionId) {
     };
     sessions.set(key, session);
     console.log(`Feedback Gate: session created key=${key} index=#${sessionCounter} sessionId=${sessionId || 'none'}`);
+    persistSessions();
     return session;
 }
 
@@ -95,9 +203,20 @@ function getAllSessionsByMcpPid(mcpPid) {
     return result;
 }
 
+function _tryAdoptUnboundSession(mcpPid, now) {
+    // Restored sessions start with mcpPid=0 until the first trigger binds a live PID.
+    const unbound = [...sessions.values()].filter(s => s.mcpPid === 0);
+    if (unbound.length !== 1) return null;
+    const only = unbound[0];
+    if (only.triggerData && (now - only.lastActiveAt) < 15 * 60 * 1000) return null;
+    only.mcpPid = mcpPid;
+    only.lastActiveAt = now;
+    delete only.restoredAt;
+    return only;
+}
+
 function getOrCreateSessionForTrigger(mcpPid, sessionId) {
     const now = Date.now();
-
     // Phase 0: match by session_id (PID-independent).
     // A conversation may hop between MCP PIDs (e.g. after Cursor restarts
     // a PID or when the same window uses different MCP instances). We track
@@ -112,18 +231,47 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
                 return s;
             }
         }
-        // Unknown session_id — likely a new conversation, but context compaction
-        // can cause agents to generate a fresh UUID for the same conversation.
-        // Safe to adopt ONLY when there is exactly ONE session globally and it is
-        // idle with matching PID.  When multiple sessions exist, we cannot tell
-        // which one the new session_id belongs to, so always create new.
+        // Unknown session_id — likely context compaction causing a fresh UUID,
+        // or the first call with session_id after an initial call without one.
+        // Adopt the sole existing session if it's safe to do so.
+        const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
         if (sessions.size === 1) {
             const only = sessions.values().next().value;
-            if (!only.triggerData && only.mcpPid === mcpPid) {
-                console.log(`Feedback Gate: adopting sole idle session ${only.key} for new session_id=${sessionId} (was ${only.sessionId || 'none'})`);
-                only.sessionId = sessionId;
-                only.lastActiveAt = now;
-                return only;
+            // Skip if the sole session already owns a DIFFERENT sessionId AND has
+            // a non-stale trigger (truly a separate active conversation).
+            const hasDifferentActiveSession = only.sessionId && only.sessionId !== sessionId
+                && only.triggerData && (now - only.lastActiveAt) < ADOPT_STALE_TRIGGER_MS;
+            if (!hasDifferentActiveSession) {
+                const triggerStale = only.triggerData && (now - only.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
+                if (!only.triggerData || triggerStale) {
+                    if (triggerStale) {
+                        const staleTid = only.triggerData.trigger_id;
+                        console.log(`Feedback Gate: clearing stale trigger on sole session ${only.key} for adoption (idle ${((now - only.lastActiveAt) / 60000).toFixed(0)}min)`);
+                        only.triggerData = null;
+                        if (staleTid) {
+                            const respFile = getTempPath(`feedback_gate_response_${staleTid}.json`);
+                            if (!fs.existsSync(respFile)) {
+                                try {
+                                    const tmp = respFile + '.tmp';
+                                    fs.writeFileSync(tmp, JSON.stringify({
+                                        response: "[EXPIRED] Trigger expired due to inactivity.",
+                                        auto_response: true, trigger_id: staleTid,
+                                        timestamp: new Date().toISOString()
+                                    }, null, 2));
+                                    fs.renameSync(tmp, respFile);
+                                } catch {}
+                            }
+                        }
+                    }
+                    if (only.sessionId !== sessionId) {
+                        console.log(`Feedback Gate: sole session ${only.key} adopted new sessionId ${sessionId} (was ${only.sessionId || 'none'})`);
+                    }
+                    only.sessionId = sessionId;
+                    only.mcpPid = mcpPid;
+                    only.lastActiveAt = now;
+                    persistSessions();
+                    return only;
+                }
             }
         }
         return createSession(mcpPid, now, sessionId);
@@ -134,21 +282,40 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
     const pidSessions = getAllSessionsByMcpPid(mcpPid);
 
     if (pidSessions.length === 0) {
+        const adopted = _tryAdoptUnboundSession(mcpPid, now);
+        if (adopted) return adopted;
         return createSession(mcpPid, now);
     }
 
     if (pidSessions.length === 1) {
         const only = pidSessions[0];
-        if (!only.triggerData) {
+        const triggerStale = only.triggerData && (now - only.lastActiveAt) > (15 * 60 * 1000);
+        if (!only.triggerData || triggerStale) {
+            if (triggerStale) {
+                const staleTid = only.triggerData.trigger_id;
+                console.log(`Feedback Gate: clearing stale trigger on sole PID session ${only.key} (idle ${((now - only.lastActiveAt) / 60000).toFixed(0)}min)`);
+                only.triggerData = null;
+                if (staleTid) {
+                    const respFile = getTempPath(`feedback_gate_response_${staleTid}.json`);
+                    if (!fs.existsSync(respFile)) {
+                        try {
+                            const tmp = respFile + '.tmp';
+                            fs.writeFileSync(tmp, JSON.stringify({
+                                response: "[EXPIRED] Trigger expired due to inactivity.",
+                                auto_response: true, trigger_id: staleTid,
+                                timestamp: new Date().toISOString()
+                            }, null, 2));
+                            fs.renameSync(tmp, respFile);
+                        } catch {}
+                    }
+                }
+            }
             only.lastActiveAt = now;
             return only;
         }
-        // Single session but has pending trigger → new concurrent conversation
         return createSession(mcpPid, now);
     }
 
-    // Multiple sessions without session_id → cannot safely route.
-    // Create new session to avoid cross-talk.
     return createSession(mcpPid, now);
 }
 
@@ -187,6 +354,7 @@ function switchToSession(sessionKey, isManual) {
     activeSessionKey = sessionKey;
     queue.setActiveSessionKey(sessionKey);
     session.lastActiveAt = Date.now();
+    persistSessions();
 
     syncSessionToWebview(session);
     syncTabsToWebview();
@@ -219,31 +387,81 @@ function syncTabsToWebview() {
                 : '',
         });
     }
+    // INVARIANT: no two sessions should share the same non-empty sessionId
+    const sidMap = new Map();
+    for (const s of sessions.values()) {
+        if (s.sessionId) {
+            if (sidMap.has(s.sessionId)) {
+                console.error(`Feedback Gate: ⚠️ DUPLICATE_SESSION_ID! sid=${s.sessionId} keys=[${sidMap.get(s.sessionId)}, ${s.key}]`);
+            }
+            sidMap.set(s.sessionId, s.key);
+        }
+    }
     broadcastToAllWebviews({ command: 'syncTabs', tabs, activeKey: activeSessionKey });
 }
 
 function cleanupStaleSessions() {
     const now = Date.now();
+    const STALE_TRIGGER_MS = 2 * 60 * 60 * 1000; // 2h — trigger hanging this long is abandoned
     const toRemove = [];
+    let triggerCleared = false;
     for (const [key, session] of sessions) {
         const age = now - session.lastActiveAt;
         const processAlive = isProcessAlive(session.mcpPid);
 
-        if (session.triggerData) {
-            // Has pending trigger — only clean if MCP process is dead
-            if (!processAlive) {
-                toRemove.push(key);
-            }
-            // Process alive → conversation is still waiting, never clean
+        // Skip sessions whose MCP PID is not bound to this window — they may
+        // belong to another window sharing the same workspace globalState.
+        // Only skip if session is recent (< 1h); old unbound sessions still get cleaned.
+        if (session.mcpPid && !boundMcpPids.has(session.mcpPid) && session.mcpPid !== 0 && age < 60 * 60 * 1000) {
             continue;
         }
 
-        // No pending trigger
-        if (!processAlive && age > 2 * 60 * 1000) {
-            // Process dead + 2 min grace → clean
+        if (session.triggerData) {
+            // Restored sessions (mcpPid=0) haven't bound a live PID yet — don't treat as dead
+            if (!processAlive && session.mcpPid !== 0) {
+                toRemove.push(key);
+                continue;
+            }
+            if (!processAlive && session.mcpPid === 0) {
+                continue;
+            }
+            // Process alive but trigger stale for 2h — agent likely gave up
+            if (age > STALE_TRIGGER_MS) {
+                const staleTid = session.triggerData.trigger_id;
+                console.log(`Feedback Gate: clearing stale trigger on session ${key} (idle ${(age / 60000).toFixed(0)}min)`);
+                if (staleTid) {
+                    const respFile = getTempPath(`feedback_gate_response_${staleTid}.json`);
+                    if (!fs.existsSync(respFile)) {
+                        try {
+                            const tmp = respFile + '.tmp';
+                            fs.writeFileSync(tmp, JSON.stringify({
+                                response: "[EXPIRED] Trigger expired due to inactivity (2h cleanup).",
+                                auto_response: true, trigger_id: staleTid,
+                                timestamp: new Date().toISOString()
+                            }, null, 2));
+                            fs.renameSync(tmp, respFile);
+                        } catch (e) {
+                            console.log(`Feedback Gate: failed to write expired response for ${staleTid}: ${e.message}`);
+                        }
+                    }
+                }
+                session.triggerData = null;
+                session.lastResponseTime = now;
+                triggerCleared = true;
+            } else {
+                continue;
+            }
+        }
+
+        // No pending trigger (or just cleared above)
+        // Skip PID-based cleanup for restored sessions (mcpPid=0) — their PID
+        // hasn't been updated yet. They'll be cleaned by the age-based path.
+        if (session.mcpPid === 0) {
+            const graceStart = session.restoredAt || session.lastActiveAt;
+            if (now - graceStart > 60 * 60 * 1000) toRemove.push(key);
+        } else if (!processAlive && age > 2 * 60 * 1000) {
             toRemove.push(key);
         } else if (processAlive && age > 60 * 60 * 1000) {
-            // Process alive but 60 min idle without trigger → clean
             toRemove.push(key);
         }
     }
@@ -255,9 +473,18 @@ function cleanupStaleSessions() {
             const next = findNextPendingSession();
             activeSessionKey = next ? next.key : (sessions.size > 0 ? sessions.keys().next().value : null);
             queue.setActiveSessionKey(activeSessionKey || '');
+            const nextSession = activeSessionKey ? sessions.get(activeSessionKey) : null;
+            if (nextSession) syncSessionToWebview(nextSession);
         }
     }
-    if (toRemove.length > 0) syncTabsToWebview();
+    if (toRemove.length > 0) persistSessions();
+    if (toRemove.length > 0 || triggerCleared) {
+        syncTabsToWebview();
+        if (triggerCleared && activeSessionKey) {
+            const activeS = sessions.get(activeSessionKey);
+            if (activeS) syncSessionToWebview(activeS);
+        }
+    }
 }
 
 function findNextPendingSession() {
@@ -272,11 +499,13 @@ function findNextPendingSession() {
 function addMessageToSession(sessionKey, msg) {
     const session = sessions.get(sessionKey);
     if (!session) return;
+    if (!msg.timestamp) msg.timestamp = Date.now();
     session.messages.push(msg);
     // Cap messages at 200 per session
     if (session.messages.length > 200) {
         session.messages = session.messages.slice(-200);
     }
+    persistSessions();
     // If this is the active session, also push to webview
     if (sessionKey === activeSessionKey) {
         broadcastToAllWebviews({
@@ -286,6 +515,7 @@ function addMessageToSession(sessionKey, msg) {
             plain: msg.plain || false,
             attachments: msg.attachments,
             files: msg.files,
+            timestamp: msg.timestamp,
         });
     }
 }
@@ -327,6 +557,7 @@ function setCurrentTriggerData(triggerData, mcpPid) {
         session.lastActiveAt = Date.now();
         if (sessionId && !session.sessionId) {
             session.sessionId = sessionId;
+            persistSessions();
         }
         // Adopt untagged queue messages when this is the sole active session.
         // This prevents the global-pool fallback in post-route from being
@@ -339,6 +570,12 @@ function setCurrentTriggerData(triggerData, mcpPid) {
         if (triggerData && triggerData.message) {
             session.label = _buildTabLabel(session.index, triggerData.message);
             session._labelSource = 'agent';
+            persistSessions();
+            syncTabsToWebview();
+        }
+        // INVARIANT CHECK: session's sessionId must match the incoming sessionId
+        if (sessionId && session.sessionId && session.sessionId !== sessionId) {
+            console.error(`Feedback Gate: ⚠️ SESSION_ID_MISMATCH! session.key=${session.key} session.sessionId=${session.sessionId} incoming=${sessionId}`);
         }
         return session;
     }
@@ -396,14 +633,48 @@ const syncQueueToWebview = (sessionKey) => queue.syncToWebview(sessionKey);
 function closeSessionByKey(key) {
     if (!key) return;
     const toClose = sessions.get(key);
-    if (!toClose || toClose.triggerData) return;
+    if (!toClose) return;
+    // Allow closing if trigger is stale (>2min idle) or no trigger at all.
+    // Only block closing if trigger is active and recent.
+    if (toClose.triggerData) {
+        const triggerAge = Date.now() - toClose.lastActiveAt;
+        if (triggerAge < 2 * 60 * 1000) return;
+        // Stale trigger — auto-respond before closing
+        const staleTid = toClose.triggerData.trigger_id;
+        if (staleTid) {
+            const respFile = getTempPath(`feedback_gate_response_${staleTid}.json`);
+            if (!fs.existsSync(respFile)) {
+                try {
+                    const tmp = respFile + '.tmp';
+                    fs.writeFileSync(tmp, JSON.stringify({
+                        response: "[CLOSED] User closed the feedback tab.",
+                        auto_response: true, trigger_id: staleTid,
+                        timestamp: new Date().toISOString()
+                    }, null, 2));
+                    fs.renameSync(tmp, respFile);
+                } catch {}
+            }
+        }
+    }
     queue.migrateSessionKey(key, '');
     sessions.delete(key);
+    persistSessions();
     if (activeSessionKey === key) {
         const next = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
         activeSessionKey = next ? next.key : null;
         queue.setActiveSessionKey(activeSessionKey || '');
-        if (next) syncSessionToWebview(next);
+        if (next) {
+            syncSessionToWebview(next);
+        } else {
+            broadcastToAllWebviews({
+                command: 'loadSession',
+                sessionKey: '',
+                label: '',
+                messages: [],
+                draft: '',
+                hasPendingTrigger: false,
+            });
+        }
     }
     syncTabsToWebview();
     syncQueueToWebview(activeSessionKey || '');
@@ -509,13 +780,19 @@ class FeedbackGatePanelProvider {
                         if (sendSession) sendSession.pendingRemoteReply = null;
                         else if (activeSession) activeSession.pendingRemoteReply = null;
                         else pendingRemoteReply = null;
-                        enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files, {
+                        const enqueuedItem = enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files, {
                             sessionKey: sendSessionKey,
                         });
                         logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                         const sendTrigger = sendSession ? sendSession.triggerData : null;
                         if (sendTrigger && sendTrigger.trigger_id) {
                             processQueueForPendingTrigger(true, sendSession.key);
+                        } else if (sendSession) {
+                            addMessageToSession(sendSession.key, { text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files, _queued: true });
+                            if (enqueuedItem) { enqueuedItem._displayed = true; queue.saveQueue(); }
+                        } else {
+                            broadcastToAllWebviews({ command: 'addMessage', text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files });
+                            if (enqueuedItem) { enqueuedItem._displayed = true; queue.saveQueue(); }
                         }
                         break;
                     }
@@ -523,6 +800,7 @@ class FeedbackGatePanelProvider {
                         if (webviewMessage.sessionKey) {
                             if (activeSession && webviewMessage.draft !== undefined) {
                                 activeSession.draft = webviewMessage.draft || '';
+                                persistSessions();
                             }
                             switchToSession(webviewMessage.sessionKey, true);
                         }
@@ -542,7 +820,7 @@ class FeedbackGatePanelProvider {
                     case 'saveDraft':
                         if (webviewMessage.sessionKey) {
                             const draftSession = sessions.get(webviewMessage.sessionKey);
-                            if (draftSession) draftSession.draft = webviewMessage.draft || '';
+                            if (draftSession) { draftSession.draft = webviewMessage.draft || ''; persistSessions(); }
                         }
                         break;
                     case 'moveQueueItem':
@@ -613,6 +891,12 @@ class FeedbackGatePanelProvider {
         webviewView.onDidDispose(() => {
             this._view = null;
         });
+
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible && this._view) {
+                webviewView.webview.postMessage({ command: 'focus' });
+            }
+        });
     }
 
     isReady() {
@@ -622,7 +906,35 @@ class FeedbackGatePanelProvider {
     async focusView() {
         try {
             await vscode.commands.executeCommand(`${this._viewId}.focus`);
-            return true;
+            // Verify the view actually resolved after focus command.
+            // The command can silently succeed without revealing the panel
+            // (e.g. when the custom panel container has never been opened).
+            if (!this._view) {
+                await new Promise(r => setTimeout(r, 300));
+            }
+            if (this._view && this._view.visible !== false) {
+                return true;
+            }
+            // View not visible or not resolved — try revealing via the container command
+            const containerId = this._viewId === 'feedbackGate.chatView'
+                ? 'workbench.view.extension.feedbackGatePanel'
+                : 'workbench.view.extension.feedbackGateSidebar';
+            try {
+                await vscode.commands.executeCommand(containerId);
+                await new Promise(r => setTimeout(r, 300));
+            } catch {}
+            // Re-try focus after container reveal
+            if (this._view && this._view.visible === false) {
+                try {
+                    await vscode.commands.executeCommand(`${this._viewId}.focus`);
+                    await new Promise(r => setTimeout(r, 150));
+                } catch {}
+            }
+            if (this._view && this._view.visible !== false) {
+                return true;
+            }
+            console.log(`Feedback Gate: focusView ${this._viewId} — view not visible after all attempts (resolved=${!!this._view})`);
+            return false;
         } catch (e) {
             console.log(`Failed to focus view ${this._viewId}: ${e.message}`);
             return false;
@@ -651,6 +963,9 @@ function activate(context) {
     // Create output channel for logging
     outputChannel = vscode.window.createOutputChannel('Feedback Gate');
     context.subscriptions.push(outputChannel);
+    
+    _globalState = context.globalState;
+    restoreSessions();
     
     console.log('Feedback Gate extension activated for Cursor MCP integration');
     console.log(`Feedback Gate: EXTENSION_PID=${EXTENSION_PID}, IDE_QUEUE_PATH=${IDE_QUEUE_PATH}`);
@@ -842,7 +1157,9 @@ function writeResponseForTrigger(triggerId, queueItem, source) {
         files: enrichFiles(queueItem.files),
         event_type: 'MCP_RESPONSE',
         source,
-        queue_item_id: queueItem.id
+        queue_item_id: queueItem.id,
+        extension_host_pid: process.pid,
+        workspace_folders: _getMyWorkspacePaths().join(','),
     };
     const responseJson = JSON.stringify(responseData, null, 2);
     let written = false;
@@ -949,7 +1266,7 @@ function checkMcpStatus() {
         }
 
         const wasActive = mcpStatus;
-        mcpStatus = active && firstTriggerReceived;
+        mcpStatus = active;
         if (wasActive !== mcpStatus) updateChatPanelStatus();
     } catch (error) {
         if (mcpStatus) {
@@ -981,13 +1298,43 @@ function updateChatPanelStatus() {
     }
 }
 
+function _getMyWorkspacePaths() {
+    try {
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length === 0) return [];
+        return folders.map(f => f.uri.fsPath);
+    } catch { return []; }
+}
+
+function _workspacePathsMatch(mcpWorkspaceFolders, myWorkspaces) {
+    if (!mcpWorkspaceFolders || myWorkspaces.length === 0) return false;
+    const mcpPaths = mcpWorkspaceFolders.split(',').filter(Boolean);
+    for (const mws of myWorkspaces) {
+        for (const mcp of mcpPaths) {
+            // Exact match or parent/child relationship (MCP cwd may be
+            // the workspace root itself, or a subdirectory).
+            if (mws === mcp || mcp.startsWith(mws + '/') || mws.startsWith(mcp + '/')) return true;
+        }
+    }
+    return false;
+}
+
 function discoverMcpPids() {
     /**
-     * Discover ALL MCP server PIDs that belong to THIS Cursor window.
+     * Discover ALL MCP server PIDs that belong to THIS Cursor instance.
      *
-     * A single Cursor window can have multiple agent conversations, each spawning
-     * its own MCP server process. All share the same extension-host parent (process.pid).
-     * We return a Set of all alive MCP PIDs whose PPID matches ours.
+     * Cursor shares a SINGLE mcp-process across all windows in the same instance.
+     * All extension-hosts share the same Cursor main process as parent.
+     * The MCP server's ancestor chain includes this shared main process PID.
+     *
+     * Matching strategy (in priority order):
+     * 1. Direct PPID match: entry.ppid === process.pid
+     * 2. Ancestor match: process.pid appears in entry.ancestor_pids[]
+     * 3. Sibling match: our PPID (Cursor main process) appears in entry.ancestor_pids[]
+     *    — this is the primary match in multi-window scenarios where MCP is spawned
+     *    by a shared mcp-process helper, not by any specific extension-host.
+     * 4. Workspace match: entry.workspace_folders overlaps with our workspace
+     * 5. Fallback: old PID files without ppid — bind newest alive process
      */
     const discovered = new Set();
     try {
@@ -997,22 +1344,46 @@ function discoverMcpPids() {
         if (files.length === 0) return discovered;
         
         const myPid = process.pid;
+        const myPpid = process.ppid;
+        const myWorkspaces = _getMyWorkspacePaths();
         const entries = files
             .map(f => {
                 const fullPath = path.join(tempDir, f);
                 try {
                     const stat = fs.statSync(fullPath);
                     const data = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
-                    return { file: f, fullPath, pid: data.pid, ppid: data.ppid, mtime: stat.mtime.getTime() };
+                    return {
+                        file: f, fullPath,
+                        pid: data.pid,
+                        ppid: data.ppid,
+                        ancestorPids: Array.isArray(data.ancestor_pids) ? data.ancestor_pids : [],
+                        workspaceFolders: typeof data.workspace_folders === 'string' ? data.workspace_folders : '',
+                        mtime: stat.mtime.getTime(),
+                    };
                 } catch { return null; }
             })
             .filter(Boolean);
         
         for (const entry of entries) {
-            if (entry.ppid === myPid) {
+            const isDirectChild = entry.ppid === myPid;
+            const isDescendant = entry.ancestorPids.includes(myPid);
+            // Sibling match: both this extension-host and the MCP share a common
+            // Cursor main process ancestor (our PPID is in MCP's ancestor chain).
+            const isSibling = myPpid > 1 && entry.ancestorPids.includes(myPpid);
+            let isWorkspaceMatch = false;
+            if (!isDirectChild && !isDescendant && !isSibling) {
+                isWorkspaceMatch = _workspacePathsMatch(entry.workspaceFolders, myWorkspaces);
+            }
+            if (isDirectChild || isDescendant || isSibling || isWorkspaceMatch) {
                 try {
                     process.kill(entry.pid, 0);
                     discovered.add(entry.pid);
+                    if (!isDirectChild) {
+                        const method = isDescendant ? 'ancestor' : isSibling ? 'sibling' : 'workspace';
+                        if (discovered.size <= 3) {
+                            console.log(`Feedback Gate: MCP PID ${entry.pid} matched via ${method} (mcp_ppid=${entry.ppid}, my_pid=${myPid}, my_ppid=${myPpid})`);
+                        }
+                    }
                 } catch {
                     try { fs.unlinkSync(entry.fullPath); } catch {}
                 }
@@ -1273,6 +1644,16 @@ function startFeedbackGateIntegration(context) {
             checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${pid}.json`));
         }
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
+        // Scan per-trigger files (concurrency-safe: each conversation writes its own file)
+        try {
+            const tempDir = getTempPath('');
+            const entries = fs.readdirSync(tempDir);
+            for (const entry of entries) {
+                if (entry.startsWith('feedback_gate_trigger_fg_') && entry.endsWith('.json') && !entry.endsWith('.tmp')) {
+                    checkTriggerFile(context, path.join(tempDir, entry));
+                }
+            }
+        } catch {}
         checkIdeQueueFile();
         // Expire stale pendingRemoteReply (30 minutes)
         if (pendingRemoteReply && Date.now() - pendingRemoteReply.enqueuedAt > 30 * 60 * 1000) {
@@ -1290,8 +1671,6 @@ function startFeedbackGateIntegration(context) {
             firstTriggerReceived = false;
             lastTriggerTime = 0;
             unregisterIdeSession();
-            mcpStatus = false;
-            updateChatPanelStatus();
             console.log('Feedback Gate: session expired — idle for 2h');
         }
     }, 250);
@@ -1312,6 +1691,15 @@ function startFeedbackGateIntegration(context) {
             checkTriggerFile(context, getTempPath(`feedback_gate_trigger_pid${pid}.json`));
         }
         checkTriggerFile(context, getTempPath('feedback_gate_trigger.json'));
+        try {
+            const tempDir = getTempPath('');
+            const entries = fs.readdirSync(tempDir);
+            for (const entry of entries) {
+                if (entry.startsWith('feedback_gate_trigger_fg_') && entry.endsWith('.json') && !entry.endsWith('.tmp')) {
+                    checkTriggerFile(context, path.join(tempDir, entry));
+                }
+            }
+        } catch {}
     }, 100);
     
     vscode.window.showInformationMessage('Feedback Gate MCP 集成就绪！正在监听 Cursor 工具调用…');
@@ -1337,30 +1725,109 @@ function checkTriggerFile(context, filePath) {
                 return;
             }
             
-            // Instance isolation: only consume triggers that belong to this Cursor window.
-            // Match by PPID (the MCP's parent process should be our extension-host PID),
-            // or by boundMcpPids set if already established.
+            // Instance isolation: only consume triggers from the same Cursor instance.
+            // Cursor shares a single mcp-process across all windows; we match by
+            // PPID, ancestor chain, or sibling relationship (same Cursor main process).
             const triggerPid = triggerData.pid;
             const triggerPpid = triggerData.ppid;
+            const triggerAncestors = Array.isArray(triggerData.ancestor_pids) ? triggerData.ancestor_pids : [];
             const myPid = process.pid;
+            const myPpid = process.ppid;
             
-            // If trigger has PPID info, use it for precise matching
-            if (triggerPpid && triggerPpid !== myPid) {
-                // This trigger belongs to a different Cursor window — leave it alone
+            const isDirectChild = triggerPpid === myPid;
+            const isDescendant = triggerAncestors.includes(myPid);
+            const isSibling = myPpid > 1 && triggerAncestors.includes(myPpid);
+            
+            if (triggerPpid && !isDirectChild && !isDescendant && !isSibling) {
                 return;
             }
             
+            // --- Multi-window routing (same Cursor instance, shared MCP) ---
+            // Cursor's mcp-process is shared across ALL windows, so all
+            // extension-hosts are siblings of the MCP.  We route using:
+            //   1. target_extension_host_pid (precise, from session history)
+            //   2. session_id ownership (this window handled it before)
+            //   3. Focused-window deferral (first trigger — no history)
+            //
+            // IMPORTANT: workspace_folders from the trigger is UNRELIABLE for
+            // first-trigger routing because WORKSPACE_FOLDER_PATHS env var
+            // reflects the window that STARTED the MCP, not the window whose
+            // agent is calling the tool.  We only trust workspace info that
+            // was learned from a previous response (single-path, precise).
+
+            const triggerSessionId = triggerData.data && triggerData.data.session_id;
+            const targetEhPid = triggerData.target_extension_host_pid;
+            const triggerWorkspace = triggerData.workspace_folders || '';
+
+            if (isSibling && !isDirectChild && !isDescendant) {
+                // Signal 1: target_extension_host_pid — precise redirect
+                if (targetEhPid && targetEhPid !== myPid) {
+                    try {
+                        process.kill(targetEhPid, 0);
+                        return; // Target alive, let it handle
+                    } catch {
+                        // Target EH dead.  Deterministic fallback:
+                        // If trigger has session_id, only the session owner claims.
+                        // If no session_id, fall through to workspace/focus logic.
+                        if (triggerSessionId) {
+                            let weOwnSession = false;
+                            for (const s of sessions.values()) {
+                                if (s.sessionId === triggerSessionId) { weOwnSession = true; break; }
+                            }
+                            if (!weOwnSession) return; // Not ours — skip deterministically
+                        }
+                    }
+                }
+
+                const wsPrecise = triggerWorkspace && !triggerWorkspace.includes(',');
+                const myWorkspaces = _getMyWorkspacePaths();
+                const wsMatch = _workspacePathsMatch(triggerWorkspace, myWorkspaces);
+
+                // Signal 2: session_id ownership (when targetEhPid absent or is us)
+                if (triggerSessionId) {
+                    let weOwnSession = false;
+                    for (const s of sessions.values()) {
+                        if (s.sessionId === triggerSessionId) {
+                            weOwnSession = true;
+                            break;
+                        }
+                    }
+                    if (weOwnSession) {
+                        // We own this session — proceed to atomic claim below.
+                    } else if (wsPrecise && !wsMatch) {
+                        return;
+                    } else if (wsPrecise && wsMatch) {
+                        // Workspace matches precisely — claim even if not focused.
+                        // Atomic unlink below prevents double-claim across windows.
+                    } else {
+                        // First trigger for this session (no owner yet), no workspace hint.
+                        // Only focused window claims; others skip deterministically.
+                        const isFocused = vscode.window.state && vscode.window.state.focused;
+                        if (!isFocused) return;
+                    }
+                } else {
+                    if (wsPrecise && !wsMatch) {
+                        return;
+                    }
+                    // No session_id — only focused window or workspace-match claims.
+                    if (!wsMatch) {
+                        const isFocused = vscode.window.state && vscode.window.state.focused;
+                        if (!isFocused) return;
+                    }
+                }
+            }
+            
             if (triggerPid && !boundMcpPids.has(triggerPid)) {
-                if (triggerPpid === myPid) {
+                if (isDirectChild || isDescendant || isSibling) {
                     boundMcpPids.add(triggerPid);
-                    console.log(`Feedback Gate: added MCP PID ${triggerPid} (PPID match)`);
+                    const method = isDirectChild ? 'PPID' : isDescendant ? 'ancestor' : 'sibling';
+                    console.log(`Feedback Gate: added MCP PID ${triggerPid} (${method} match)`);
                 } else if (boundMcpPids.size === 0) {
                     try {
                         process.kill(triggerPid, 0);
                         boundMcpPids.add(triggerPid);
                         console.log(`Feedback Gate: fallback added MCP PID ${triggerPid} (legacy)`);
                     } catch {
-                        try { fs.unlinkSync(filePath); } catch {}
                         return;
                     }
                 } else {
@@ -1373,6 +1840,38 @@ function checkTriggerFile(context, filePath) {
                 try { fs.unlinkSync(filePath); } catch {}
                 return;
             }
+            
+            // Cross-window deduplication: use the per-trigger canonical file as
+            // the SOLE atomic claim point.  On POSIX, only one process can
+            // successfully unlink a given inode.  Even though the MCP writes the
+            // same trigger to 3 paths (per-trigger, pid, legacy), all windows
+            // race on this ONE canonical path to decide ownership.
+            if (triggerId) {
+                const canonicalPath = getTempPath(`feedback_gate_trigger_fg_${triggerId}.json`);
+                try {
+                    fs.unlinkSync(canonicalPath);
+                } catch (e) {
+                    if (e.code === 'ENOENT') {
+                        // Another window already claimed this trigger.
+                        // Clean up the file we scanned (may be pid / legacy copy).
+                        try { fs.unlinkSync(filePath); } catch {}
+                        return;
+                    }
+                }
+            } else {
+                // Legacy trigger without trigger_id — fall back to filePath claim
+                try {
+                    fs.unlinkSync(filePath);
+                } catch (e) {
+                    if (e.code === 'ENOENT') return;
+                }
+            }
+            // Clean up redundant copies so no window sees stale files.
+            try { fs.unlinkSync(filePath); } catch {}
+            if (triggerPid) {
+                try { fs.unlinkSync(getTempPath(`feedback_gate_trigger_pid${triggerPid}.json`)); } catch {}
+            }
+            try { fs.unlinkSync(getTempPath('feedback_gate_trigger.json')); } catch {}
             
             lastTriggerTime = Date.now();
             if (!firstTriggerReceived) {
@@ -1395,6 +1894,7 @@ function checkTriggerFile(context, filePath) {
                         trigger_id: triggerId
                     }, null, 2));
                     fs.renameSync(tmpPath, responseFile);
+                    sendExtensionAcknowledgement(triggerId, (triggerData.data && triggerData.data.tool) || 'feedback_gate_chat');
                 }
                 try { fs.unlinkSync(filePath); } catch {}
                 console.log('Feedback Gate disabled — auto-passthrough sent');
@@ -1412,7 +1912,7 @@ function checkTriggerFile(context, filePath) {
             }
             if (!targetSession && !targetSessionId && triggerPid) {
                 const pidSessions = getAllSessionsByMcpPid(triggerPid);
-                if (pidSessions.length === 1) {
+                if (pidSessions.length === 1 && !pidSessions[0].triggerData) {
                     targetSession = pidSessions[0];
                 }
             }
@@ -1460,7 +1960,9 @@ function checkTriggerFile(context, filePath) {
                                 addMessageToSession(session.key, { text: agentMsg, type: 'system' });
                                 maybeWriteOutbox(agentMsg);
                             }
-                            addMessageToSession(session.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+                            if (!queueItem._displayed) {
+                                addMessageToSession(session.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+                            }
                             if (queueItem.text || (queueItem.attachments && queueItem.attachments.length > 0)) {
                                 session.label = _buildTabLabel(session.index, queueItem.text, queueItem.attachments);
                                 session._labelSource = 'user';
@@ -1474,7 +1976,9 @@ function checkTriggerFile(context, filePath) {
                                 broadcastToAllWebviews({ command: 'newMessage', text: agentMsg, type: 'system', toolData: triggerData.data, mcpIntegration: false });
                                 maybeWriteOutbox(agentMsg);
                             }
-                            broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+                            if (!queueItem._displayed) {
+                                broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+                            }
                             const sourceTag = queueItem.sourceLabel
                                 ? `⚡ 已从队列自动发送（来自${queueItem.sourceLabel}）`
                                 : '⚡ 已从队列自动发送';
@@ -1501,9 +2005,10 @@ function checkTriggerFile(context, filePath) {
             }
             
             // Eagerly clean dead sessions before routing new trigger
+            // Skip restored sessions (mcpPid=0) — they haven't been bound yet.
             let cleaned = false;
             for (const [sKey, s] of sessions) {
-                if (s.mcpPid === triggerPid) continue;
+                if (s.mcpPid === 0 || s.mcpPid === triggerPid) continue;
                 if (!isProcessAlive(s.mcpPid)) {
                     console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
                     queue.migrateSessionKey(sKey, '');
@@ -1560,7 +2065,9 @@ function checkTriggerFile(context, filePath) {
                                 addMessageToSession(session.key, { text: agentMsg, type: 'system' });
                                 maybeWriteOutbox(agentMsg);
                             }
-                            addMessageToSession(session.key, { text: postItem.text, type: 'user', attachments: postItem.attachments, files: postItem.files });
+                            if (!postItem._displayed) {
+                                addMessageToSession(session.key, { text: postItem.text, type: 'user', attachments: postItem.attachments, files: postItem.files });
+                            }
                             if (postItem.text || (postItem.attachments && postItem.attachments.length > 0)) {
                                 session.label = _buildTabLabel(session.index, postItem.text, postItem.attachments);
                                 session._labelSource = 'user';
@@ -1618,11 +2125,7 @@ function checkTriggerFile(context, filePath) {
                     processedTriggerIds.delete(first);
                 }
             }
-            try {
-                fs.unlinkSync(filePath);
-            } catch (cleanupError) {
-                console.log(`Could not clean trigger file: ${cleanupError.message}`);
-            }
+            try { fs.unlinkSync(filePath); } catch {}
         }
     } catch (error) {
         if (error.code !== 'ENOENT') {
@@ -1742,7 +2245,7 @@ function handleFeedbackGateToolCall(context, toolData, mcpPid) {
         }
         if (!targetSession) targetSession = getSessionByMcpPid(mcpPid);
         if (targetSession) {
-            targetSession.messages.push({ text: popupOptions.message, type: 'system' });
+            targetSession.messages.push({ text: popupOptions.message, type: 'system', timestamp: Date.now() });
             if (targetSession.messages.length > 200) targetSession.messages = targetSession.messages.slice(-200);
         }
     }
@@ -1826,63 +2329,18 @@ function openFeedbackGatePopup(context, options = {}) {
             chatPanel = null;
         }
 
-        // Try each candidate in priority order
-        for (const provider of providerCandidates) {
-            if (provider._view) {
+        // Unified async focus logic for all candidates (resolved or not).
+        // Prepares pending messages so they get delivered once the view resolves.
+        const tryProviders = async () => {
+            for (let i = 0; i < providerCandidates.length; i++) {
+                const provider = providerCandidates[i];
                 provider._mcpIntegration = mcpIntegration;
                 provider._currentSpecialHandling = specialHandling;
                 if (mcpIntegration) {
-                    setTimeout(() => {
-                        broadcastToAllWebviews({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
-                    }, 100);
+                    provider._pendingMessages.push({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
                 }
                 if (mcpIntegration && message && !_skipNewMessage) {
-                    setTimeout(() => {
-                        broadcastToAllWebviews({
-                            command: 'newMessage',
-                            text: message,
-                            type: 'system',
-                            toolData: toolData,
-                            mcpIntegration: mcpIntegration
-                        });
-                    }, 150);
-                }
-                provider.focusView();
-                if (autoFocus) {
-                    setTimeout(() => { postToWebview({ command: 'focus' }); }, 200);
-                }
-                return;
-            }
-        }
-
-        // None resolved yet — try to focus the preferred provider (triggers resolveWebviewView)
-        const primary = providerCandidates[0];
-        primary._mcpIntegration = mcpIntegration;
-        primary._currentSpecialHandling = specialHandling;
-        if (mcpIntegration) {
-            primary._pendingMessages.push({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
-        }
-        if (mcpIntegration && message && !_skipNewMessage) {
-            primary._pendingMessages.push({
-                command: 'newMessage',
-                text: message,
-                type: 'system',
-                toolData: toolData,
-                mcpIntegration: mcpIntegration
-            });
-        }
-        primary.focusView().then(ok => {
-            if (!ok && providerCandidates.length > 1) {
-                const fallback = providerCandidates[1];
-                console.log(`Feedback Gate: preferred view focus failed, trying fallback`);
-                primary._pendingMessages = [];
-                fallback._mcpIntegration = mcpIntegration;
-                fallback._currentSpecialHandling = specialHandling;
-                if (mcpIntegration) {
-                    fallback._pendingMessages.push({ command: 'updateMcpStatus', active: true, hasPendingTrigger: true });
-                }
-                if (mcpIntegration && message && !_skipNewMessage) {
-                    fallback._pendingMessages.push({
+                    provider._pendingMessages.push({
                         command: 'newMessage',
                         text: message,
                         type: 'system',
@@ -1890,19 +2348,32 @@ function openFeedbackGatePopup(context, options = {}) {
                         mcpIntegration: mcpIntegration
                     });
                 }
-                fallback.focusView().then(ok2 => {
-                    if (!ok2) {
-                        console.log('Feedback Gate: all view providers failed, falling back to editor tab');
-                        fallback._pendingMessages = [];
-                        openFeedbackGatePopup(context, { ...options, _forceEditor: true });
+
+                const ok = await provider.focusView();
+                if (ok) {
+                    // Flush pending messages now that the view is resolved and visible
+                    if (provider._view && provider._view.webview && provider._pendingMessages.length > 0) {
+                        for (const msg of provider._pendingMessages) {
+                            provider._view.webview.postMessage(msg);
+                        }
+                        provider._pendingMessages = [];
                     }
-                });
-            } else if (!ok) {
-                console.log('Feedback Gate: view focus failed, falling back to editor tab');
-                primary._pendingMessages = [];
-                usePanelView = false;
-                openFeedbackGatePopup(context, { ...options, _forceEditor: true });
+                    if (autoFocus) {
+                        setTimeout(() => { postToWebview({ command: 'focus' }); }, 200);
+                    }
+                    return;
+                }
+                // This candidate failed — clear its pending messages before trying next
+                provider._pendingMessages = [];
+                console.log(`Feedback Gate: provider ${i} (${provider._viewId}) focus failed, trying next`);
             }
+            // All providers failed — fall back to editor tab
+            console.log('Feedback Gate: all view providers failed, falling back to editor tab');
+            openFeedbackGatePopup(context, { ...options, _forceEditor: true });
+        };
+        tryProviders().catch(e => {
+            console.log(`Feedback Gate: tryProviders error: ${e.message}, falling back to editor tab`);
+            openFeedbackGatePopup(context, { ...options, _forceEditor: true });
         });
         return;
     }
@@ -1975,13 +2446,19 @@ function openFeedbackGatePopup(context, options = {}) {
                     if (sendSession2) sendSession2.pendingRemoteReply = null;
                     else if (activeSession) activeSession.pendingRemoteReply = null;
                     else pendingRemoteReply = null;
-                    enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files, {
+                    const enqueuedItem2 = enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files, {
                         sessionKey: sendSessionKey2,
                     });
                     logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                     const sendTrigger2 = sendSession2 ? sendSession2.triggerData : null;
                     if (sendTrigger2 && sendTrigger2.trigger_id) {
                         processQueueForPendingTrigger(true, sendSession2.key);
+                    } else if (sendSession2) {
+                        addMessageToSession(sendSession2.key, { text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files, _queued: true });
+                        if (enqueuedItem2) { enqueuedItem2._displayed = true; queue.saveQueue(); }
+                    } else {
+                        broadcastToAllWebviews({ command: 'addMessage', text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files });
+                        if (enqueuedItem2) { enqueuedItem2._displayed = true; queue.saveQueue(); }
                     }
                     break;
                 }
@@ -1989,6 +2466,7 @@ function openFeedbackGatePopup(context, options = {}) {
                     if (webviewMessage.sessionKey) {
                         if (activeSession && webviewMessage.draft !== undefined) {
                             activeSession.draft = webviewMessage.draft || '';
+                            persistSessions();
                         }
                         switchToSession(webviewMessage.sessionKey, true);
                     }
@@ -2008,7 +2486,7 @@ function openFeedbackGatePopup(context, options = {}) {
                 case 'saveDraft':
                     if (webviewMessage.sessionKey) {
                         const draftSession2 = sessions.get(webviewMessage.sessionKey);
-                        if (draftSession2) draftSession2.draft = webviewMessage.draft || '';
+                        if (draftSession2) { draftSession2.draft = webviewMessage.draft || ''; persistSessions(); }
                     }
                     break;
                 case 'moveQueueItem':
@@ -2086,6 +2564,12 @@ function openFeedbackGatePopup(context, options = {}) {
         context.subscriptions
     );
 
+    chatPanel.onDidChangeViewState(e => {
+        if (e.webviewPanel.visible && e.webviewPanel.active) {
+            e.webviewPanel.webview.postMessage({ command: 'focus' });
+        }
+    });
+
     // Auto-focus if requested
     if (autoFocus) {
         setTimeout(() => {
@@ -2127,15 +2611,19 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
     markQueueItemDone(queueItem.id);
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
+    if (!queueItem._displayed) {
+        if (targetSession) {
+            addMessageToSession(targetSession.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+        } else {
+            broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
+        }
+    }
     if (targetSession) {
-        addMessageToSession(targetSession.key, { text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
         if (queueItem.text || (queueItem.attachments && queueItem.attachments.length > 0)) {
             targetSession.label = _buildTabLabel(targetSession.index, queueItem.text, queueItem.attachments);
             targetSession._labelSource = 'user';
             syncTabsToWebview();
         }
-    } else {
-        broadcastToAllWebviews({ command: 'addMessage', text: queueItem.text, type: 'user', attachments: queueItem.attachments, files: queueItem.files });
     }
 
     const isLocalDirect = directSend && (!queueItem.source || queueItem.source === 'local');
@@ -2425,6 +2913,12 @@ function handleDroppedFile(filePath, triggerId) {
 }
 
 function deactivate() {
+    // Flush session persistence synchronously before shutdown
+    if (_persistTimer) { clearTimeout(_persistTimer); _persistTimer = null; }
+    if (_globalState) {
+        _flushSessionsToGlobalState();
+    }
+
     unregisterIdeSession();
     
     if (feedbackGateWatcher) {

@@ -6,25 +6,6 @@ alwaysApply: true
 
 # Feedback Gate Protocol
 
-## ⛔ ABSOLUTE RULE: 禁止回溯已完成的请求（Compaction 安全）
-
-**此规则优先级高于本文件中所有其他规则。**
-
-上下文压缩（compaction）后，系统可能在消息末尾重新附带对话最初的 `<user_query>` 标签。这不是新任务。
-
-### 强制检查流程（每次 compaction 恢复后的第一步）
-1. 读取压缩摘要（conversation summary）
-2. 检查 `<user_query>` 中的请求是否在摘要中被标记为「已完成」「已处理」「COMPLETED」
-3. 如果已处理 → **绝对禁止重新执行**，直接从摘要中的「Current Work」或「Pending Tasks」继续
-4. 如果未处理 → 正常执行
-5. 如果不确定 → 通过 `feedback_gate_chat` 向用户确认
-
-### 红线
-- **NEVER** 在完成阶段性工作后说"现在回到用户最初的问题"然后重新执行
-- **NEVER** 把摘要中历史 feedback gate 回复当作当前待办
-- 最高优先级：用户在主聊天框发送的**最新消息**（触发当前回复的消息）
-- 压缩摘要中的历史 feedback gate 回复 → **已处理的历史记录**，不是当前待办
-
 ## 核心规则
 完成用户请求后，**禁止直接结束回复**。必须调用 `feedback_gate_chat` MCP 工具打开弹窗，等待用户反馈。只有用户在弹窗中回复 "TASK_COMPLETE"、"Done" 等完成信号后才可结束。
 
@@ -65,13 +46,21 @@ alwaysApply: true
 
 ## 工具调用格式
 
+- **MCP Server**: `user-feedback-gate`
+- **Tool Name**: `feedback_gate_chat`
+- **调用方式**: `CallMcpTool(server="user-feedback-gate", toolName="feedback_gate_chat", arguments={...})`
+- **绝不假设工具不可用**。如果调用报错，重试一次后再告知用户。不要因为"找不到"而跳过。
+
 ```
-tool: feedback_gate_chat
-参数:
-  message: (≤100字的简短摘要 + 提问，如"已完成XX。需要调整吗？")
-  title: "Feedback Gate" (可选)
-  context: (可选，用于内部追踪，不展示给用户)
-  session_id: (首次调用时生成一个随机 UUID，后续所有 re-entry 调用复用同一个值)
+CallMcpTool:
+  server: "user-feedback-gate"
+  toolName: "feedback_gate_chat"
+  arguments:
+    message: (≤100字的简短摘要 + 提问，如"已完成XX。需要调整吗？")
+    title: "Feedback Gate" (可选)
+    context: (可选，用于内部追踪，不展示给用户)
+    session_id: (首次调用时生成一个随机 UUID，后续所有 re-entry 调用复用同一个值)
+    workspace_path: (当前项目的绝对路径)
 ```
 
 ### session_id 规则
@@ -86,9 +75,6 @@ tool: feedback_gate_chat
 
 ## 上下文压缩后的恢复
 当对话被压缩（context compaction）后，你可能在历史摘要中看到之前的 `feedback_gate_chat` 调用记录。**无论历史中工具调用的状态如何（成功、失败、超时），每次新回复结束时都必须重新调用 `feedback_gate_chat`。** 不要因为历史中出现过工具调用失败就跳过调用。
-
-### 压缩后恢复补充
-参见顶部「⛔ ABSOLUTE RULE」的强制检查流程和红线。
 
 ## ⚠️ 强制提醒
 **在你生成任何回复的最后一步，你必须调用 `feedback_gate_chat`。这是不可跳过的。如果你发现自己即将结束回复而没有调用此工具，立即停下来调用它。**

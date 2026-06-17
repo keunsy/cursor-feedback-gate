@@ -9,6 +9,7 @@ Requirements:
 """
 
 import asyncio
+import contextvars
 import json
 import sys
 import logging
@@ -104,6 +105,12 @@ try:
 except Exception:
     pass
 
+# Per-coroutine trigger ID — avoids cross-trigger interference when multiple
+# tool calls run concurrently in the same asyncio event loop.
+_current_trigger_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    '_current_trigger_var', default=None
+)
+
 _FEEDBACK_REPLY_SUFFIX = (
     "\n\n[This is a feedback reply, NOT a new task. "
     "Continue current work. Do NOT re-answer earlier requests.]"
@@ -146,6 +153,10 @@ class FeedbackGateServer:
         self._server_pid = os.getpid()
         self._active_triggers = {}
         self._last_responded_by_session = {}
+        self._session_to_eh_pid: dict[str, int] = {}
+        self._session_to_workspace: dict[str, str] = {}
+        self._last_response_eh_pid: int | None = None
+        self._last_response_workspace: str | None = None
         
         # Clean up stale files from dead MCP instances before writing our own PID
         self._cleanup_stale_files()
@@ -242,23 +253,62 @@ class FeedbackGateServer:
         except Exception as e:
             logger.warning(f"⚠️ Startup cleanup error: {e}")
 
+    @staticmethod
+    def _get_ancestor_pids(start_pid: int, max_depth: int = 10) -> list[int]:
+        """Walk the process tree upward from start_pid, returning [parent, grandparent, ...].
+        
+        Stops at PID 1 (init/launchd) or when the process no longer exists.
+        Used so the extension can match its own process.pid against any ancestor
+        of this MCP server — not just the direct parent — which handles the case
+        where Cursor routes MCP through an intermediate `mcp-process` helper.
+        """
+        ancestors: list[int] = []
+        current = start_pid
+        try:
+            import subprocess
+            for _ in range(max_depth):
+                result = subprocess.run(
+                    ["ps", "-o", "ppid=", "-p", str(current)],
+                    capture_output=True, text=True, timeout=2,
+                )
+                ppid_str = result.stdout.strip()
+                if not ppid_str:
+                    break
+                ppid = int(ppid_str)
+                if ppid <= 1:
+                    break
+                ancestors.append(ppid)
+                current = ppid
+        except Exception as e:
+            logger.debug(f"Ancestor PID walk stopped: {e}")
+        return ancestors
+
     def _write_pid_file(self):
         """Write a PID-specific marker file so the extension can identify its MCP server instance.
         
-        Includes PPID (parent process ID) which is the extension-host process that launched
-        this MCP server. The extension can match its own process.pid against this PPID to
-        bind to the correct MCP instance in multi-window setups.
+        Includes PPID, ancestor_pids chain, and workspace_folders so the extension
+        can match via multiple strategies:
+        1. Direct PPID match (extension-host spawned MCP directly)
+        2. Ancestor chain match (rare, but possible)
+        3. Sibling match (same Cursor main process parent)
         """
         try:
             pid_file = Path(get_temp_path(f"feedback_gate_mcp_{self._server_pid}.pid"))
+            ancestors = self._get_ancestor_pids(self._server_pid)
+            # NOTE: WORKSPACE_FOLDER_PATHS reflects the window that started the
+            # MCP, not necessarily the window whose agent calls tools.  Stored
+            # here for debugging only; trigger routing must NOT rely on it.
+            workspace_paths = os.environ.get("WORKSPACE_FOLDER_PATHS", "") or os.getcwd()
             pid_data = {
                 "pid": self._server_pid,
                 "ppid": os.getppid(),
+                "ancestor_pids": ancestors,
+                "workspace_folders": workspace_paths,
                 "timestamp": datetime.now().isoformat(),
                 "system": "feedback-gate"
             }
             pid_file.write_text(json.dumps(pid_data))
-            logger.info(f"📝 PID file written: {pid_file} (PPID: {os.getppid()})")
+            logger.info(f"📝 PID file written: {pid_file} (PPID: {os.getppid()}, ancestors: {ancestors}, workspace: {workspace_paths})")
         except Exception as e:
             logger.error(f"❌ Failed to write PID file: {e}")
 
@@ -301,6 +351,11 @@ class FeedbackGateServer:
                                 "type": "string",
                                 "description": "Unique session identifier for this conversation. Generate a random UUID on your FIRST call and reuse the SAME value for all subsequent re-entry calls (when you receive [WAITING]). This ensures multiple conversations can use Feedback Gate simultaneously without interference.",
                                 "default": ""
+                            },
+                            "workspace_path": {
+                                "type": "string",
+                                "description": "Absolute path of the current workspace/project root. Used for multi-window routing — ensures the popup opens in the correct Cursor window. Pass the workspace root path (e.g. '/Users/me/my-project').",
+                                "default": ""
                             }
                         }
                     }
@@ -325,22 +380,26 @@ class FeedbackGateServer:
                     await asyncio.sleep(1.0)
                     raise ValueError(f"Unknown tool: {name}")
             except asyncio.CancelledError:
-                logger.warning(f"⚠️ [DIAG] Tool call CANCELLED for {name} | pending_trigger={self._pending_trigger_id} | This means Cursor IDE aborted the MCP call (possible IDE-level timeout or user Stop)")
-                _log_event("CANCELLED", f"tool={name} trigger={self._pending_trigger_id}")
-                if self._pending_trigger_id:
-                    response_file = Path(get_temp_path(f"feedback_gate_response_{self._pending_trigger_id}.json"))
+                # Use per-coroutine trigger ID to avoid cross-trigger interference.
+                cancelled_trigger = _current_trigger_var.get(None) or self._pending_trigger_id
+                logger.warning(f"⚠️ [DIAG] Tool call CANCELLED for {name} | trigger={cancelled_trigger} | pending_trigger={self._pending_trigger_id} | This means Cursor IDE aborted the MCP call (possible IDE-level timeout or user Stop)")
+                _log_event("CANCELLED", f"tool={name} trigger={cancelled_trigger}")
+                if cancelled_trigger:
+                    response_file = Path(get_temp_path(f"feedback_gate_response_{cancelled_trigger}.json"))
                     if response_file.exists():
-                        logger.info(f"⚠️ [DIAG] Response file exists on cancel for trigger {self._pending_trigger_id} — marking for next-call delivery (NOT consuming now to avoid data loss)")
-                        _log_event("CANCEL_RESPONSE_PENDING", f"trigger={self._pending_trigger_id}")
+                        logger.info(f"⚠️ [DIAG] Response file exists on cancel for trigger {cancelled_trigger} — marking for next-call delivery (NOT consuming now to avoid data loss)")
+                        _log_event("CANCEL_RESPONSE_PENDING", f"trigger={cancelled_trigger}")
                     else:
-                        logger.info(f"🔒 [DIAG] PRESERVING pending trigger {self._pending_trigger_id} — no response file yet, popup is still alive")
+                        logger.info(f"🔒 [DIAG] PRESERVING pending trigger {cancelled_trigger} — no response file yet, popup is still alive")
                 raise
             except Exception as e:
                 logger.error(f"💥 Tool call error for {name}: {e}")
-                if self._pending_trigger_id:
-                    logger.warning(f"🧹 Clearing pending trigger {self._pending_trigger_id} due to exception")
-                    self._active_triggers.pop(self._pending_trigger_id, None)
-                    self._clear_trigger_state(responded=False)
+                error_trigger = _current_trigger_var.get(None) or self._pending_trigger_id
+                if error_trigger:
+                    logger.warning(f"🧹 Clearing trigger {error_trigger} due to exception")
+                    self._active_triggers.pop(error_trigger, None)
+                    if self._pending_trigger_id == error_trigger:
+                        self._clear_trigger_state(responded=False)
                 await asyncio.sleep(1.0)
                 return [TextContent(type="text", text=f"ERROR: Tool {name} failed: {str(e)}")]
 
@@ -404,6 +463,13 @@ class FeedbackGateServer:
                 self._last_files = []
 
             if user_input:
+                if file_content.startswith('{'):
+                    eh_pid = data.get("extension_host_pid")
+                    if eh_pid:
+                        self._last_response_eh_pid = int(eh_pid)
+                    ws = data.get("workspace_folders")
+                    if ws:
+                        self._last_response_workspace = ws
                 response_file.unlink(missing_ok=True)
                 return user_input
             return None
@@ -470,15 +536,16 @@ class FeedbackGateServer:
     )
 
     @classmethod
-    def _load_heartbeat_config(cls) -> tuple[str, str, int | None, int | None]:
-        """Read heartbeat mode, reply, optional wait_seconds, and optional stale_seconds from config file.
+    def _load_heartbeat_config(cls) -> tuple[str, str, int | None, int | None, int | None]:
+        """Read heartbeat mode, reply, optional wait_seconds, stale_seconds, and max_total_seconds from config file.
         Config file is re-read on every heartbeat so changes take effect
         without restarting the MCP server.
-        Returns (mode, reply, wait_seconds_override_or_None, stale_seconds_override_or_None)."""
+        Returns (mode, reply, wait_seconds_override_or_None, stale_seconds_override_or_None, max_total_seconds_override_or_None)."""
         mode = os.environ.get("FEEDBACK_GATE_HEARTBEAT_MODE", "waiting").lower()
         reply = os.environ.get("FEEDBACK_GATE_HEARTBEAT_REPLY", "当前时间")
         wait_override: int | None = None
         stale_override: int | None = None
+        max_total_override: int | None = None
         try:
             cfg_path = Path(cls._HEARTBEAT_CONFIG_PATH)
             if cfg_path.exists():
@@ -489,9 +556,11 @@ class FeedbackGateServer:
                     wait_override = int(cfg["wait_seconds"])
                 if "stale_seconds" in cfg:
                     stale_override = int(cfg["stale_seconds"])
+                if "max_total_seconds" in cfg:
+                    max_total_override = int(cfg["max_total_seconds"])
         except Exception as e:
             logger.debug(f"Failed to read heartbeat config: {e}")
-        return mode, reply, wait_override, stale_override
+        return mode, reply, wait_override, stale_override, max_total_override
 
     @staticmethod
     def _build_heartbeat_message(count: int, elapsed_min: float, session_id: str = "") -> str:
@@ -522,7 +591,7 @@ class FeedbackGateServer:
         - 'waiting' (default): [WAITING] + re-call instruction
         - 'user_response': fake User Response to keep a normal Agent cycle
         """
-        mode, reply, _, _ = self._load_heartbeat_config()
+        mode, reply, _, _, _ = self._load_heartbeat_config()
         if mode == "user_response":
             logger.info(f"💓 Heartbeat using user_response mode: '{reply}'")
             return f"User Response: {reply}{_FEEDBACK_REPLY_SUFFIX}"
@@ -535,6 +604,12 @@ class FeedbackGateServer:
         context = args.get("context", "")
         urgent = args.get("urgent", False)
         session_id = args.get("session_id", "").strip()
+        workspace_path = args.get("workspace_path", "").strip()
+
+        # Store workspace from tool call for precise multi-window routing.
+        if session_id and workspace_path:
+            self._session_to_workspace[session_id] = workspace_path
+            logger.info(f"📍 Workspace from tool call: session={session_id[:8]}... ws={workspace_path}")
         
         self._last_attachments = []
         self._last_files = []
@@ -570,10 +645,27 @@ class FeedbackGateServer:
             elif len(self._active_triggers) > 1:
                 logger.warning(f"⚠️ Multiple active triggers ({len(self._active_triggers)}) without session_id — cannot safely match, creating new trigger")
         
+        # Evict ALL other triggers for the same session_id when entering.
+        # This prevents a stale trigger's heartbeat re-enter from interfering
+        # with a newer trigger created for the same session (the bug where
+        # trigger A times out, Agent re-calls creating trigger B, but trigger A's
+        # heartbeat re-enter races and corrupts shared state).
+        if session_id and my_trigger_id:
+            same_session_stale = [
+                tid for tid, info in self._active_triggers.items()
+                if tid != my_trigger_id and info.get("session_id") == session_id
+            ]
+            for tid in same_session_stale:
+                logger.warning(f"🧹 Evicting same-session stale trigger {tid} (session={session_id}, keeping={my_trigger_id})")
+                _log_event("EVICT_SAME_SESSION", f"evicted={tid} kept={my_trigger_id} session={session_id}")
+                del self._active_triggers[tid]
+                if self._pending_trigger_id == tid:
+                    self._clear_trigger_state(responded=False)
+        
         # Clean up stale triggers (skip the one we just matched)
         stale_limit = self._STALE_TRIGGER_SECONDS_CLI if is_remote else self._STALE_TRIGGER_SECONDS_IDE
         if not is_remote:
-            _, _, _, stale_override = self._load_heartbeat_config()
+            _, _, _, stale_override, _ = self._load_heartbeat_config()
             if stale_override is not None:
                 stale_limit = stale_override
         stale_ids = [tid for tid, info in self._active_triggers.items()
@@ -605,12 +697,19 @@ class FeedbackGateServer:
                 self._clear_trigger_state(responded=False)
         
         if my_trigger_id:
+            _current_trigger_var.set(my_trigger_id)
             # Same conversation re-entering — check for ready response
             response_file = Path(get_temp_path(f"feedback_gate_response_{my_trigger_id}.json"))
             if response_file.exists():
+                self._last_response_eh_pid = None
+                self._last_response_workspace = None
                 ready_input = self._read_and_consume_response(response_file)
                 if ready_input:
                     _resp_sid = (my_trigger_info or {}).get("session_id", "") or session_id
+                    if _resp_sid and self._last_response_eh_pid:
+                        self._session_to_eh_pid[_resp_sid] = self._last_response_eh_pid
+                    if _resp_sid and self._last_response_workspace:
+                        self._session_to_workspace[_resp_sid] = self._last_response_workspace
                     del self._active_triggers[my_trigger_id]
                     if self._pending_trigger_id == my_trigger_id:
                         self._clear_trigger_state(responded=True)
@@ -625,10 +724,12 @@ class FeedbackGateServer:
             
             # Re-enter wait loop for this trigger
             wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-            _, _, wait_override, _ = self._load_heartbeat_config()
+            _, _, wait_override, _, max_total_override = self._load_heartbeat_config()
             if wait_override is not None and not is_remote:
                 wait_secs = wait_override
             max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
+            if max_total_override is not None and not is_remote:
+                max_secs = max_total_override
             label = "CLI" if is_remote else "IDE"
             
             hb_count = my_trigger_info.get("heartbeat_count", 0)
@@ -648,8 +749,15 @@ class FeedbackGateServer:
                 raise
             
             if user_input:
+                if my_trigger_id not in self._active_triggers:
+                    logger.warning(f"⚠️ RE-ENTER trigger {my_trigger_id} was evicted during wait, but got input — delivering anyway")
+                else:
+                    del self._active_triggers[my_trigger_id]
                 _resp_sid = (my_trigger_info or {}).get("session_id", "") or session_id
-                del self._active_triggers[my_trigger_id]
+                if _resp_sid and self._last_response_eh_pid:
+                    self._session_to_eh_pid[_resp_sid] = self._last_response_eh_pid
+                if _resp_sid and self._last_response_workspace:
+                    self._session_to_workspace[_resp_sid] = self._last_response_workspace
                 if self._pending_trigger_id == my_trigger_id:
                     self._clear_trigger_state(responded=True)
                 else:
@@ -662,6 +770,14 @@ class FeedbackGateServer:
                 self._append_media_to_response(result)
                 return result
             else:
+                # Trigger was evicted (replaced by a newer trigger for same session)
+                # — silently exit so we don't send a stale heartbeat that competes
+                # with the new trigger's response.
+                if my_trigger_id not in self._active_triggers:
+                    logger.info(f"🚫 RE-ENTER trigger {my_trigger_id} was evicted — suppressing heartbeat to avoid interfering with newer trigger")
+                    _log_event("HEARTBEAT_SUPPRESSED", f"trigger={my_trigger_id} reason=evicted")
+                    return [TextContent(type="text", text=f"SKIP: This feedback request ({my_trigger_id[:20]}...) has been superseded by a newer request. Do NOT re-call — the newer request is already active.")]
+                
                 hb_count += 1
                 my_trigger_info["heartbeat_count"] = hb_count
                 elapsed_total = hb_count * wait_secs
@@ -723,12 +839,30 @@ class FeedbackGateServer:
             "urgent": urgent,
             "trigger_id": trigger_id,
             "session_id": session_id,
+            "workspace_path": workspace_path,
             "timestamp": datetime.now().isoformat(),
             "immediate_activation": True
         })
         
         if success:
+            # Evict any existing triggers for the same session before registering
+            # the new one. This is the second defense line (the first is at the top
+            # of _handle_feedback_gate_chat) — needed because the code path to here
+            # skips the session-match block above (my_trigger_id was None).
+            if session_id:
+                old_session_triggers = [
+                    tid for tid, info in self._active_triggers.items()
+                    if info.get("session_id") == session_id
+                ]
+                for tid in old_session_triggers:
+                    logger.warning(f"🧹 Evicting old trigger {tid} before registering new trigger {trigger_id} (session={session_id})")
+                    _log_event("EVICT_ON_NEW_TRIGGER", f"evicted={tid} new={trigger_id} session={session_id}")
+                    del self._active_triggers[tid]
+                    if self._pending_trigger_id == tid:
+                        self._clear_trigger_state(responded=False)
+            
             # Register in both legacy state and new per-trigger tracking
+            _current_trigger_var.set(trigger_id)
             self._pending_trigger_id = trigger_id
             self._pending_trigger_created_at = time.time()
             self._pending_trigger_message = message
@@ -743,13 +877,14 @@ class FeedbackGateServer:
             _log_event("NEW_TRIGGER", f"trigger={trigger_id} active={len(self._active_triggers)} msg={message[:60]}")
             
             # Quick check: is the extension alive?
-            # The extension polls every 250ms and deletes trigger files immediately.
-            # We only check the PID-namespaced file since that's what we actually write.
+            # Check the per-trigger file first (concurrency-safe), fall back to PID file.
+            my_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_fg_{trigger_id}.json")) if trigger_id else None
             pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
+            check_file = my_trigger_file or pid_trigger_file
             extension_alive = False
             for _ in range(10):
                 await asyncio.sleep(0.5)
-                if not pid_trigger_file.exists():
+                if not check_file.exists():
                     extension_alive = True
                     break
             
@@ -758,6 +893,8 @@ class FeedbackGateServer:
                 self._active_triggers.pop(trigger_id, None)
                 self._clear_trigger_state(responded=False)
                 try:
+                    if my_trigger_file:
+                        my_trigger_file.unlink(missing_ok=True)
                     pid_trigger_file.unlink(missing_ok=True)
                     Path(get_temp_path("feedback_gate_trigger.json")).unlink(missing_ok=True)
                 except Exception:
@@ -771,13 +908,17 @@ class FeedbackGateServer:
                 logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
             wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-            _, _, wait_override, _ = self._load_heartbeat_config()
+            _, _, wait_override, _, max_total_override = self._load_heartbeat_config()
             if wait_override is not None and not is_remote:
                 wait_secs = wait_override
             max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
+            if max_total_override is not None and not is_remote:
+                max_secs = max_total_override
             label = "CLI" if is_remote else "IDE"
             logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
             
+            self._last_response_eh_pid = None
+            self._last_response_workspace = None
             local_wait_task = asyncio.ensure_future(
                 self._wait_for_user_input(trigger_id, timeout=wait_secs)
             )
@@ -793,6 +934,10 @@ class FeedbackGateServer:
             
             if user_input:
                 self._active_triggers.pop(trigger_id, None)
+                if session_id and self._last_response_eh_pid:
+                    self._session_to_eh_pid[session_id] = self._last_response_eh_pid
+                if session_id and self._last_response_workspace:
+                    self._session_to_workspace[session_id] = self._last_response_workspace
                 if self._pending_trigger_id == trigger_id:
                     self._clear_trigger_state(responded=True)
                 else:
@@ -1159,18 +1304,20 @@ class FeedbackGateServer:
         return None
 
     async def _trigger_cursor_popup_immediately(self, data: dict) -> bool:
-        """Create trigger file for Cursor extension with immediate activation and instance isolation"""
+        """Create trigger file for Cursor extension with immediate activation and instance isolation.
+        
+        Uses per-trigger unique filenames (feedback_gate_trigger_fg_{trigger_id}.json) so that
+        concurrent conversations from the same MCP process don't overwrite each other's triggers.
+        Also writes the PID-namespaced and legacy files for backward compatibility / alive detection.
+        """
         try:
-            # PID-namespaced trigger file for multi-instance isolation.
-            # The extension polls for feedback_gate_trigger_pid*.json — only this
-            # and the legacy file are consumed; per-trigger files would become orphans.
-            trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
+            trigger_id = data.get("trigger_id", "")
+            # Primary: per-trigger unique file — safe for concurrent conversations
+            per_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_fg_{trigger_id}.json")) if trigger_id else None
+            # Backward compat: PID-namespaced + legacy (may be overwritten by concurrent calls)
+            pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
             legacy_trigger_file = Path(get_temp_path("feedback_gate_trigger.json"))
             
-            # Build routing info: try env vars first, then fall back to routing file.
-            # cursor-remote-control writes a session-specific routing file
-            # (feedback_gate_routing_{session}.json) so that IDE MCP instances don't
-            # accidentally pick up remote-control routing via the generic filename.
             routing = {}
             fg_chat_id = os.environ.get("FEEDBACK_GATE_CHAT_ID", "")
             fg_platform = os.environ.get("FEEDBACK_GATE_PLATFORM", "")
@@ -1193,6 +1340,18 @@ class FeedbackGateServer:
             if fg_session:
                 routing["session"] = fg_session
             
+            # Resolve target window from session history.
+            # IMPORTANT: WORKSPACE_FOLDER_PATHS env var reflects the window that
+            # LAUNCHED the MCP process, NOT the window whose agent is currently
+            # calling this tool.  Writing it into the trigger misleads the
+            # extension into routing to the wrong window.  Only write workspace
+            # info learned from a previous response (session-specific, precise).
+            _sid = data.get("session_id", "")
+            _target_eh_pid = self._session_to_eh_pid.get(_sid) if _sid else None
+            _target_workspace = self._session_to_workspace.get(_sid) if _sid else None
+            if not _target_workspace:
+                _target_workspace = (data.get("workspace_path") or "").strip()
+            
             trigger_data = {
                 "timestamp": datetime.now().isoformat(),
                 "system": "feedback-gate",
@@ -1200,6 +1359,9 @@ class FeedbackGateServer:
                 "data": data,
                 "pid": self._server_pid,
                 "ppid": os.getppid(),
+                "ancestor_pids": self._get_ancestor_pids(self._server_pid),
+                "target_extension_host_pid": _target_eh_pid,
+                "workspace_folders": _target_workspace or "",
                 "active_window": True,
                 "mcp_integration": True,
                 "immediate_activation": True,
@@ -1207,18 +1369,20 @@ class FeedbackGateServer:
             if routing:
                 trigger_data["routing"] = routing
             
-            trigger_id = data.get("trigger_id", "")
             logger.info(f"🎯 CREATING trigger files (PID: {self._server_pid}, trigger_id: {trigger_id})")
             
             trigger_json = json.dumps(trigger_data, indent=2)
             file_size = len(trigger_json.encode('utf-8'))
             
-            for target in (trigger_file, legacy_trigger_file):
+            targets = [pid_trigger_file, legacy_trigger_file]
+            if per_trigger_file:
+                targets.insert(0, per_trigger_file)
+            for target in targets:
                 tmp = target.with_suffix('.json.tmp')
                 tmp.write_text(trigger_json)
                 tmp.replace(target)
             
-            logger.info(f"🔥 Trigger created: {trigger_file} ({file_size} bytes)")
+            logger.info(f"🔥 Trigger created: {per_trigger_file or pid_trigger_file} ({file_size} bytes)")
             
             await asyncio.sleep(0.05)
             
@@ -1228,8 +1392,7 @@ class FeedbackGateServer:
             logger.error(f"❌ CRITICAL: Failed to create Feedback Gate trigger: {e}")
             import traceback
             logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
-            # Wait before returning failure
-            await asyncio.sleep(1.0)  # Wait 1 second before confirming failure
+            await asyncio.sleep(1.0)
             return False
 
     async def run(self):
@@ -1318,13 +1481,16 @@ class FeedbackGateServer:
         # Cleanup operations before shutdown
         logger.info("🧹 Performing cleanup operations before shutdown...")
         
-        # Clean up any temporary files (both PID-namespaced and legacy)
+        # Clean up any temporary files (PID-namespaced, per-trigger, and legacy)
         try:
             temp_files = [
                 get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"),
                 get_temp_path(f"feedback_gate_mcp_{self._server_pid}.pid"),
                 get_temp_path("feedback_gate_trigger.json"),
             ]
+            # Also clean per-trigger files for active triggers
+            for tid in list(self._active_triggers.keys()):
+                temp_files.append(get_temp_path(f"feedback_gate_trigger_fg_{tid}.json"))
             for temp_file in temp_files:
                 if Path(temp_file).exists():
                     Path(temp_file).unlink()

@@ -97,11 +97,11 @@ fi
 
 source "$INSTALL_DIR/venv/bin/activate"
 
-pip install --upgrade pip -q 2>/dev/null
+pip install --no-user --upgrade pip -q 2>/dev/null
 
 log "安装 Python 依赖（首次安装需下载约 30MB）..."
 PIP_LOG=$(mktemp)
-if ! pip install -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
+if ! pip install --no-user -q "mcp>=1.9.2" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
     cat "$PIP_LOG"
     err "Python 依赖安装失败"
     echo ""

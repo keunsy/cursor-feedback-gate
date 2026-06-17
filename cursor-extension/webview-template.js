@@ -913,7 +913,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             }
         }
         
-        function addMessage(text, type = 'user', toolData = null, plain = false, _unused = false, attachments = [], files = []) {
+        function addMessage(text, type = 'user', toolData = null, plain = false, _unused = false, attachments = [], files = [], timestamp = null) {
             messageCount++;
             const messageDiv = document.createElement('div');
             messageDiv.className = \`message \${type}\${plain ? ' plain' : ''}\`;
@@ -958,7 +958,8 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             if (!plain) {
                 const timeDiv = document.createElement('div');
                 timeDiv.className = 'message-time';
-                timeDiv.textContent = new Date().toLocaleTimeString();
+                const displayTime = timestamp ? new Date(timestamp) : new Date();
+                timeDiv.textContent = displayTime.toLocaleTimeString();
                 messageDiv.appendChild(timeDiv);
             }
             
@@ -1374,10 +1375,10 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
             switch (message.command) {
                 case 'addMessage':
-                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files);
+                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files, message.timestamp || null);
                     break;
                 case 'newMessage':
-                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files);
+                    addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files, message.timestamp || null);
                     if (message.mcpIntegration) {
                         mcpIntegration = true;
                         messageInput.placeholder = 'Cursor 正在等待你的回复…';
@@ -1613,7 +1614,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             messageCount = 0;
             if (messages && messages.length > 0) {
                 messages.forEach(msg => {
-                    addMessage(msg.text, msg.type || 'system', null, msg.plain || false, false, msg.attachments, msg.files);
+                    addMessage(msg.text, msg.type || 'system', null, msg.plain || false, false, msg.attachments, msg.files, msg.timestamp || null);
                 });
             }
             messageInput.value = draft || '';
@@ -1625,16 +1626,33 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         // Initialize
         vscode.postMessage({ command: 'ready' });
         
-        // Focus input immediately
-        setTimeout(() => {
-            messageInput.focus();
-        }, 100);
+        // Focus input immediately + retry for slow webview init in new windows
+        setTimeout(() => { messageInput.focus(); }, 100);
+        setTimeout(() => { if (!messageInput.disabled) messageInput.focus(); }, 500);
+        setTimeout(() => { if (!messageInput.disabled) messageInput.focus(); }, 1500);
 
         // Auto-focus input when webview regains focus (fixes Cmd+V not working
         // after switching back from editor or other apps)
         window.addEventListener('focus', () => {
             if (!messageInput.disabled) {
                 messageInput.focus();
+            }
+        });
+
+        // Also handle click anywhere in the webview body to focus the input
+        document.body.addEventListener('click', (e) => {
+            if (e.target === document.body || e.target === messagesContainer ||
+                e.target.classList.contains('chat-container')) {
+                if (!messageInput.disabled) {
+                    messageInput.focus();
+                }
+            }
+        });
+
+        // Visibility change handler: when the tab/panel becomes visible again
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && !messageInput.disabled) {
+                setTimeout(() => messageInput.focus(), 50);
             }
         });
     </script>

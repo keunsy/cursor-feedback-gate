@@ -80,10 +80,25 @@ function migrateSessionKey(fromKey, toKey) {
     if (changed) saveQueue();
 }
 
+function migrateOrphanSessionKeys(validKeys) {
+    let changed = false;
+    messageQueue.forEach(m => {
+        if (m.sessionKey && !validKeys.has(m.sessionKey)) {
+            m._prevSessionKey = m.sessionKey;
+            m.sessionKey = '';
+            changed = true;
+        }
+    });
+    if (changed) {
+        saveQueue();
+        console.log('Feedback Gate queue: migrated orphan items to untagged');
+    }
+}
+
 function syncToWebview(sessionKey) {
     if (_postToWebview) {
         const filterKey = sessionKey !== undefined ? sessionKey : _activeSessionKey;
-        let items = messageQueue.filter(m => m.status === 'pending' || m.status === 'processing');
+        let items = messageQueue.filter(m => (m.status === 'pending' || m.status === 'processing') && !m._displayed);
         if (filterKey) {
             items = items.filter(m => m.sessionKey === filterKey);
         } else {
@@ -284,4 +299,5 @@ module.exports = {
     syncToWebview,
     setActiveSessionKey,
     migrateSessionKey,
+    migrateOrphanSessionKeys,
 };
