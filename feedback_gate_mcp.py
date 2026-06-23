@@ -901,9 +901,16 @@ class FeedbackGateServer:
                     pass
                 return [TextContent(type="text", text="SKIP: Feedback Gate extension is not active (no GUI detected). Continuing without user feedback.")]
             
-            ack_received = await self._wait_for_extension_acknowledgement(trigger_id, timeout=15)
-            if ack_received:
-                logger.info("📨 Extension acknowledged popup activation")
+            ack_data = await self._wait_for_extension_acknowledgement(trigger_id, timeout=15)
+            if ack_data:
+                # Learn which window claimed this trigger for future routing.
+                ack_eh_pid = ack_data.get("extension_host_pid")
+                ack_ws = ack_data.get("workspace_folders", "")
+                if session_id and ack_eh_pid:
+                    self._session_to_eh_pid[session_id] = int(ack_eh_pid)
+                if session_id and ack_ws:
+                    self._session_to_workspace[session_id] = ack_ws
+                logger.info(f"📨 Extension acknowledged (eh_pid={ack_eh_pid}, ws={ack_ws})")
             else:
                 logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
@@ -1232,14 +1239,15 @@ class FeedbackGateServer:
         logger.info("🏁 shutdown_mcp processing complete")
         return [TextContent(type="text", text=response)]
 
-    async def _wait_for_extension_acknowledgement(self, trigger_id: str, timeout: int = 30) -> bool:
-        """Wait for extension acknowledgement that popup was activated"""
+    async def _wait_for_extension_acknowledgement(self, trigger_id: str, timeout: int = 30) -> dict | None:
+        """Wait for extension acknowledgement that popup was activated.
+        Returns the ack data dict on success, None on timeout."""
         ack_file = Path(get_temp_path(f"feedback_gate_ack_{trigger_id}.json"))
         
         logger.info(f"🔍 Monitoring for extension acknowledgement: {ack_file}")
         
         start_time = time.time()
-        check_interval = 0.1  # Check every 100ms for fast response
+        check_interval = 0.1
         
         while time.time() - start_time < timeout:
             try:
@@ -1247,18 +1255,15 @@ class FeedbackGateServer:
                     data = json.loads(ack_file.read_text())
                     ack_status = data.get("acknowledged", False)
                     
-                    # Clean up acknowledgement file immediately
                     try:
                         ack_file.unlink()
-                        logger.info(f"🧹 Acknowledgement file cleaned up")
                     except Exception:
                         pass
                     
                     if ack_status:
                         logger.info(f"📨 EXTENSION ACKNOWLEDGED popup activation for trigger {trigger_id}")
-                        return True
+                        return data
                     
-                # Check frequently for faster response
                 await asyncio.sleep(check_interval)
                 
             except Exception as e:
@@ -1266,7 +1271,7 @@ class FeedbackGateServer:
                 await asyncio.sleep(0.5)
         
         logger.warning(f"⏰ TIMEOUT waiting for extension acknowledgement (trigger_id: {trigger_id})")
-        return False
+        return None
 
     async def _wait_for_user_input(self, trigger_id: str, timeout: int = 3300) -> Optional[str]:
         """Wait for user input — only check the trigger-ID-specific response file.
@@ -1340,17 +1345,21 @@ class FeedbackGateServer:
             if fg_session:
                 routing["session"] = fg_session
             
-            # Resolve target window from session history.
-            # IMPORTANT: WORKSPACE_FOLDER_PATHS env var reflects the window that
-            # LAUNCHED the MCP process, NOT the window whose agent is currently
-            # calling this tool.  Writing it into the trigger misleads the
-            # extension into routing to the wrong window.  Only write workspace
-            # info learned from a previous response (session-specific, precise).
+            # Resolve target window for routing.
+            # Priority: tool-call workspace_path > session cache > nothing.
+            # The tool-call workspace_path is always the most accurate because
+            # it comes from the agent's current window, while the session cache
+            # may be stale (e.g. agent switched windows or session_id was reused).
             _sid = data.get("session_id", "")
+            _call_workspace = (data.get("workspace_path") or "").strip()
+            _cached_workspace = self._session_to_workspace.get(_sid) if _sid else None
+            _target_workspace = _call_workspace or _cached_workspace or ""
             _target_eh_pid = self._session_to_eh_pid.get(_sid) if _sid else None
-            _target_workspace = self._session_to_workspace.get(_sid) if _sid else None
-            if not _target_workspace:
-                _target_workspace = (data.get("workspace_path") or "").strip()
+            # If workspace changed from what was cached, the cached eh_pid may
+            # point to the wrong window — clear it to avoid mis-routing.
+            if _target_eh_pid and _call_workspace and _cached_workspace and _call_workspace != _cached_workspace:
+                logger.info(f"🔄 Workspace changed for session {_sid[:8]}...: {_cached_workspace} → {_call_workspace}, clearing cached eh_pid {_target_eh_pid}")
+                _target_eh_pid = None
             
             trigger_data = {
                 "timestamp": datetime.now().isoformat(),
@@ -1369,7 +1378,7 @@ class FeedbackGateServer:
             if routing:
                 trigger_data["routing"] = routing
             
-            logger.info(f"🎯 CREATING trigger files (PID: {self._server_pid}, trigger_id: {trigger_id})")
+            logger.info(f"🎯 CREATING trigger (id={trigger_id}, ws={_target_workspace or 'none'}, eh_pid={_target_eh_pid or 'none'}, call_ws={_call_workspace or 'none'}, cached_ws={_cached_workspace or 'none'})")
             
             trigger_json = json.dumps(trigger_data, indent=2)
             file_size = len(trigger_json.encode('utf-8'))

@@ -1794,8 +1794,14 @@ function checkTriggerFile(context, filePath) {
                             break;
                         }
                     }
-                    if (weOwnSession) {
-                        // We own this session — proceed to atomic claim below.
+                    const myWsPaths = myWorkspaces.join(',');
+                    console.log(`Feedback Gate: ROUTE sid=${triggerSessionId.slice(0,8)}... own=${weOwnSession} wsPrecise=${wsPrecise} wsMatch=${wsMatch} triggerWs=${triggerWorkspace} myWs=${myWsPaths} ehPid=${targetEhPid || 'none'}`);
+                    if (weOwnSession && wsPrecise && !wsMatch) {
+                        console.log(`Feedback Gate: YIELD — own session but workspace mismatch, letting correct window claim`);
+                        return;
+                    } else if (weOwnSession) {
+                        // We own this session and workspace matches (or no hint)
+                        // — proceed to atomic claim below.
                     } else if (wsPrecise && !wsMatch) {
                         return;
                     } else if (wsPrecise && wsMatch) {
@@ -2285,7 +2291,9 @@ function sendExtensionAcknowledgement(triggerId, toolType) {
             trigger_id: triggerId,
             tool_type: toolType,
             extension: 'feedback-gate',
-            popup_activated: true
+            popup_activated: true,
+            extension_host_pid: process.pid,
+            workspace_folders: _getMyWorkspacePaths().join(','),
         };
         
         const ackFile = getTempPath(`feedback_gate_ack_${triggerId}.json`);
