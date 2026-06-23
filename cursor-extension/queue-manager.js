@@ -147,7 +147,7 @@ function enqueueMessage(text, attachments, files, meta) {
     };
     messageQueue.push(item);
     saveQueue();
-    syncToWebview();
+    syncToWebview(item.sessionKey);
     return item;
 }
 
@@ -251,7 +251,7 @@ function editQueueItem(id, newText) {
     if (item) {
         item.text = newText;
         saveQueue();
-        syncToWebview();
+        syncToWebview(item.sessionKey);
     }
 }
 

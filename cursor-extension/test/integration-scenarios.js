@@ -87,17 +87,18 @@ function createRoutingHarness() {
             for (const s of sessions.values()) {
                 if (s.sessionId === triggerSessionId) { weOwnSession = true; break; }
             }
+
+            // Signal 2: workspace path matching
+            const wsPrecise = !!(triggerWorkspace && workspacePath);
+            const wsMatch = wsPrecise && triggerWorkspace === workspacePath;
+
+            if (weOwnSession && wsPrecise && !wsMatch) {
+                return { claimed: false, reason: 'workspace mismatch overrides session ownership' };
+            }
             if (weOwnSession) {
                 claimedTriggers.push(triggerData);
                 return { claimed: true, reason: 'session ownership' };
             }
-        }
-
-        // Signal 2: workspace path matching
-        const wsPrecise = !!(triggerWorkspace && workspacePath);
-        const wsMatch = wsPrecise && triggerWorkspace === workspacePath;
-
-        if (triggerSessionId) {
             if (wsPrecise && !wsMatch) {
                 return { claimed: false, reason: 'workspace mismatch' };
             }
@@ -113,10 +114,12 @@ function createRoutingHarness() {
         }
 
         // No session_id — use workspace + focus
-        if (wsPrecise && !wsMatch) {
+        const wsPreciseNoSid = !!(triggerWorkspace && workspacePath);
+        const wsMatchNoSid = wsPreciseNoSid && triggerWorkspace === workspacePath;
+        if (wsPreciseNoSid && !wsMatchNoSid) {
             return { claimed: false, reason: 'workspace mismatch (no sessionId)' };
         }
-        if (wsPrecise && wsMatch) {
+        if (wsPreciseNoSid && wsMatchNoSid) {
             claimedTriggers.push(triggerData);
             return { claimed: true, reason: 'workspace match (no sessionId)' };
         }
@@ -152,11 +155,33 @@ scenario('TR-2: workspace mismatch rejects trigger', () => {
     assert.strictEqual(result.reason, 'workspace mismatch');
 });
 
-scenario('TR-3: session ownership takes priority over workspace', () => {
+scenario('TR-3: session ownership yields when workspace hint mismatches', () => {
     const h = createRoutingHarness();
     h.createSession(9999, 'uuid-1');
     const result = h.routeTrigger(
         { data: { session_id: 'uuid-1', workspace_path: '/projects/other' } },
+        { workspacePath: '/projects/mine', isFocused: false }
+    );
+    assert.strictEqual(result.claimed, false);
+    assert.strictEqual(result.reason, 'workspace mismatch overrides session ownership');
+});
+
+scenario('TR-3b: session ownership claims when workspace matches', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-1');
+    const result = h.routeTrigger(
+        { data: { session_id: 'uuid-1', workspace_path: '/projects/mine' } },
+        { workspacePath: '/projects/mine', isFocused: false }
+    );
+    assert.strictEqual(result.claimed, true);
+    assert.strictEqual(result.reason, 'session ownership');
+});
+
+scenario('TR-3c: session ownership claims when no workspace hint', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-1');
+    const result = h.routeTrigger(
+        { data: { session_id: 'uuid-1' } },
         { workspacePath: '/projects/mine', isFocused: false }
     );
     assert.strictEqual(result.claimed, true);
@@ -1115,6 +1140,125 @@ scenario('E2E-12: MCP PID change → session rebound, history preserved', () => 
     assert.strictEqual(s.mcpPid, 2222);
     assert.strictEqual(s.messages.length, 4);
     assert.strictEqual(h.responseFiles.length, 2);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 9: syncToWebview sessionKey filtering (Issue #3)
+// ═══════════════════════════════════════════════════════════════
+
+function createSyncFilterHarness() {
+    let messageQueue = [];
+    let _activeSessionKey = '';
+    let _idCounter = 0;
+    let lastSyncedItems = null;
+
+    function postToWebview(msg) {
+        if (msg.command === 'syncQueue') {
+            lastSyncedItems = msg.items;
+        }
+    }
+
+    function syncToWebview(sessionKey) {
+        const filterKey = sessionKey !== undefined ? sessionKey : _activeSessionKey;
+        let items = messageQueue.filter(m => (m.status === 'pending' || m.status === 'processing') && !m._displayed);
+        if (filterKey) {
+            items = items.filter(m => m.sessionKey === filterKey);
+        } else {
+            items = items.filter(m => !m.sessionKey);
+        }
+        postToWebview({ command: 'syncQueue', items, pendingCount: items.filter(m => m.status === 'pending').length });
+    }
+
+    function enqueueMessage(text, meta) {
+        const item = {
+            id: ++_idCounter,
+            text,
+            status: 'pending',
+            sessionKey: (meta?.sessionKey != null ? meta.sessionKey : _activeSessionKey) || '',
+        };
+        messageQueue.push(item);
+        syncToWebview(item.sessionKey);
+        return item;
+    }
+
+    function editQueueItem(id, newText) {
+        const item = messageQueue.find(m => m.id === id && m.status === 'pending');
+        if (item) {
+            item.text = newText;
+            syncToWebview(item.sessionKey);
+        }
+    }
+
+    function enqueueMessageBroken(text, meta) {
+        const item = {
+            id: ++_idCounter,
+            text,
+            status: 'pending',
+            sessionKey: (meta?.sessionKey != null ? meta.sessionKey : _activeSessionKey) || '',
+        };
+        messageQueue.push(item);
+        syncToWebview(); // BUG: no sessionKey passed
+        return item;
+    }
+
+    return {
+        enqueueMessage, enqueueMessageBroken, editQueueItem, syncToWebview,
+        setActiveSessionKey: (k) => { _activeSessionKey = k; },
+        getLastSynced: () => lastSyncedItems,
+        get queue() { return messageQueue; },
+    };
+}
+
+scenario('SF-1: enqueue with sessionKey → synced items include the new message', () => {
+    const h = createSyncFilterHarness();
+    h.enqueueMessage('hello', { sessionKey: 'sess_1' });
+    const synced = h.getLastSynced();
+    assert.strictEqual(synced.length, 1);
+    assert.strictEqual(synced[0].text, 'hello');
+    assert.strictEqual(synced[0].sessionKey, 'sess_1');
+});
+
+scenario('SF-2: old broken enqueue (no sessionKey arg) → message filtered out when _activeSessionKey empty', () => {
+    const h = createSyncFilterHarness();
+    h.enqueueMessageBroken('invisible', { sessionKey: 'sess_1' });
+    const synced = h.getLastSynced();
+    assert.strictEqual(synced.length, 0, 'broken enqueue should filter out message');
+});
+
+scenario('SF-3: enqueue multiple messages → all visible for same session', () => {
+    const h = createSyncFilterHarness();
+    h.enqueueMessage('msg1', { sessionKey: 'sess_1' });
+    h.enqueueMessage('msg2', { sessionKey: 'sess_1' });
+    h.enqueueMessage('msg3', { sessionKey: 'sess_1' });
+    const synced = h.getLastSynced();
+    assert.strictEqual(synced.length, 3);
+});
+
+scenario('SF-4: enqueue for different sessions → only matching session items synced', () => {
+    const h = createSyncFilterHarness();
+    h.enqueueMessage('for-s1', { sessionKey: 'sess_1' });
+    h.enqueueMessage('for-s2', { sessionKey: 'sess_2' });
+    const synced = h.getLastSynced();
+    assert.strictEqual(synced.length, 1);
+    assert.strictEqual(synced[0].sessionKey, 'sess_2');
+});
+
+scenario('SF-5: editQueueItem → UI refreshes with correct session filter', () => {
+    const h = createSyncFilterHarness();
+    const item = h.enqueueMessage('original', { sessionKey: 'sess_1' });
+    h.editQueueItem(item.id, 'edited');
+    const synced = h.getLastSynced();
+    assert.strictEqual(synced.length, 1);
+    assert.strictEqual(synced[0].text, 'edited');
+});
+
+scenario('SF-6: enqueue without meta.sessionKey falls back to _activeSessionKey', () => {
+    const h = createSyncFilterHarness();
+    h.setActiveSessionKey('active_sess');
+    h.enqueueMessage('fallback msg', {});
+    const synced = h.getLastSynced();
+    assert.strictEqual(synced.length, 1);
+    assert.strictEqual(synced[0].sessionKey, 'active_sess');
 });
 
 // ═══════════════════════════════════════════════════════════════

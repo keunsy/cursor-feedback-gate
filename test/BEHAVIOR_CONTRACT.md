@@ -41,7 +41,7 @@
 |---|------|----------|----------|
 | R1 | Workspace 精确匹配 | 即使不聚焦也能 claim trigger | TR-1 |
 | R2 | Workspace 不匹配 | 拒绝 claim | TR-2 |
-| R3 | Session ownership | 优先级最高，无视 workspace | TR-3 |
+| R3 | Session ownership | 优先级最高，**但当有精确 workspace 且不匹配时让出** | TR-3 |
 | R4 | 无 workspace hint + 无 session owner | 只有聚焦窗口 claim | TR-4, TR-5 |
 | R5 | targetEhPid 不匹配 | 立即拒绝 | TR-6 |
 
@@ -88,13 +88,24 @@
 | M8 | 多 session 互不影响 | 不同 session 的 trigger 可并存 | MC-1, MC-2 |
 | M9 | _active_triggers 上限 (20) | 超限时驱逐最旧的 trigger | EV-3 |
 
-## 9. MCP 状态检测
+## 9. Queue UI 同步
+
+| # | 场景 | 期望行为 | 验证测试 |
+|---|------|----------|----------|
+| SF1 | enqueueMessage 后 syncToWebview | 使用 item.sessionKey 过滤，新消息可见 | SF-1 |
+| SF2 | 多条同 session 消息入队 | 全部在 syncToWebview 输出中可见 | SF-3 |
+| SF3 | 不同 session 消息入队 | 仅最后入队的 session 消息在 sync 中可见 | SF-4 |
+| SF4 | editQueueItem 后 syncToWebview | 使用编辑项的 sessionKey 过滤，更新后内容可见 | SF-5 |
+| SF5 | enqueue 无 meta.sessionKey | 降级到 _activeSessionKey | SF-6 |
+
+## 10. MCP 状态检测
 
 | # | 场景 | 期望行为 | 验证测试 |
 |---|------|----------|----------|
 | MS1 | Log 文件 < 30s | mcpStatus = active | MS-1 |
 | MS2 | Log > 30s + 无活进程 | mcpStatus = inactive | MS-2 |
 | MS3 | Log > 30s + 有活进程 | mcpStatus = active | MS-3 |
+
 
 ---
 
