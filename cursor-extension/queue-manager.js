@@ -1,4 +1,5 @@
 const fs = require('fs');
+const path = require('path');
 const { getTempPath } = require('./utils');
 
 let messageQueue = [];
@@ -12,11 +13,85 @@ function init(vscode, postToWebviewFn) {
     _postToWebview = postToWebviewFn;
 }
 
-function getQueueFilePath() {
-    const workspaceId = _vscode && _vscode.workspace.workspaceFolders
+function _getWorkspaceId() {
+    return _vscode && _vscode.workspace.workspaceFolders
         ? _vscode.workspace.workspaceFolders[0].uri.fsPath.replace(/[^a-zA-Z0-9]/g, '_').slice(-40)
         : 'default';
-    return getTempPath(`feedback_gate_queue_${workspaceId}_pid${process.pid}.json`);
+}
+
+function getQueueFilePath() {
+    return getTempPath(`feedback_gate_queue_${_getWorkspaceId()}_pid${process.pid}.json`);
+}
+
+function _isProcessAlive(pid) {
+    if (!pid || pid <= 0) return false;
+    try { process.kill(pid, 0); return true; } catch (e) {
+        return e.code !== 'ESRCH';
+    }
+}
+
+function _extractQueueFilePid(filename) {
+    const match = filename.match(/_pid(\d+)\.json/);
+    return match ? Number(match[1]) : null;
+}
+
+function _migrateOldPidQueues() {
+    const workspaceId = _getWorkspaceId();
+    const prefix = `feedback_gate_queue_${workspaceId}_pid`;
+    const myFile = `${prefix}${process.pid}.json`;
+    const myClaimSuffix = `.migrating.${process.pid}`;
+    const tmpDir = getTempPath('');
+    let files;
+    try {
+        files = fs.readdirSync(tmpDir).filter(f => {
+            if (!f.startsWith(prefix) || f.endsWith('.tmp') || f === myFile) return false;
+            if (f.endsWith('.json')) return true;
+            return f.includes('.migrating.');
+        });
+    } catch { return; }
+
+    const claimedPaths = [];
+    for (const file of files) {
+        const filePath = path.join(tmpDir, file);
+        if (file.endsWith(myClaimSuffix)) {
+            claimedPaths.push(filePath);
+            continue;
+        }
+        const filePid = _extractQueueFilePid(file);
+        if (filePid != null && _isProcessAlive(filePid)) continue;
+        const claimPath = `${filePath}${myClaimSuffix}`;
+        try {
+            fs.renameSync(filePath, claimPath);
+            claimedPaths.push(claimPath);
+        } catch { /* another instance claimed it */ }
+    }
+
+    let migrated = 0;
+    for (const claimPath of claimedPaths) {
+        try {
+            const data = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
+            const items = (data.items || []).filter(m => m.status === 'pending' || m.status === 'processing');
+            for (const m of items) {
+                m.status = 'pending';
+                delete m.processingAt;
+                if (m.sessionKey) {
+                    m._prevSessionKey = m.sessionKey;
+                    m.sessionKey = '';
+                }
+                messageQueue.push(m);
+                migrated++;
+            }
+        } catch (e) {
+            console.log(`Feedback Gate queue: failed to migrate ${path.basename(claimPath)}: ${e.message}`);
+        }
+    }
+    if (migrated > 0) {
+        saveQueue();
+        console.log(`Feedback Gate queue: migrated ${migrated} item(s) from ${claimedPaths.length} old PID file(s)`);
+    }
+    for (const claimPath of claimedPaths) {
+        try { fs.unlinkSync(claimPath); } catch { /* best effort */ }
+    }
 }
 
 function loadQueue() {
@@ -32,9 +107,6 @@ function loadQueue() {
                     delete m.processingAt;
                     changed = true;
                 }
-                // On reload, stale sessionKeys would prevent messages from being
-                // consumed since no in-memory session can match them.  Clear them
-                // so the next trigger for this PID can pick them up.
                 if (m.sessionKey) {
                     m._prevSessionKey = m.sessionKey;
                     m.sessionKey = '';
@@ -52,6 +124,7 @@ function loadQueue() {
             messageQueue = [];
         }
     }
+    _migrateOldPidQueues();
 }
 
 function saveQueue() {
@@ -99,10 +172,14 @@ function syncToWebview(sessionKey) {
     if (_postToWebview) {
         const filterKey = sessionKey !== undefined ? sessionKey : _activeSessionKey;
         let items = messageQueue.filter(m => (m.status === 'pending' || m.status === 'processing') && !m._displayed);
+        const preFilterCount = items.length;
         if (filterKey) {
             items = items.filter(m => m.sessionKey === filterKey);
         } else {
             items = items.filter(m => !m.sessionKey);
+        }
+        if (preFilterCount > 0 && items.length === 0) {
+            console.log(`Feedback Gate queue: syncToWebview FILTERED OUT all ${preFilterCount} item(s) — filterKey="${filterKey}", _activeSessionKey="${_activeSessionKey}", queue sessionKeys: [${messageQueue.filter(m=>m.status==='pending'&&!m._displayed).map(m=>JSON.stringify(m.sessionKey)).join(',')}]`);
         }
         _postToWebview({
             command: 'syncQueue',
@@ -147,6 +224,7 @@ function enqueueMessage(text, attachments, files, meta) {
     };
     messageQueue.push(item);
     saveQueue();
+    console.log(`Feedback Gate queue: enqueued "${item.text?.slice(0,30)}" sessionKey="${item.sessionKey}", _activeSessionKey="${_activeSessionKey}", total=${messageQueue.length}`);
     syncToWebview(item.sessionKey);
     return item;
 }

@@ -93,7 +93,11 @@ function createRoutingHarness() {
             const wsMatch = wsPrecise && triggerWorkspace === workspacePath;
 
             if (weOwnSession && wsPrecise && !wsMatch) {
-                return { claimed: false, reason: 'workspace mismatch overrides session ownership' };
+                const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                if (triggerAgeMs < 3000) {
+                    return { claimed: false, reason: 'workspace mismatch overrides session ownership' };
+                }
+                return { claimed: true, reason: 'session owner reclaim after yield timeout' };
             }
             if (weOwnSession) {
                 claimedTriggers.push(triggerData);
@@ -106,11 +110,20 @@ function createRoutingHarness() {
                 claimedTriggers.push(triggerData);
                 return { claimed: true, reason: 'workspace match (new session)' };
             }
-            if (!isFocused) {
-                return { claimed: false, reason: 'not focused, no workspace hint' };
+            // No owner, no workspace hint.  Windows with existing sessions
+            // participate immediately; focused-but-empty windows defer; others skip.
+            const hasAnySessions = sessions.size > 0;
+            if (!hasAnySessions && !isFocused) {
+                return { claimed: false, reason: 'no sessions, not focused' };
+            }
+            if (!hasAnySessions) {
+                const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                if (triggerAgeMs < 1500) {
+                    return { claimed: false, reason: 'focused but empty window defers' };
+                }
             }
             claimedTriggers.push(triggerData);
-            return { claimed: true, reason: 'focused window claims' };
+            return { claimed: true, reason: hasAnySessions ? 'window with sessions races' : 'focused empty window claims after defer' };
         }
 
         // No session_id — use workspace + focus
@@ -155,15 +168,27 @@ scenario('TR-2: workspace mismatch rejects trigger', () => {
     assert.strictEqual(result.reason, 'workspace mismatch');
 });
 
-scenario('TR-3: session ownership yields when workspace hint mismatches', () => {
+scenario('TR-3: session ownership yields when workspace hint mismatches (fresh trigger)', () => {
     const h = createRoutingHarness();
     h.createSession(9999, 'uuid-1');
     const result = h.routeTrigger(
-        { data: { session_id: 'uuid-1', workspace_path: '/projects/other' } },
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-1', workspace_path: '/projects/other' } },
         { workspacePath: '/projects/mine', isFocused: false }
     );
     assert.strictEqual(result.claimed, false);
     assert.strictEqual(result.reason, 'workspace mismatch overrides session ownership');
+});
+
+scenario('TR-3c: session owner reclaims after yield grace period expires', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-1');
+    const staleTimestamp = new Date(Date.now() - 4000).toISOString();
+    const result = h.routeTrigger(
+        { timestamp: staleTimestamp, data: { session_id: 'uuid-1', workspace_path: '/projects/other' } },
+        { workspacePath: '/projects/mine', isFocused: false }
+    );
+    assert.strictEqual(result.claimed, true);
+    assert.strictEqual(result.reason, 'session owner reclaim after yield timeout');
 });
 
 scenario('TR-3b: session ownership claims when workspace matches', () => {
@@ -207,6 +232,48 @@ scenario('TR-5: no session_id + no workspace + not focused → rejected', () => 
     assert.strictEqual(result.claimed, false);
 });
 
+scenario('TR-7: new session_id, no owner, no ws — window with sessions races', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-old');
+    const result = h.routeTrigger(
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-new' } },
+        { workspacePath: '/projects/mine', isFocused: false }
+    );
+    assert.strictEqual(result.claimed, true);
+    assert.strictEqual(result.reason, 'window with sessions races');
+});
+
+scenario('TR-8: new session_id, no owner, no ws — empty focused window defers on fresh trigger', () => {
+    const h = createRoutingHarness();
+    const result = h.routeTrigger(
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-new' } },
+        { workspacePath: '/projects/mine', isFocused: true }
+    );
+    assert.strictEqual(result.claimed, false);
+    assert.strictEqual(result.reason, 'focused but empty window defers');
+});
+
+scenario('TR-9: new session_id, no owner, no ws — empty non-focused window rejected', () => {
+    const h = createRoutingHarness();
+    const result = h.routeTrigger(
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-new' } },
+        { workspacePath: '/projects/mine', isFocused: false }
+    );
+    assert.strictEqual(result.claimed, false);
+    assert.strictEqual(result.reason, 'no sessions, not focused');
+});
+
+scenario('TR-10: new session_id, no owner, no ws — empty focused window claims after defer timeout', () => {
+    const h = createRoutingHarness();
+    const staleTs = new Date(Date.now() - 2000).toISOString();
+    const result = h.routeTrigger(
+        { timestamp: staleTs, data: { session_id: 'uuid-new' } },
+        { workspacePath: '/projects/mine', isFocused: true }
+    );
+    assert.strictEqual(result.claimed, true);
+    assert.strictEqual(result.reason, 'focused empty window claims after defer');
+});
+
 scenario('TR-6: targetEhPid mismatch rejects immediately', () => {
     const h = createRoutingHarness();
     const result = h.routeTrigger(
@@ -226,14 +293,14 @@ scenario('TR-7: targetEhPid matches process.pid → continues routing', () => {
     assert.strictEqual(result.claimed, true);
 });
 
-scenario('TR-8: session_id present but no workspace hint + not focused → rejected', () => {
+scenario('TR-8b: session_id present but no workspace hint + not focused + no sessions → rejected', () => {
     const h = createRoutingHarness();
     const result = h.routeTrigger(
-        { data: { session_id: 'uuid-new' } },
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-new' } },
         { workspacePath: '/projects/foo', isFocused: false }
     );
     assert.strictEqual(result.claimed, false);
-    assert.strictEqual(result.reason, 'not focused, no workspace hint');
+    assert.strictEqual(result.reason, 'no sessions, not focused');
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -1260,6 +1327,115 @@ scenario('SF-6: enqueue without meta.sessionKey falls back to _activeSessionKey'
     assert.strictEqual(synced.length, 1);
     assert.strictEqual(synced[0].sessionKey, 'active_sess');
 });
+
+// ═══════════════════════════════════════════════════════════════
+// QM: Queue Migration across PIDs (unit-level, file-system tests)
+// ═══════════════════════════════════════════════════════════════
+
+const qmTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fg-qm-test-'));
+const qmWorkspaceSlug = 'rs_user_work_cursor_cursor_feedback_gate';
+
+function writeOldPidQueueFile(pid, items) {
+    const filePath = path.join(qmTmpDir, `feedback_gate_queue_${qmWorkspaceSlug}_pid${pid}.json`);
+    fs.writeFileSync(filePath, JSON.stringify({ items }));
+    return filePath;
+}
+
+function clearQmTmpDir() {
+    for (const f of fs.readdirSync(qmTmpDir)) {
+        try { fs.unlinkSync(path.join(qmTmpDir, f)); } catch {}
+    }
+}
+
+function freshQueueModule(fakePid) {
+    const modulePath = require.resolve('../queue-manager.js');
+    delete require.cache[modulePath];
+    const utilsPath = require.resolve('../utils.js');
+    const origGetTempPath = require(utilsPath).getTempPath;
+    require(utilsPath).getTempPath = (f) => path.join(qmTmpDir, f);
+
+    const origPid = process.pid;
+    Object.defineProperty(process, 'pid', { value: fakePid, writable: true, configurable: true });
+
+    const qm = require(modulePath);
+    const mockVscode = {
+        workspace: { workspaceFolders: [{ uri: { fsPath: `/Users/user/work/cursor/cursor-feedback-gate` } }] },
+    };
+    let lastSync = null;
+    qm.init(mockVscode, (msg) => { if (msg.command === 'syncQueue') lastSync = msg; });
+
+    function cleanup() {
+        Object.defineProperty(process, 'pid', { value: origPid, writable: true, configurable: true });
+        require(utilsPath).getTempPath = origGetTempPath;
+        delete require.cache[modulePath];
+    }
+    return { qm, lastSync: () => lastSync, cleanup };
+}
+
+scenario('QM-1: loadQueue migrates pending messages from old PID files', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(99990, [
+        { id: 1, text: 'old msg 1', status: 'pending', sessionKey: 'old_sess', timestamp: new Date().toISOString() },
+        { id: 2, text: 'old msg 2', status: 'pending', sessionKey: '', timestamp: new Date().toISOString() },
+    ]);
+    const { qm, cleanup } = freshQueueModule(99991);
+    try {
+        qm.loadQueue();
+        const count = qm.getPendingQueueCount('');
+        assert.strictEqual(count, 2, 'both messages migrated with cleared sessionKey');
+        const oldFile = path.join(qmTmpDir, `feedback_gate_queue_${qmWorkspaceSlug}_pid99990.json`);
+        assert.ok(!fs.existsSync(oldFile), 'old PID file should be deleted');
+    } finally { cleanup(); }
+});
+
+scenario('QM-2: old PID file with done items — only pending/processing migrated', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(99992, [
+        { id: 1, text: 'done msg', status: 'done', sessionKey: '' },
+        { id: 2, text: 'pending msg', status: 'pending', sessionKey: 'sess_x' },
+        { id: 3, text: 'processing msg', status: 'processing', sessionKey: '', processingAt: Date.now() },
+    ]);
+    const { qm, cleanup } = freshQueueModule(99993);
+    try {
+        qm.loadQueue();
+        assert.strictEqual(qm.getPendingQueueCount(''), 2, 'pending + processing migrated, done skipped');
+    } finally { cleanup(); }
+});
+
+scenario('QM-3: multiple old PID files merged', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(88880, [{ id: 1, text: 'file1', status: 'pending', sessionKey: 'a' }]);
+    writeOldPidQueueFile(88881, [{ id: 2, text: 'file2', status: 'pending', sessionKey: 'b' }]);
+    const { qm, cleanup } = freshQueueModule(88882);
+    try {
+        qm.loadQueue();
+        assert.strictEqual(qm.getPendingQueueCount(''), 2, 'messages from both old files merged');
+    } finally { cleanup(); }
+});
+
+scenario('QM-4: migrated messages have sessionKey cleared + _prevSessionKey set', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(77770, [{ id: 1, text: 'tagged', status: 'pending', sessionKey: 'old_sk' }]);
+    const { qm, cleanup } = freshQueueModule(77771);
+    try {
+        qm.loadQueue();
+        const item = qm.dequeueMessage('');
+        assert.ok(item, 'item dequeued with empty sessionKey');
+        assert.strictEqual(item.sessionKey, '', 'sessionKey cleared');
+        assert.strictEqual(item._prevSessionKey, 'old_sk', '_prevSessionKey preserved');
+    } finally { cleanup(); }
+});
+
+scenario('QM-5: no old PID files — loadQueue works normally', () => {
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66660);
+    try {
+        qm.loadQueue();
+        assert.strictEqual(qm.getPendingQueueCount(''), 0);
+    } finally { cleanup(); }
+});
+
+try { fs.rmSync(qmTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════
 // Results

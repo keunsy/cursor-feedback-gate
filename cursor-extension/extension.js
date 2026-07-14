@@ -720,7 +720,7 @@ function postToWebview(message) {
 
 function broadcastToAllWebviews(message) {
     const cmd = message && message.command;
-    const isChat = cmd === 'addMessage' || cmd === 'newMessage' || cmd === 'focus' || cmd === 'syncQueue';
+    const isChat = cmd === 'addMessage' || cmd === 'newMessage' || cmd === 'focus';
     if (isChat) {
         return postToWebview(message);
     }
@@ -1759,25 +1759,33 @@ function checkTriggerFile(context, filePath) {
 
             const triggerSessionId = triggerData.data && triggerData.data.session_id;
             const targetEhPid = triggerData.target_extension_host_pid;
-            const triggerWorkspace = triggerData.workspace_folders || '';
+            const triggerWorkspace = triggerData.workspace_folders
+                || (triggerData.data && triggerData.data.workspace_path)
+                || '';
 
             if (isSibling && !isDirectChild && !isDescendant) {
                 // Signal 1: target_extension_host_pid — precise redirect
                 if (targetEhPid && targetEhPid !== myPid) {
+                    let targetAlive = false;
                     try {
                         process.kill(targetEhPid, 0);
+                        targetAlive = true;
+                    } catch {}
+                    if (targetAlive) {
                         return; // Target alive, let it handle
-                    } catch {
-                        // Target EH dead.  Deterministic fallback:
-                        // If trigger has session_id, only the session owner claims.
-                        // If no session_id, fall through to workspace/focus logic.
-                        if (triggerSessionId) {
-                            let weOwnSession = false;
-                            for (const s of sessions.values()) {
-                                if (s.sessionId === triggerSessionId) { weOwnSession = true; break; }
-                            }
-                            if (!weOwnSession) return; // Not ours — skip deterministically
+                    }
+                    // Target EH dead.  Deterministic fallback:
+                    // If trigger has session_id, only the session owner claims.
+                    // If no session_id, fall through to workspace/focus logic.
+                    if (triggerSessionId) {
+                        let weOwnSession = false;
+                        for (const s of sessions.values()) {
+                            if (s.sessionId === triggerSessionId) { weOwnSession = true; break; }
                         }
+                        console.log(`Feedback Gate: ROUTE dead-ehPid=${targetEhPid} sid=${triggerSessionId.slice(0,8)}... own=${weOwnSession} myPid=${myPid}`);
+                        if (!weOwnSession) return; // Not ours — skip deterministically
+                    } else {
+                        console.log(`Feedback Gate: ROUTE dead-ehPid=${targetEhPid} no-sid, falling through to ws/focus`);
                     }
                 }
 
@@ -1797,8 +1805,16 @@ function checkTriggerFile(context, filePath) {
                     const myWsPaths = myWorkspaces.join(',');
                     console.log(`Feedback Gate: ROUTE sid=${triggerSessionId.slice(0,8)}... own=${weOwnSession} wsPrecise=${wsPrecise} wsMatch=${wsMatch} triggerWs=${triggerWorkspace} myWs=${myWsPaths} ehPid=${targetEhPid || 'none'}`);
                     if (weOwnSession && wsPrecise && !wsMatch) {
-                        console.log(`Feedback Gate: YIELD — own session but workspace mismatch, letting correct window claim`);
-                        return;
+                        // YIELD to let the correct workspace window claim, but only
+                        // for a short grace period.  If the trigger file is still
+                        // present after 3s it means the target window doesn't exist
+                        // (closed / agent sent wrong workspace_path), so the session
+                        // owner reclaims to avoid the trigger being lost.
+                        const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                        if (triggerAgeMs < 3000) {
+                            return;
+                        }
+                        console.log(`Feedback Gate: YIELD expired (${triggerAgeMs}ms) — session owner reclaiming despite workspace mismatch`);
                     } else if (weOwnSession) {
                         // We own this session and workspace matches (or no hint)
                         // — proceed to atomic claim below.
@@ -1808,16 +1824,32 @@ function checkTriggerFile(context, filePath) {
                         // Workspace matches precisely — claim even if not focused.
                         // Atomic unlink below prevents double-claim across windows.
                     } else {
-                        // First trigger for this session (no owner yet), no workspace hint.
-                        // Only focused window claims; others skip deterministically.
+                        // First trigger for this session — no owner, no workspace hint.
+                        // We cannot trust focus alone because the focused window may be
+                        // unrelated (e.g. user just opened a third window).
+                        // Strategy: windows with existing sessions (likely the right
+                        // target) try immediately; windows without sessions (empty/new)
+                        // defer briefly.  Atomic unlink ensures only one winner.
+                        const hasAnySessions = sessions.size > 0;
                         const isFocused = vscode.window.state && vscode.window.state.focused;
-                        if (!isFocused) return;
+                        if (!hasAnySessions && !isFocused) {
+                            return;
+                        }
+                        if (!hasAnySessions) {
+                            // Focused but no sessions — defer to let windows with
+                            // sessions claim first.
+                            const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                            if (triggerAgeMs < 1500) {
+                                return;
+                            }
+                        }
+                        console.log(`Feedback Gate: no owner + no ws hint for sid=${triggerSessionId.slice(0,8)}... — racing (sessions=${sessions.size}, focused=${isFocused})`);
                     }
                 } else {
                     if (wsPrecise && !wsMatch) {
                         return;
                     }
-                    // No session_id — only focused window or workspace-match claims.
+                    // No session_id — focused window or workspace-match claims.
                     if (!wsMatch) {
                         const isFocused = vscode.window.state && vscode.window.state.focused;
                         if (!isFocused) return;
@@ -1858,10 +1890,9 @@ function checkTriggerFile(context, filePath) {
                 const canonicalPath = getTempPath(`feedback_gate_trigger_fg_${triggerId}.json`);
                 try {
                     fs.unlinkSync(canonicalPath);
+                    console.log(`Feedback Gate: CLAIMED trigger ${triggerId.slice(-12)} (myPid=${myPid}, ws=${_getMyWorkspacePaths().join(',')}, triggerWs=${triggerWorkspace})`);
                 } catch (e) {
                     if (e.code === 'ENOENT') {
-                        // Another window already claimed this trigger.
-                        // Clean up the file we scanned (may be pid / legacy copy).
                         try { fs.unlinkSync(filePath); } catch {}
                         return;
                     }

@@ -23,6 +23,7 @@
 | Q3 | 多条消息排队 | 按 FIFO 顺序被逐个 trigger 消费 | E2E-3, G4-* |
 | Q4 | 已显示的消息不重复显示 | `_displayed` 标记防止 auto-consume 二次添加 | MO-3, G10-* |
 | Q5 | 不同 session 的队列互相隔离 | Session A 的 trigger 不消费 Session B 的消息 | G7-*, G8-*, E2E-6 |
+| Q6 | Reload/关闭后重开同 workspace | 仅迁移**已退出进程**的旧 PID 队列文件；pending 消息合并到新 PID，清空 sessionKey，删除旧文件；存活 PID 的文件不触碰 | QM-* |
 
 ## 3. Session 管理
 
@@ -41,8 +42,9 @@
 |---|------|----------|----------|
 | R1 | Workspace 精确匹配 | 即使不聚焦也能 claim trigger | TR-1 |
 | R2 | Workspace 不匹配 | 拒绝 claim | TR-2 |
-| R3 | Session ownership | 优先级最高，**但当有精确 workspace 且不匹配时让出** | TR-3 |
-| R4 | 无 workspace hint + 无 session owner | 只有聚焦窗口 claim | TR-4, TR-5 |
+| R3 | Session ownership | 优先级最高，**但当有精确 workspace 且不匹配时让出 3s；超时后 session owner 重新 claim** | TR-3, TR-3c |
+| R4 | 无 workspace hint + 无 session owner（有 session_id） | 有已存 session 的窗口参与 race；空窗口延迟后参与 | TR-7, TR-8, TR-9, TR-10 |
+| R4b | 无 workspace hint + 无 session owner（无 session_id） | 只有聚焦窗口 claim | TR-4, TR-5 |
 | R5 | targetEhPid 不匹配 | 立即拒绝 | TR-6 |
 
 ## 5. Dead-PID 清理
@@ -82,6 +84,7 @@
 | M2 | Heartbeat 未超时 | 返回 WAITING，heartbeat_count++ | HB-1, HB-4 |
 | M3 | Heartbeat 超过 max_total | 返回 TIMEOUT，清理 trigger | HB-3, E2E-MCP-2 |
 | M4 | Trigger 被驱逐后心跳 | 返回 EVICTED（不再干扰新 trigger） | HB-2 |
+| M4b | Heartbeat 发现 EH 已死 | 重写 trigger 文件（清除 target_eh_pid），让新 EH 有机会 claim | — (runtime) |
 | M5 | IDE stale limit (24h) | 超过 24h 未响应的 trigger 被清理（可通过配置文件覆盖） | SC-2 |
 | M6 | CLI stale limit (2min) | 超过 2min 未响应的 trigger 被清理 | SC-3 |
 | M7 | Cooldown (2s) | 响应后 2s 内重复调用返回 SKIP | CD-1, CD-2 |

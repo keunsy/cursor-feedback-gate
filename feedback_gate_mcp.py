@@ -790,6 +790,7 @@ class FeedbackGateServer:
                     max_hours = max_secs / 3600
                     logger.warning(f"⏰ RE-ENTER {label} wait exceeded {max_hours:.0f}h ({elapsed_min:.0f}min) for {my_trigger_id}")
                     return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
+                await self._rewrite_trigger_for_recovery(my_trigger_id, my_trigger_info)
                 logger.info(f"⏳ RE-ENTER heartbeat #{hb_count} | trigger={my_trigger_id} | {wait_secs}s | ~{elapsed_min:.1f}min cumulative")
                 _log_event("HEARTBEAT", f"#{hb_count} trigger={my_trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
                 trigger_sid = my_trigger_info.get("session_id", "") if my_trigger_info else ""
@@ -872,6 +873,9 @@ class FeedbackGateServer:
                 "message": message,
                 "created_at": time.time(),
                 "heartbeat_count": 0,
+                "workspace_path": workspace_path,
+                "title": title,
+                "context": context,
             }
             logger.info(f"🔥 POPUP TRIGGERED - waiting for user input (trigger_id: {trigger_id}, session_id={session_id or 'none'}, active_triggers={len(self._active_triggers)})")
             _log_event("NEW_TRIGGER", f"trigger={trigger_id} active={len(self._active_triggers)} msg={message[:60]}")
@@ -973,6 +977,8 @@ class FeedbackGateServer:
                     max_hours = max_secs / 3600
                     logger.warning(f"⏰ {label} wait exceeded {max_hours:.0f}h ({elapsed_min:.0f}min) for {trigger_id}")
                     return [TextContent(type="text", text=f"TIMEOUT: No user input received within {max_hours:.0f} hours ({label} limit). Stopping wait.")]
+                if trigger_info:
+                    await self._rewrite_trigger_for_recovery(trigger_id, trigger_info)
                 logger.info(f"⏳ {label} heartbeat #{hb_count} | trigger={trigger_id} | {wait_secs}s | ~{elapsed_min:.1f}min cumulative")
                 _log_event("HEARTBEAT", f"#{hb_count} trigger={trigger_id} wall={wall_elapsed:.1f}s cumul={elapsed_min:.1f}min")
                 return [TextContent(type="text", text=self._build_heartbeat_response(hb_count, elapsed_min, session_id=session_id))]
@@ -1238,6 +1244,88 @@ class FeedbackGateServer:
         
         logger.info("🏁 shutdown_mcp processing complete")
         return [TextContent(type="text", text=response)]
+
+    async def _rewrite_trigger_for_recovery(self, trigger_id: str, trigger_info: dict) -> bool:
+        """Re-create trigger file when the claiming EH appears dead.
+        
+        After a heartbeat timeout, the EH that originally claimed the trigger
+        may have restarted (PID changed).  The new EH has no knowledge of the
+        pending trigger because the canonical file was already deleted by the
+        old EH.  Re-writing the trigger file gives the new EH a chance to
+        claim and display the popup.
+        
+        We intentionally clear target_extension_host_pid so that the new EH
+        (different PID) isn't filtered out by the routing logic.
+        """
+        sid = trigger_info.get("session_id", "")
+        cached_eh_pid = self._session_to_eh_pid.get(sid) if sid else None
+        if not cached_eh_pid:
+            return False
+        
+        eh_alive = False
+        try:
+            os.kill(cached_eh_pid, 0)
+            eh_alive = True
+        except (OSError, ProcessLookupError):
+            pass
+        
+        if eh_alive:
+            return False
+        
+        logger.info(f"🔄 RECOVERY: EH {cached_eh_pid} is dead for trigger {trigger_id} — rewriting trigger file")
+        
+        if sid:
+            del self._session_to_eh_pid[sid]
+        
+        ws = trigger_info.get("workspace_path", "")
+        if not ws and sid:
+            ws = self._session_to_workspace.get(sid, "")
+        
+        data = {
+            "tool": "feedback_gate_chat",
+            "message": trigger_info.get("message", ""),
+            "title": trigger_info.get("title", "Feedback Gate"),
+            "context": trigger_info.get("context", ""),
+            "urgent": False,
+            "trigger_id": trigger_id,
+            "session_id": sid,
+            "workspace_path": ws,
+            "timestamp": datetime.now().isoformat(),
+            "immediate_activation": True,
+        }
+        
+        trigger_data = {
+            "timestamp": datetime.now().isoformat(),
+            "system": "feedback-gate",
+            "editor": "cursor",
+            "data": data,
+            "pid": self._server_pid,
+            "ppid": os.getppid(),
+            "ancestor_pids": self._get_ancestor_pids(self._server_pid),
+            "target_extension_host_pid": None,
+            "workspace_folders": ws,
+            "active_window": True,
+            "mcp_integration": True,
+            "immediate_activation": True,
+            "recovery": True,
+        }
+        
+        trigger_json = json.dumps(trigger_data, indent=2)
+        per_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_fg_{trigger_id}.json"))
+        pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
+        legacy_trigger_file = Path(get_temp_path("feedback_gate_trigger.json"))
+        
+        try:
+            for target in [per_trigger_file, pid_trigger_file, legacy_trigger_file]:
+                tmp = target.with_suffix('.json.tmp')
+                tmp.write_text(trigger_json)
+                tmp.replace(target)
+            logger.info(f"🔄 RECOVERY: trigger file rewritten for {trigger_id} (ws={ws}, eh_pid=cleared)")
+            _log_event("TRIGGER_RECOVERY", f"trigger={trigger_id} dead_eh={cached_eh_pid} ws={ws}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ RECOVERY: failed to rewrite trigger {trigger_id}: {e}")
+            return False
 
     async def _wait_for_extension_acknowledgement(self, trigger_id: str, timeout: int = 30) -> dict | None:
         """Wait for extension acknowledgement that popup was activated.
