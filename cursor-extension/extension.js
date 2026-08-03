@@ -756,10 +756,13 @@ class FeedbackGatePanelProvider {
         this._pendingMessages = [];
         this._mcpIntegration = true;
         this._currentSpecialHandling = null;
+        this._readyReceived = false;
     }
 
     resolveWebviewView(webviewView) {
+        const isRebuild = this._readyReceived;
         this._view = webviewView;
+        this._readyReceived = false;
 
         webviewView.webview.options = {
             enableScripts: true
@@ -854,7 +857,11 @@ class FeedbackGatePanelProvider {
                         vscode.window.showErrorMessage(webviewMessage.message);
                         break;
                     case 'ready': {
+                        this._readyReceived = true;
                         const hasAnyTrigger = [...sessions.values()].some(s => s.triggerData) || !!currentTriggerData;
+
+                        // Flush pending messages (same as old code, just unified
+                        // the two branches into one).
                         if (this._pendingMessages.length > 0) {
                             webviewView.webview.postMessage({
                                 command: 'updateMcpStatus',
@@ -872,11 +879,21 @@ class FeedbackGatePanelProvider {
                                 hasPendingTrigger: hasAnyTrigger
                             });
                         }
-                        syncQueueToWebview(activeSessionKey || '');
-                        syncTabsToWebview();
+
+                        // FIX: Sync session BEFORE queue.  loadSession sets
+                        // currentSessionKey in the webview; syncQueue's filter
+                        // depends on it.  Old order (queue→session) caused the
+                        // queue to be filtered with a stale sessionKey, dropping
+                        // all items when the webview was rebuilt.
                         if (activeSessionKey) {
                             const s = sessions.get(activeSessionKey);
                             if (s) syncSessionToWebview(s);
+                        }
+                        syncTabsToWebview();
+                        syncQueueToWebview(activeSessionKey || '');
+
+                        if (isRebuild) {
+                            console.log('Feedback Gate: webview rebuilt (new window or re-layout), state re-synced');
                         }
                         break;
                     }
@@ -2375,6 +2392,10 @@ function openFeedbackGatePopup(context, options = {}) {
 
         // Unified async focus logic for all candidates (resolved or not).
         // Prepares pending messages so they get delivered once the view resolves.
+        // The 'ready' handler in onDidReceiveMessage is the SOLE consumer of
+        // _pendingMessages — tryProviders only enqueues and waits for focus.
+        // This avoids a race where tryProviders flushes messages while the
+        // webview is mid-rebuild (dispose→resolve) and 'ready' also flushes.
         const tryProviders = async () => {
             for (let i = 0; i < providerCandidates.length; i++) {
                 const provider = providerCandidates[i];
@@ -2395,13 +2416,16 @@ function openFeedbackGatePopup(context, options = {}) {
 
                 const ok = await provider.focusView();
                 if (ok) {
-                    // Flush pending messages now that the view is resolved and visible
-                    if (provider._view && provider._view.webview && provider._pendingMessages.length > 0) {
+                    // If 'ready' already fired (view was already resolved and
+                    // visible), pending messages won't be picked up by the
+                    // ready handler.  Flush them directly in this case only.
+                    if (provider._readyReceived && provider._view && provider._view.webview && provider._pendingMessages.length > 0) {
                         for (const msg of provider._pendingMessages) {
                             provider._view.webview.postMessage(msg);
                         }
                         provider._pendingMessages = [];
                     }
+                    // If ready hasn't fired yet, the ready handler will flush.
                     if (autoFocus) {
                         setTimeout(() => { postToWebview({ command: 'focus' }); }, 200);
                     }
