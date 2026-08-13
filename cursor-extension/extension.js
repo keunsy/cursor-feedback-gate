@@ -790,10 +790,8 @@ class FeedbackGatePanelProvider {
                         const sendTrigger = sendSession ? sendSession.triggerData : null;
                         if (sendTrigger && sendTrigger.trigger_id) {
                             processQueueForPendingTrigger(true, sendSession.key);
-                        } else {
-                            // No active trigger — message goes to queue only.
-                            // Do NOT display yet; it will be shown in correct order
-                            // (after agentMsg) when the next trigger auto-consumes it.
+                        } else if (sendSession) {
+                            waitForTriggerAndDrain(sendSession.key);
                         }
                         break;
                     }
@@ -2054,6 +2052,8 @@ function checkTriggerFile(context, filePath) {
                             processedTriggerIds.delete(first);
                         }
                         try { fs.unlinkSync(filePath); } catch {}
+                        if (session) cancelPendingDrain(session.key);
+                        else if (targetSessionKey) cancelPendingDrain(targetSessionKey);
                         console.log(`Feedback Gate: auto-consumed queue item "${queueItem.text}"`);
                         return;
                     }
@@ -2151,6 +2151,7 @@ function checkTriggerFile(context, filePath) {
                                 }
                             }
                             try { fs.unlinkSync(filePath); } catch {}
+                            cancelPendingDrain(session.key);
                             console.log(`Feedback Gate: post-route auto-consumed queue item "${postItem.text}" for session ${session.key}`);
                             return;
                         } else {
@@ -2524,6 +2525,7 @@ function openFeedbackGatePopup(context, options = {}) {
                     } else if (sendSession2) {
                         addMessageToSession(sendSession2.key, { text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files, _queued: true });
                         if (enqueuedItem2) { enqueuedItem2._displayed = true; queue.saveQueue(); }
+                        waitForTriggerAndDrain(sendSession2.key);
                     } else {
                         broadcastToAllWebviews({ command: 'addMessage', text: webviewMessage.text, type: 'user', attachments: webviewMessage.attachments, files: webviewMessage.files });
                         if (enqueuedItem2) { enqueuedItem2._displayed = true; queue.saveQueue(); }
@@ -2649,6 +2651,43 @@ function openFeedbackGatePopup(context, options = {}) {
 }
 
 
+const _pendingDrainTimers = new Map();
+
+function cancelPendingDrain(sessionKey) {
+    const timer = _pendingDrainTimers.get(sessionKey);
+    if (timer) {
+        clearInterval(timer);
+        _pendingDrainTimers.delete(sessionKey);
+    }
+}
+
+function waitForTriggerAndDrain(sessionKey) {
+    if (_pendingDrainTimers.has(sessionKey)) return;
+    const MAX_ATTEMPTS = 30;
+    const INTERVAL_MS = 500;
+    let attempt = 0;
+    const timer = setInterval(() => {
+        attempt++;
+        const session = sessions.get(sessionKey);
+        if (!session || getPendingQueueCount(sessionKey) === 0) {
+            clearInterval(timer);
+            _pendingDrainTimers.delete(sessionKey);
+            return;
+        }
+        if (session.triggerData && session.triggerData.trigger_id) {
+            clearInterval(timer);
+            _pendingDrainTimers.delete(sessionKey);
+            processQueueForPendingTrigger(true, sessionKey);
+            return;
+        }
+        if (attempt >= MAX_ATTEMPTS) {
+            clearInterval(timer);
+            _pendingDrainTimers.delete(sessionKey);
+        }
+    }, INTERVAL_MS);
+    _pendingDrainTimers.set(sessionKey, timer);
+}
+
 function processQueueForPendingTrigger(directSend, targetSessionKey) {
     // Use specified session if provided, otherwise fall back to active session
     const targetSession = targetSessionKey ? sessions.get(targetSessionKey) : getActiveSession();
@@ -2677,6 +2716,7 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
     }
 
     markQueueItemDone(queueItem.id);
+    cancelPendingDrain(sessionKey);
     logUserInput(queueItem.text, 'MCP_RESPONSE', triggerId, queueItem.attachments || [], queueItem.files || []);
 
     if (!queueItem._displayed) {
