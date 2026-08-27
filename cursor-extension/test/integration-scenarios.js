@@ -1848,6 +1848,46 @@ scenario('WF-6: no forwarding when this window holds the lease itself', () => {
 });
 
 try { fs.rmSync(wfTmpDir, { recursive: true }); } catch {}
+// ═══════════════════════════════════════════════════════════════
+// EC: Queue auto-consume write failure must not drop the trigger (E1)
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors the pre-route auto-consume decision in checkTriggerFile.
+// The trigger is ALREADY claimed (canonical unlink done) before this point,
+// so a failed response write must requeue the item and fall through to the
+// popup route instead of returning (which would hang the agent).
+function mirrorAutoConsume(writeOk) {
+    const queueItem = { id: 1, text: 'queued reply', status: 'processing', processingAt: Date.now() };
+    let queueWriteOk = true;
+    let claimedTriggerConsumed = false; // true = we responded and returned
+    let fellThroughToPopup = false;     // true = normal route binds the trigger
+
+    queueWriteOk = writeOk;
+    if (!queueWriteOk) {
+        queueItem.status = 'pending';
+        delete queueItem.processingAt;
+    }
+    if (queueWriteOk) {
+        claimedTriggerConsumed = true; // success path returns
+    } else {
+        fellThroughToPopup = true;     // failure path falls through
+    }
+    return { queueItem, claimedTriggerConsumed, fellThroughToPopup };
+}
+
+scenario('EC-1: response write succeeds → trigger consumed, no popup fallthrough', () => {
+    const r = mirrorAutoConsume(true);
+    assert.strictEqual(r.claimedTriggerConsumed, true);
+    assert.strictEqual(r.fellThroughToPopup, false);
+});
+
+scenario('EC-2: response write FAILS → item requeued + trigger routed to popup (not dropped)', () => {
+    const r = mirrorAutoConsume(false);
+    assert.strictEqual(r.claimedTriggerConsumed, false, 'must NOT pretend the trigger was answered');
+    assert.strictEqual(r.fellThroughToPopup, true, 'trigger must reach the popup route');
+    assert.strictEqual(r.queueItem.status, 'pending', 'message must be requeued, not lost');
+    assert.strictEqual(r.queueItem.processingAt, undefined);
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Results

@@ -2121,10 +2121,21 @@ function checkTriggerFile(context, filePath) {
                     }
 
                     const qTriggerId = triggerData.data && triggerData.data.trigger_id;
+                    let queueWriteOk = true;
                     if (qTriggerId) {
-                        if (!writeResponseForTrigger(qTriggerId, queueItem, 'feedback_gate_queue')) {
-                            return;
+                        queueWriteOk = writeResponseForTrigger(qTriggerId, queueItem, 'feedback_gate_queue');
+                        if (!queueWriteOk) {
+                            // The trigger is already claimed — discarding it now would hang the
+                            // agent until timeout. Requeue the message and fall through to the
+                            // normal route: the popup opens, and any pending drain delivers the
+                            // requeued item once the trigger is bound.
+                            console.log(`Feedback Gate: queue auto-consume write FAILED for ${qTriggerId} — requeued item, falling back to popup route`);
+                            queueItem.status = 'pending';
+                            delete queueItem.processingAt;
+                            queue.saveQueue();
                         }
+                    }
+                    if (qTriggerId && queueWriteOk) {
                         markQueueItemDone(queueItem.id);
                         sendExtensionAcknowledgement(qTriggerId, triggerData.data.tool);
                         if (session && session.sessionId) holdSessionLease(session.sessionId, session.key);
@@ -2166,7 +2177,7 @@ function checkTriggerFile(context, filePath) {
                         queue.saveQueue();
                         console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id, falling through to popup`);
                     }
-                    if (triggerId) {
+                    if (triggerId && queueWriteOk) {
                         processedTriggerIds.add(triggerId);
                         if (processedTriggerIds.size > 50) {
                             const first = processedTriggerIds.values().next().value;
