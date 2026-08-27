@@ -983,7 +983,6 @@ class FeedbackGateServer:
             my_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_fg_{trigger_id}.json")) if trigger_id else None
             pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
             check_file = my_trigger_file or pid_trigger_file
-            extension_alive = False
             # F3: consumption window is configurable via FEEDBACK_GATE_TRIGGER_TIMEOUT
             # (seconds, default 5). CLI/remote-control setups can extend it because
             # their extension may poll more slowly. Keeps the default behaviour intact.

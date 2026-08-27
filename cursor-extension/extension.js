@@ -296,8 +296,8 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
         // Unknown session_id — likely context compaction causing a fresh UUID,
         // or the first call with session_id after an initial call without one.
         // Adopt the sole existing session if it's safe to do so.
-            const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
-            const ADOPT_MAX_SESSION_AGE_MS = 60 * 60 * 1000; // never resurrect a conversation idle for over 1h
+        const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
+        const ADOPT_MAX_SESSION_AGE_MS = 60 * 60 * 1000; // never resurrect a conversation idle for over 1h
         if (sessions.size === 1) {
             const only = sessions.values().next().value;
             // Skip if the sole session already owns a DIFFERENT sessionId AND has
@@ -2229,7 +2229,7 @@ function checkTriggerFile(context, filePath) {
                         queueItem.status = 'pending';
                         delete queueItem.processingAt;
                         queue.saveQueue();
-                        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — no trigger_id, falling through to popup`);
+                        console.log(`Feedback Gate: recovered queue item "${queueItem.text}" — ${qTriggerId ? 'response write failed' : 'no trigger_id'}, falling through to popup`);
                     }
                     if (triggerId && queueWriteOk) {
                         processedTriggerIds.add(triggerId);
