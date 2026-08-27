@@ -250,6 +250,33 @@ function refreshHeldLeases(now) {
     }
 }
 
+/**
+ * Forward a user message to the window that currently holds the session
+ * lease, via the holder's IDE queue file (the existing cross-process
+ * delivery channel). Returns true when forwarding succeeded.
+ */
+function forwardMessageToLeaseHolder(session, text, attachments, files) {
+    try {
+        const lease = sessionLease.readLease(session.sessionId);
+        if (!lease || lease.eh_pid === process.pid) return false;
+        const entry = JSON.stringify({
+            text,
+            ts: new Date().toISOString(),
+            source: 'window-forward',
+            targetSessionId: session.sessionId,
+            targetSessionKey: lease.session_key || '',
+            attachments: attachments || [],
+            files: files || [],
+        });
+        fs.appendFileSync(getTempPath(`feedback_gate_ide_queue_${lease.eh_pid}.jsonl`), entry + '\n');
+        console.log(`Feedback Gate: forwarded message for session ${session.sessionId} to lease holder pid ${lease.eh_pid}`);
+        return true;
+    } catch (e) {
+        console.log(`Feedback Gate: failed to forward message to lease holder: ${e.message}`);
+        return false;
+    }
+}
+
 function getOrCreateSessionForTrigger(mcpPid, sessionId) {
     const now = Date.now();
     // Phase 0: match by session_id (PID-independent).
@@ -651,6 +678,7 @@ const SOURCE_LABELS = {
     dingtalk: '钉钉',
     wecom: '企微',
     wechat: '微信',
+    'window-forward': '另一个窗口',
 };
 
 // ── IDE Reply (V2 bidirectional feedback) ──────────
@@ -823,7 +851,11 @@ class FeedbackGatePanelProvider {
                         const rawSessionKey = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
                         const sendSession = (rawSessionKey ? sessions.get(rawSessionKey) : null) || activeSession;
                         if (sendSession && sendSession.sessionId && sessionLease.isHeldElsewhere(sendSession.sessionId, process.pid)) {
-                            vscode.window.showWarningMessage('Feedback Gate: 该会话正由另一个 Cursor 窗口处理，请切换到该窗口回复');
+                            if (forwardMessageToLeaseHolder(sendSession, webviewMessage.text, webviewMessage.attachments, webviewMessage.files)) {
+                                vscode.window.showInformationMessage('Feedback Gate: 该会话由另一个窗口持有，消息已转发');
+                            } else {
+                                vscode.window.showWarningMessage('Feedback Gate: 该会话正由另一个 Cursor 窗口处理，请切换到该窗口回复');
+                            }
                             break;
                         }
                         const sendSessionKey = sendSession ? sendSession.key : '';
@@ -1540,6 +1572,7 @@ function consumeIdeQueueFile(filePath, isRecovery) {
         const lines = content.split('\n').filter(l => l.trim());
         let count = 0;
         let stale = 0;
+        let lastTargetSession = null;
 
         for (const line of lines) {
             try {
@@ -1551,13 +1584,28 @@ function consumeIdeQueueFile(filePath, isRecovery) {
                     continue;
                 }
 
-                // Route remote messages: prefer active session if it has a pending trigger,
-                // then any other pending session, then active session key as fallback.
-                const activeSession = activeSessionKey ? sessions.get(activeSessionKey) : null;
-                const preferActive = activeSession && activeSession.triggerData;
-                const pendingSession = preferActive ? activeSession : findNextPendingSession();
-                const remoteSessionKey = pendingSession ? pendingSession.key : (activeSessionKey || '');
-                enqueueMessage(item.text, [], [], {
+                // Route remote messages. Window-forwarded replies name their exact
+                // target session; everything else prefers the active session when it
+                // has a pending trigger, then any other pending session, then the
+                // active session key as fallback.
+                let remoteSessionKey = '';
+                if (item.targetSessionId) {
+                    for (const s of sessions.values()) {
+                        if (s.sessionId === item.targetSessionId) { remoteSessionKey = s.key; break; }
+                    }
+                    if (!remoteSessionKey && item.targetSessionKey && sessions.has(item.targetSessionKey)) {
+                        remoteSessionKey = item.targetSessionKey;
+                    }
+                }
+                if (!remoteSessionKey) {
+                    const activeSession = activeSessionKey ? sessions.get(activeSessionKey) : null;
+                    const preferActive = activeSession && activeSession.triggerData;
+                    const pendingSession = preferActive ? activeSession : findNextPendingSession();
+                    remoteSessionKey = pendingSession ? pendingSession.key : (activeSessionKey || '');
+                }
+                const routedTarget = remoteSessionKey ? sessions.get(remoteSessionKey) : null;
+                if (routedTarget) lastTargetSession = routedTarget;
+                enqueueMessage(item.text, item.attachments || [], item.files || [], {
                     source: item.source,
                     sourceLabel: SOURCE_LABELS[item.source] || item.source,
                     chatId: item.chatId,
@@ -1579,13 +1627,20 @@ function consumeIdeQueueFile(filePath, isRecovery) {
         if (count > 0 || stale > 0) {
             console.log(`Feedback Gate: consumed ${count} IDE queue message(s), discarded ${stale} stale`);
         }
-        const pendingForQueue = findNextPendingSession();
-        if (count > 0 && pendingForQueue && pendingForQueue.triggerData && pendingForQueue.triggerData.trigger_id) {
-            processQueueForPendingTrigger(true, pendingForQueue.key);
+        if (count > 0 && lastTargetSession && lastTargetSession.triggerData && lastTargetSession.triggerData.trigger_id) {
+            // A forwarded/remote message landed in a session with a pending
+            // trigger — drain that session's queue directly (also covers the
+            // active session, which findNextPendingSession() skips).
+            processQueueForPendingTrigger(true, lastTargetSession.key);
         } else {
-            const activeTrigger = getCurrentTriggerData();
-            if (count > 0 && activeTrigger && activeTrigger.trigger_id) {
-                processQueueForPendingTrigger(true);
+            const pendingForQueue = findNextPendingSession();
+            if (count > 0 && pendingForQueue && pendingForQueue.triggerData && pendingForQueue.triggerData.trigger_id) {
+                processQueueForPendingTrigger(true, pendingForQueue.key);
+            } else {
+                const activeTrigger = getCurrentTriggerData();
+                if (count > 0 && activeTrigger && activeTrigger.trigger_id) {
+                    processQueueForPendingTrigger(true);
+                }
             }
         }
     } catch (e) {
@@ -2575,7 +2630,11 @@ function openFeedbackGatePopup(context, options = {}) {
                     const rawSessionKey2 = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
                     const sendSession2 = (rawSessionKey2 ? sessions.get(rawSessionKey2) : null) || activeSession;
                     if (sendSession2 && sendSession2.sessionId && sessionLease.isHeldElsewhere(sendSession2.sessionId, process.pid)) {
-                        vscode.window.showWarningMessage('Feedback Gate: 该会话正由另一个 Cursor 窗口处理，请切换到该窗口回复');
+                        if (forwardMessageToLeaseHolder(sendSession2, webviewMessage.text, webviewMessage.attachments, webviewMessage.files)) {
+                            vscode.window.showInformationMessage('Feedback Gate: 该会话由另一个窗口持有，消息已转发');
+                        } else {
+                            vscode.window.showWarningMessage('Feedback Gate: 该会话正由另一个 Cursor 窗口处理，请切换到该窗口回复');
+                        }
                         break;
                     }
                     const sendSessionKey2 = sendSession2 ? sendSession2.key : '';

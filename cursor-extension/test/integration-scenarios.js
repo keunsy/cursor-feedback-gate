@@ -1690,6 +1690,133 @@ scenario('LW-10: lease for a DIFFERENT session does not block this one', () => {
 });
 
 try { fs.rmSync(lwTmpDir, { recursive: true }); } catch {}
+// ═══════════════════════════════════════════════════════════════
+// WF: Cross-window forwarding via the holder's IDE queue (wave 1c)
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors the routing block of consumeIdeQueueFile after wave 1c.
+function mirrorIdeRouting(item, sessionsMap, activeSessionKey) {
+    let remoteSessionKey = '';
+    if (item.targetSessionId) {
+        for (const s of sessionsMap.values()) {
+            if (s.sessionId === item.targetSessionId) { remoteSessionKey = s.key; break; }
+        }
+        if (!remoteSessionKey && item.targetSessionKey && sessionsMap.has(item.targetSessionKey)) {
+            remoteSessionKey = item.targetSessionKey;
+        }
+    }
+    if (!remoteSessionKey) {
+        const activeSession = activeSessionKey ? sessionsMap.get(activeSessionKey) : null;
+        const preferActive = activeSession && activeSession.triggerData;
+        let pendingSession = null;
+        if (preferActive) {
+            pendingSession = activeSession;
+        } else {
+            for (const session of sessionsMap.values()) {
+                if (session.triggerData && session.key !== activeSessionKey) { pendingSession = session; break; }
+            }
+        }
+        remoteSessionKey = pendingSession ? pendingSession.key : (activeSessionKey || '');
+    }
+    return remoteSessionKey;
+}
+
+const wfTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fg-wf-test-'));
+
+function clearWfTmpDir() {
+    for (const f of fs.readdirSync(wfTmpDir)) {
+        try { fs.unlinkSync(path.join(wfTmpDir, f)); } catch {}
+    }
+}
+
+// Mirrors forwardMessageToLeaseHolder's entry construction + file choice.
+function mirrorForward(session, lease, text) {
+    if (!lease || lease.eh_pid === process.pid) return null;
+    return {
+        file: `feedback_gate_ide_queue_${lease.eh_pid}.jsonl`,
+        entry: {
+            text,
+            ts: new Date().toISOString(),
+            source: 'window-forward',
+            targetSessionId: session.sessionId,
+            targetSessionKey: lease.session_key || '',
+            attachments: [],
+            files: [],
+        },
+    };
+}
+
+scenario('WF-1: forwarded message with targetSessionId routes to that session even if another is active', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', sessionId: 'sid-A', triggerData: { trigger_id: 't' } }],
+        ['k2', { key: 'k2', sessionId: 'sid-B', triggerData: { trigger_id: 't2' } }],
+    ]);
+    const key = mirrorIdeRouting(
+        { text: 'hi', source: 'window-forward', targetSessionId: 'sid-B' },
+        sessionsMap, 'k1'
+    );
+    assert.strictEqual(key, 'k2', 'must land in the target session, not the active one');
+});
+
+scenario('WF-2: unknown targetSessionId falls back to targetSessionKey when the session exists', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', sessionId: 'sid-A', triggerData: { trigger_id: 't' } }],
+    ]);
+    const key = mirrorIdeRouting(
+        { text: 'hi', source: 'window-forward', targetSessionId: 'sid-gone', targetSessionKey: 'k1' },
+        sessionsMap, ''
+    );
+    assert.strictEqual(key, 'k1');
+});
+
+scenario('WF-3: entries without targetSessionId keep legacy routing (active with trigger first)', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', sessionId: 'sid-A', triggerData: { trigger_id: 't' } }],
+        ['k2', { key: 'k2', sessionId: 'sid-B', triggerData: null }],
+    ]);
+    const key = mirrorIdeRouting({ text: 'hi', source: 'feishu' }, sessionsMap, 'k1');
+    assert.strictEqual(key, 'k1', 'active session with pending trigger keeps priority');
+});
+
+scenario('WF-4: entries without targetSessionId keep legacy routing (non-active pending fallback)', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', sessionId: 'sid-A', triggerData: null }],
+        ['k2', { key: 'k2', sessionId: 'sid-B', triggerData: { trigger_id: 't' } }],
+    ]);
+    const key = mirrorIdeRouting({ text: 'hi', source: 'feishu' }, sessionsMap, 'k1');
+    assert.strictEqual(key, 'k2');
+});
+
+scenario('WF-5: forward writes a window-forward entry into the holder\'s IDE queue file', () => {
+    clearWfTmpDir();
+    const holderPid = 876543;
+    const fwd = mirrorForward(
+        { sessionId: 'sid-X' },
+        { eh_pid: holderPid, session_key: 'holder_key', ts: Date.now() },
+        '回复内容'
+    );
+    assert.ok(fwd, 'must forward when another window holds the lease');
+    assert.strictEqual(fwd.file, `feedback_gate_ide_queue_${holderPid}.jsonl`);
+    assert.strictEqual(fwd.entry.source, 'window-forward');
+    assert.strictEqual(fwd.entry.targetSessionId, 'sid-X');
+    assert.strictEqual(fwd.entry.targetSessionKey, 'holder_key');
+    // Round-trip through the actual file the holder polls.
+    const filePath = path.join(wfTmpDir, fwd.file);
+    fs.appendFileSync(filePath, JSON.stringify(fwd.entry) + '\n');
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').trim());
+    assert.strictEqual(parsed.text, '回复内容');
+});
+
+scenario('WF-6: no forwarding when this window holds the lease itself', () => {
+    const fwd = mirrorForward(
+        { sessionId: 'sid-Y' },
+        { eh_pid: process.pid, session_key: 'mine', ts: Date.now() },
+        'hello'
+    );
+    assert.strictEqual(fwd, null);
+});
+
+try { fs.rmSync(wfTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════
 // Results
