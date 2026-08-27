@@ -6,6 +6,7 @@ const { spawn } = require('child_process');
 
 const { getTempPath, getMimeType } = require('./utils');
 const queue = require('./queue-manager');
+const sessionLease = require('./session-lease');
 const { getFeedbackGateHTML } = require('./webview-template');
 
 function isProcessAlive(pid) {
@@ -216,6 +217,37 @@ function _tryAdoptUnboundSession(mcpPid, now) {
     only.lastActiveAt = now;
     delete only.restoredAt;
     return only;
+}
+
+// ── Multi-window session leases ────────────────────────────────
+// Windows sharing one workspace restore identical sessions from globalState;
+// leases arbitrate which window actively owns each conversation so popups and
+// replies don't land in a window that isn't actually driving the session.
+const _myLeases = new Map(); // sessionId → sessionKey held by THIS window
+let _leaseRefreshAt = 0;
+
+function holdSessionLease(sessionId, sessionKey) {
+    if (!sessionId) return;
+    sessionLease.writeLease(sessionId, process.pid, sessionKey || '');
+    _myLeases.set(sessionId, sessionKey || '');
+}
+
+function releaseSessionLease(sessionId) {
+    if (!sessionId) return;
+    sessionLease.removeOwnLease(sessionId, process.pid);
+    _myLeases.delete(sessionId);
+}
+
+function refreshHeldLeases(now) {
+    if (!_myLeases.size) return;
+    if (now - _leaseRefreshAt < sessionLease.LEASE_REFRESH_INTERVAL_MS) return;
+    _leaseRefreshAt = now;
+    for (const sid of [..._myLeases.keys()]) {
+        let owner = null;
+        for (const s of sessions.values()) { if (s.sessionId === sid) { owner = s; break; } }
+        if (!owner) { releaseSessionLease(sid); continue; }
+        holdSessionLease(sid, owner.key);
+    }
 }
 
 function getOrCreateSessionForTrigger(mcpPid, sessionId) {
@@ -473,6 +505,8 @@ function cleanupStaleSessions() {
     for (const key of toRemove) {
         console.log(`Feedback Gate: cleaning stale session ${key}`);
         queue.migrateSessionKey(key, '');
+        const removedSession = sessions.get(key);
+        if (removedSession) releaseSessionLease(removedSession.sessionId);
         sessions.delete(key);
         if (activeSessionKey === key) {
             const next = findNextPendingSession();
@@ -665,6 +699,7 @@ function closeSessionByKey(key) {
         }
     }
     queue.migrateSessionKey(key, '');
+    releaseSessionLease(toClose.sessionId);
     sessions.delete(key);
     persistSessions();
     if (activeSessionKey === key) {
@@ -787,6 +822,10 @@ class FeedbackGatePanelProvider {
                     case 'send': {
                         const rawSessionKey = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
                         const sendSession = (rawSessionKey ? sessions.get(rawSessionKey) : null) || activeSession;
+                        if (sendSession && sendSession.sessionId && sessionLease.isHeldElsewhere(sendSession.sessionId, process.pid)) {
+                            vscode.window.showWarningMessage('Feedback Gate: 该会话正由另一个 Cursor 窗口处理，请切换到该窗口回复');
+                            break;
+                        }
                         const sendSessionKey = sendSession ? sendSession.key : '';
                         if (sendSession) sendSession.pendingRemoteReply = null;
                         else if (activeSession) activeSession.pendingRemoteReply = null;
@@ -1653,6 +1692,7 @@ function cleanupOrphanPidFiles() {
 
 function startFeedbackGateIntegration(context) {
     cleanupOrphanPidFiles();
+    sessionLease.cleanStaleLeases(Date.now());
     
     boundMcpPids = discoverMcpPids();
     if (boundMcpPids.size > 0) {
@@ -1689,6 +1729,9 @@ function startFeedbackGateIntegration(context) {
             cleanupStaleSessions._lastRun = Date.now();
             cleanupStaleSessions();
         }
+        // Keep session leases held by this window fresh (or drop them when
+        // the owning session vanished).
+        refreshHeldLeases(Date.now());
         // Expire idle session after 2h without any trigger
         if (firstTriggerReceived && lastTriggerTime > 0
             && ![...sessions.values()].some(s => s.triggerData) && !currentTriggerData
@@ -1785,6 +1828,15 @@ function checkTriggerFile(context, filePath) {
             const triggerWorkspace = triggerData.workspace_folders
                 || (triggerData.data && triggerData.data.workspace_path)
                 || '';
+
+            // Signal 0.5: multi-window session lease. If another LIVE window
+            // holds this session (claimed it and keeps refreshing the lease),
+            // defer to it — even when this window has a restored local copy of
+            // the session. Prevents same-workspace windows from racing for the
+            // same conversation and stranding replies in a dead-end queue.
+            if (triggerSessionId && sessionLease.isHeldElsewhere(triggerSessionId, myPid)) {
+                return;
+            }
 
             if (isSibling && !isDirectChild && !isDescendant) {
                 // Signal 1: target_extension_host_pid — precise redirect
@@ -2015,6 +2067,7 @@ function checkTriggerFile(context, filePath) {
                         }
                         markQueueItemDone(queueItem.id);
                         sendExtensionAcknowledgement(qTriggerId, triggerData.data.tool);
+                        if (session && session.sessionId) holdSessionLease(session.sessionId, session.key);
                         
                         const agentMsg = triggerData.data.message || triggerData.data.prompt || '';
                         if (session) {
@@ -2079,6 +2132,7 @@ function checkTriggerFile(context, filePath) {
                 if (!isProcessAlive(s.mcpPid)) {
                     console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
                     queue.migrateSessionKey(sKey, '');
+                    releaseSessionLease(s.sessionId);
                     sessions.delete(sKey);
                     if (activeSessionKey === sKey) {
                         activeSessionKey = null;
@@ -2091,6 +2145,7 @@ function checkTriggerFile(context, filePath) {
             
             // Route trigger to session (or legacy global)
             const session = triggerPid ? setCurrentTriggerData(triggerData.data, triggerPid) : null;
+            if (session && session.sessionId) holdSessionLease(session.sessionId, session.key);
             if (!session) {
                 currentTriggerData = triggerData.data;
             }
@@ -2519,6 +2574,10 @@ function openFeedbackGatePopup(context, options = {}) {
                 case 'send': {
                     const rawSessionKey2 = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
                     const sendSession2 = (rawSessionKey2 ? sessions.get(rawSessionKey2) : null) || activeSession;
+                    if (sendSession2 && sendSession2.sessionId && sessionLease.isHeldElsewhere(sendSession2.sessionId, process.pid)) {
+                        vscode.window.showWarningMessage('Feedback Gate: 该会话正由另一个 Cursor 窗口处理，请切换到该窗口回复');
+                        break;
+                    }
                     const sendSessionKey2 = sendSession2 ? sendSession2.key : '';
                     if (sendSession2) sendSession2.pendingRemoteReply = null;
                     else if (activeSession) activeSession.pendingRemoteReply = null;
@@ -3036,6 +3095,7 @@ function deactivate() {
     }
 
     unregisterIdeSession();
+    for (const sid of [..._myLeases.keys()]) releaseSessionLease(sid);
     
     if (feedbackGateWatcher) {
         clearInterval(feedbackGateWatcher);

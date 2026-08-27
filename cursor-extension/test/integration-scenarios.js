@@ -76,6 +76,12 @@ function createRoutingHarness() {
         const triggerWorkspace = triggerData.data && triggerData.data.workspace_path;
         const targetEhPid = triggerData.targetEhPid;
 
+        // Signal 0.5: multi-window session lease (mirrors extension.js)
+        if (triggerSessionId && windowState.isLeaseHeldElsewhere
+            && windowState.isLeaseHeldElsewhere(triggerSessionId)) {
+            return { claimed: false, reason: 'session lease held elsewhere' };
+        }
+
         // Signal 0: targetEhPid (skip if not us)
         if (targetEhPid && targetEhPid !== process.pid) {
             return { claimed: false, reason: 'targetEhPid mismatch' };
@@ -1543,6 +1549,147 @@ scenario('CL-3: closing a session without a trigger is allowed silently', () => 
     assert.strictEqual(r.allowed, true);
     assert.strictEqual(r.warned, false);
 });
+
+// ═══════════════════════════════════════════════════════════════
+// LW: Session lease arbitration (N1/N3/C3 — multi-window ownership)
+// ═══════════════════════════════════════════════════════════════
+
+const lwTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fg-lw-test-'));
+
+function freshLeaseModule() {
+    const modulePath = require.resolve('../session-lease.js');
+    delete require.cache[modulePath];
+    const utilsPath = require.resolve('../utils.js');
+    const origGetTempPath = require(utilsPath).getTempPath;
+    require(utilsPath).getTempPath = (f) => path.join(lwTmpDir, f);
+    const lease = require(modulePath);
+    const cleanup = () => {
+        require(utilsPath).getTempPath = origGetTempPath;
+        delete require.cache[modulePath];
+    };
+    return { lease, cleanup };
+}
+
+function clearLwTmpDir() {
+    for (const f of fs.readdirSync(lwTmpDir)) {
+        try { fs.unlinkSync(path.join(lwTmpDir, f)); } catch {}
+    }
+}
+
+const LW_MY_PID = process.pid;
+const LW_OTHER_PID = 987654;
+
+scenario('LW-1: fresh lease held by another LIVE window → defer', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        lease._setAliveProbe((pid) => pid === LW_OTHER_PID);
+        lease.writeLease('sid-1', LW_OTHER_PID, 'key_a');
+        assert.strictEqual(lease.isHeldElsewhere('sid-1', LW_MY_PID), true);
+    } finally { lease._setAliveProbe(null); cleanup(); }
+});
+
+scenario('LW-2: lease held by a DEAD window → claimable', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        lease._setAliveProbe(() => false);
+        lease.writeLease('sid-2', LW_OTHER_PID, 'key_a');
+        assert.strictEqual(lease.isHeldElsewhere('sid-2', LW_MY_PID), false);
+    } finally { lease._setAliveProbe(null); cleanup(); }
+});
+
+scenario('LW-3: stale lease (>60s) → claimable even if holder alive', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        lease._setAliveProbe(() => true);
+        lease.writeLease('sid-3', LW_OTHER_PID, 'key_a');
+        const staleNow = Date.now() + lease.LEASE_MAX_AGE_MS + 1000;
+        assert.strictEqual(lease.isHeldElsewhere('sid-3', LW_MY_PID, staleNow), false);
+    } finally { lease._setAliveProbe(null); cleanup(); }
+});
+
+scenario('LW-4: own lease → not held elsewhere', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        lease._setAliveProbe(() => true);
+        lease.writeLease('sid-4', LW_MY_PID, 'key_a');
+        assert.strictEqual(lease.isHeldElsewhere('sid-4', LW_MY_PID), false);
+    } finally { lease._setAliveProbe(null); cleanup(); }
+});
+
+scenario('LW-5: removeOwnLease removes own lease but never another window\'s', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        lease._setAliveProbe(() => true);
+        lease.writeLease('sid-5', LW_MY_PID, 'key_a');
+        lease.writeLease('sid-6', LW_OTHER_PID, 'key_b');
+        lease.removeOwnLease('sid-5', LW_MY_PID);
+        lease.removeOwnLease('sid-6', LW_MY_PID);
+        assert.strictEqual(fs.existsSync(path.join(lwTmpDir, 'feedback_gate_lease_sid-5.json')), false, 'own lease removed');
+        assert.strictEqual(fs.existsSync(path.join(lwTmpDir, 'feedback_gate_lease_sid-6.json')), true, 'foreign lease untouched');
+    } finally { lease._setAliveProbe(null); cleanup(); }
+});
+
+scenario('LW-6: cleanStaleLeases removes dead-holder files, keeps live ones', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        lease._setAliveProbe((pid) => pid === LW_MY_PID);
+        lease.writeLease('sid-live', LW_MY_PID, 'k1');
+        lease.writeLease('sid-dead', LW_OTHER_PID, 'k2');
+        lease.cleanStaleLeases(Date.now());
+        assert.strictEqual(fs.existsSync(path.join(lwTmpDir, 'feedback_gate_lease_sid-live.json')), true);
+        assert.strictEqual(fs.existsSync(path.join(lwTmpDir, 'feedback_gate_lease_sid-dead.json')), false);
+    } finally { lease._setAliveProbe(null); cleanup(); }
+});
+
+scenario('LW-7: corrupt lease file → readLease null, never throws', () => {
+    clearLwTmpDir();
+    const { lease, cleanup } = freshLeaseModule();
+    try {
+        fs.writeFileSync(path.join(lwTmpDir, 'feedback_gate_lease_sid-bad.json'), '{not json');
+        assert.strictEqual(lease.readLease('sid-bad'), null);
+        assert.strictEqual(lease.isHeldElsewhere('sid-bad', LW_MY_PID), false);
+    } finally { cleanup(); }
+});
+
+scenario('LW-8: routing defers when another window holds the session lease', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-shared'); // local restored copy exists
+    const result = h.routeTrigger(
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-shared' } },
+        { workspacePath: '', isFocused: true, isLeaseHeldElsewhere: (sid) => sid === 'uuid-shared' }
+    );
+    assert.strictEqual(result.claimed, false);
+    assert.strictEqual(result.reason, 'session lease held elsewhere');
+});
+
+scenario('LW-9: no lease → existing ownership semantics unchanged', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-shared');
+    const result = h.routeTrigger(
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-shared' } },
+        { workspacePath: '', isFocused: false, isLeaseHeldElsewhere: () => false }
+    );
+    assert.strictEqual(result.claimed, true);
+    assert.strictEqual(result.reason, 'session ownership');
+});
+
+scenario('LW-10: lease for a DIFFERENT session does not block this one', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-mine');
+    const result = h.routeTrigger(
+        { timestamp: new Date().toISOString(), data: { session_id: 'uuid-mine' } },
+        { workspacePath: '', isFocused: true, isLeaseHeldElsewhere: (sid) => sid === 'uuid-other' }
+    );
+    assert.strictEqual(result.claimed, true);
+});
+
+try { fs.rmSync(lwTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════
 // Results
