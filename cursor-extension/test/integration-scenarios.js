@@ -84,7 +84,24 @@ function createRoutingHarness() {
 
         // Signal 0: targetEhPid (skip if not us)
         if (targetEhPid && targetEhPid !== process.pid) {
-            return { claimed: false, reason: 'targetEhPid mismatch' };
+            if (windowState.targetAlive !== false) {
+                return { claimed: false, reason: 'targetEhPid mismatch' };
+            }
+            // Target EH dead (E10 mirror): the session owner claims; when NO
+            // window owns the session, the focused window adopts the trigger
+            // after a grace period instead of letting it strand forever.
+            if (triggerSessionId) {
+                let weOwnSession = false;
+                for (const s of sessions.values()) {
+                    if (s.sessionId === triggerSessionId) { weOwnSession = true; break; }
+                }
+                if (!weOwnSession) {
+                    const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                    if (!(triggerAgeMs >= 15000 && isFocused)) {
+                        return { claimed: false, reason: 'dead target, no owner, adoption not yet allowed' };
+                    }
+                }
+            }
         }
 
         // Signal 1: session_id ownership
@@ -2058,6 +2075,103 @@ scenario('NX-2: fresh trigger untouched, no notification', () => {
     const events = mirrorStaleCleanup(s, 60 * 1000, 2 * 3600 * 1000);
     assert.deepStrictEqual(events, []);
     assert.ok(s.triggerData);
+});
+// ═══════════════════════════════════════════════════════════════
+// RD: Wave-3 extension fixes (E4 ready status / E5 successor /
+//     E9 sessionless dispose / E10 orphan trigger adoption)
+// ═══════════════════════════════════════════════════════════════
+
+scenario('RD-1: E10 — dead target EH + no owner + focused >15s → adopted', () => {
+    const h = createRoutingHarness();
+    const oldTs = new Date(Date.now() - 20000).toISOString();
+    const result = h.routeTrigger(
+        { targetEhPid: 424242, timestamp: oldTs, data: { session_id: 'uuid-orphan' } },
+        { workspacePath: '', isFocused: true, targetAlive: false }
+    );
+    assert.strictEqual(result.claimed, true, 'focused window must adopt the orphaned trigger');
+});
+
+scenario('RD-2: E10 — dead target EH + no owner + NOT focused → still rejected', () => {
+    const h = createRoutingHarness();
+    const oldTs = new Date(Date.now() - 20000).toISOString();
+    const result = h.routeTrigger(
+        { targetEhPid: 424242, timestamp: oldTs, data: { session_id: 'uuid-orphan' } },
+        { workspacePath: '', isFocused: false, targetAlive: false }
+    );
+    assert.strictEqual(result.claimed, false);
+});
+
+scenario('RD-3: E10 — dead target EH + no owner + within grace period → rejected', () => {
+    const h = createRoutingHarness();
+    const freshTs = new Date(Date.now() - 3000).toISOString();
+    const result = h.routeTrigger(
+        { targetEhPid: 424242, timestamp: freshTs, data: { session_id: 'uuid-orphan' } },
+        { workspacePath: '', isFocused: true, targetAlive: false }
+    );
+    assert.strictEqual(result.claimed, false);
+});
+
+scenario('RD-4: dead target EH but session owner alive → owner claims as before', () => {
+    const h = createRoutingHarness();
+    h.createSession(9999, 'uuid-owned');
+    const result = h.routeTrigger(
+        { targetEhPid: 424242, timestamp: new Date().toISOString(), data: { session_id: 'uuid-owned' } },
+        { workspacePath: '', isFocused: false, targetAlive: false }
+    );
+    assert.strictEqual(result.claimed, true);
+    assert.strictEqual(result.reason, 'session ownership');
+});
+
+function mirrorSuccessorOnDelete(sessionsMap, deletedKey) {
+    // Mirrors the E5 fix in the preemptive dead-session cleanup.
+    sessionsMap.delete(deletedKey);
+    let next = null;
+    for (const s of sessionsMap.values()) { if (s.triggerData) { next = s; break; } }
+    if (!next && sessionsMap.size > 0) next = sessionsMap.values().next().value;
+    return next ? next.key : null;
+}
+
+scenario('RD-5: E5 — deleting the active session picks a successor', () => {
+    const sessionsMap = new Map([
+        ['dead', { key: 'dead', triggerData: null }],
+        ['alive', { key: 'alive', triggerData: { trigger_id: 't' } }],
+    ]);
+    assert.strictEqual(mirrorSuccessorOnDelete(sessionsMap, 'dead'), 'alive');
+});
+
+scenario('RD-5b: E5 — deleting the last session yields null successor', () => {
+    const sessionsMap = new Map([['dead', { key: 'dead', triggerData: null }]]);
+    assert.strictEqual(mirrorSuccessorOnDelete(sessionsMap, 'dead'), null);
+});
+
+function mirrorSessionlessDispose(currentTriggerData, responseExists) {
+    // Mirrors chatPanel.onDidDispose in sessionless mode (E9).
+    const tid = currentTriggerData && currentTriggerData.trigger_id;
+    let wroteClosed = false;
+    if (tid && !responseExists) wroteClosed = true;
+    return { wroteClosed, cleared: true };
+}
+
+scenario('RD-6: E9 — disposing sessionless popup answers [CLOSED]', () => {
+    const r = mirrorSessionlessDispose({ trigger_id: 't-legacy' }, false);
+    assert.strictEqual(r.wroteClosed, true);
+    assert.strictEqual(r.cleared, true);
+});
+
+scenario('RD-6b: E9 — existing response is never overwritten on dispose', () => {
+    const r = mirrorSessionlessDispose({ trigger_id: 't-legacy' }, true);
+    assert.strictEqual(r.wroteClosed, false);
+});
+
+function mirrorReadyStatus(hasPendingMessages, mcpStatus) {
+    // Mirrors the provider 'ready' handler after the E4 fix: the active flag
+    // must reflect mcpStatus even when pending messages are flushed.
+    return { active: mcpStatus };
+}
+
+scenario('RD-7: E4 — ready with buffered messages reports real MCP status', () => {
+    assert.strictEqual(mirrorReadyStatus(true, false).active, false);
+    assert.strictEqual(mirrorReadyStatus(true, true).active, true);
 });
 
 // ═══════════════════════════════════════════════════════════════

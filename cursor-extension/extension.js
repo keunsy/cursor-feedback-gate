@@ -947,7 +947,7 @@ class FeedbackGatePanelProvider {
                         if (this._pendingMessages.length > 0) {
                             webviewView.webview.postMessage({
                                 command: 'updateMcpStatus',
-                                active: true,
+                                active: mcpStatus,
                                 hasPendingTrigger: hasAnyTrigger
                             });
                             for (const msg of this._pendingMessages) {
@@ -1941,7 +1941,19 @@ function checkTriggerFile(context, filePath) {
                             if (s.sessionId === triggerSessionId) { weOwnSession = true; break; }
                         }
                         console.log(`Feedback Gate: ROUTE dead-ehPid=${targetEhPid} sid=${triggerSessionId.slice(0,8)}... own=${weOwnSession} myPid=${myPid}`);
-                        if (!weOwnSession) return; // Not ours — skip deterministically
+                        if (!weOwnSession) {
+                            // E10: the target EH is dead and NO live window owns this
+                            // session — every window returning here would strand the
+                            // trigger forever. After a grace period the focused window
+                            // adopts it (atomic unlink still guards the claim).
+                            const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                            const isFocusedNow = vscode.window.state && vscode.window.state.focused;
+                            if (triggerAgeMs >= 15000 && isFocusedNow) {
+                                console.log(`Feedback Gate: dead-ehPid orphan trigger sid=${triggerSessionId.slice(0,8)}... — focused window adopting after ${Math.round(triggerAgeMs / 1000)}s`);
+                            } else {
+                                return; // Not ours — skip deterministically
+                            }
+                        }
                     } else {
                         console.log(`Feedback Gate: ROUTE dead-ehPid=${targetEhPid} no-sid, falling through to ws/focus`);
                     }
@@ -2244,8 +2256,11 @@ function checkTriggerFile(context, filePath) {
                     releaseSessionLease(s.sessionId);
                     sessions.delete(sKey);
                     if (activeSessionKey === sKey) {
-                        activeSessionKey = null;
-                        queue.setActiveSessionKey('');
+                        // E5: pick a successor instead of leaving the UI with no
+                        // active session (mirrors closeSessionByKey).
+                        const next = findNextPendingSession() || (sessions.size > 0 ? sessions.values().next().value : null);
+                        activeSessionKey = next ? next.key : null;
+                        queue.setActiveSessionKey(activeSessionKey || '');
                     }
                     cleaned = true;
                 }
@@ -2807,6 +2822,25 @@ function openFeedbackGatePopup(context, options = {}) {
         () => {
             chatPanel = null;
             if (sessions.size === 0) {
+                // E9: sessionless (legacy) mode — closing the tab used to silently
+                // abandon the trigger, leaving the agent hanging until timeout.
+                // Answer [CLOSED] so the request terminates cleanly.
+                const closedTid = currentTriggerData && currentTriggerData.trigger_id;
+                if (closedTid) {
+                    const respFile = getTempPath(`feedback_gate_response_${closedTid}.json`);
+                    if (!fs.existsSync(respFile)) {
+                        try {
+                            const tmp = respFile + '.tmp';
+                            fs.writeFileSync(tmp, JSON.stringify({
+                                response: "[CLOSED] User closed the feedback popup.",
+                                auto_response: true, trigger_id: closedTid,
+                                timestamp: new Date().toISOString()
+                            }, null, 2));
+                            fs.renameSync(tmp, respFile);
+                            console.log(`Feedback Gate: auto-responded [CLOSED] for disposed sessionless trigger ${closedTid}`);
+                        } catch {}
+                    }
+                }
                 currentTriggerData = null;
             }
         },
