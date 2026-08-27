@@ -1967,6 +1967,71 @@ scenario('DP-3: legacy trigger without id → consumed via filePath unlink', () 
 });
 
 // ═══════════════════════════════════════════════════════════════
+// B1: IDE-queue drain must prefer the session that received the message
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors the post-consume drain selection in consumeIdeQueueFile.
+// Old behaviour used findNextPendingSession() which SKIPS the active
+// session, so a message drained into the active session's queue was never
+// sent when another session also waited.
+function mirrorIdeDrainSelection(lastTargetSession, sessionsMap, activeSessionKey) {
+    if (lastTargetSession && lastTargetSession.triggerData && lastTargetSession.triggerData.trigger_id) {
+        return { key: lastTargetSession.key, via: 'routed-target' };
+    }
+    const active = activeSessionKey ? sessionsMap.get(activeSessionKey) : null;
+    let pending = null;
+    for (const s of sessionsMap.values()) {
+        if (s.triggerData && s.key !== activeSessionKey) { pending = s; break; }
+    }
+    if (pending && pending.triggerData && pending.triggerData.trigger_id) {
+        return { key: pending.key, via: 'pending' };
+    }
+    const activeTrigger = active ? active.triggerData : null;
+    if (activeTrigger && activeTrigger.trigger_id) {
+        return { key: activeSessionKey, via: 'active-trigger' };
+    }
+    return null;
+}
+
+scenario('B1-1: message routed to ACTIVE session with trigger → active is drained', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', triggerData: { trigger_id: 'tA' } }],
+        ['k2', { key: 'k2', triggerData: { trigger_id: 'tB' } }],
+    ]);
+    const r = mirrorIdeDrainSelection(sessionsMap.get('k1'), sessionsMap, 'k1');
+    assert.strictEqual(r.key, 'k1');
+    assert.strictEqual(r.via, 'routed-target', 'must not skip the active session');
+});
+
+scenario('B1-2: message routed to non-active session wins over active trigger', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', triggerData: { trigger_id: 'tA' } }],
+        ['k2', { key: 'k2', triggerData: { trigger_id: 'tB' } }],
+    ]);
+    const r = mirrorIdeDrainSelection(sessionsMap.get('k2'), sessionsMap, 'k1');
+    assert.strictEqual(r.key, 'k2');
+});
+
+scenario('B1-3: no routed target → legacy non-active pending fallback', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', triggerData: null }],
+        ['k2', { key: 'k2', triggerData: { trigger_id: 'tB' } }],
+    ]);
+    const r = mirrorIdeDrainSelection(null, sessionsMap, 'k1');
+    assert.strictEqual(r.key, 'k2');
+    assert.strictEqual(r.via, 'pending');
+});
+
+scenario('B1-4: nothing pending anywhere → active-trigger fallback', () => {
+    const sessionsMap = new Map([
+        ['k1', { key: 'k1', triggerData: { trigger_id: 'tA' } }],
+    ]);
+    const r = mirrorIdeDrainSelection(null, sessionsMap, 'k1');
+    assert.strictEqual(r.key, 'k1');
+    assert.strictEqual(r.via, 'active-trigger');
+});
+
+// ═══════════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════════
 
