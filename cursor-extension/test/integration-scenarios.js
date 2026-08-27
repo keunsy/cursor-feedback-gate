@@ -2173,6 +2173,21 @@ scenario('RD-7: E4 — ready with buffered messages reports real MCP status', ()
     assert.strictEqual(mirrorReadyStatus(true, false).active, false);
     assert.strictEqual(mirrorReadyStatus(true, true).active, true);
 });
+// ═══════════════════════════════════════════════════════════════
+// E7: pending webview message buffer must stay bounded
+// ═══════════════════════════════════════════════════════════════
+
+scenario('E7-1: pending message buffer is capped at 500 (oldest dropped first)', () => {
+    // Mirrors the broadcast helpers' cap: if a webview never becomes ready,
+    // buffered messages must not grow without bound.
+    const buf = [];
+    for (let i = 0; i < 600; i++) {
+        buf.push({ id: i });
+        if (buf.length > 500) buf.shift();
+    }
+    assert.strictEqual(buf.length, 500);
+    assert.strictEqual(buf[0].id, 100, 'oldest entries dropped first');
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Results

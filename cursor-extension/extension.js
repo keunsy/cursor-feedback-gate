@@ -790,6 +790,8 @@ function postToWebview(message) {
     const provider = (pref === 'sidebar' ? sidebarViewProvider : chatViewProvider) || sidebarViewProvider || chatViewProvider;
     if (provider) {
         provider._pendingMessages.push(message);
+        // E7: never grow unbounded if the webview never becomes ready.
+        if (provider._pendingMessages.length > 500) provider._pendingMessages.shift();
     }
     return false;
 }
@@ -819,6 +821,8 @@ function broadcastToAllWebviews(message) {
         const provider = (pref === 'sidebar' ? sidebarViewProvider : chatViewProvider) || sidebarViewProvider || chatViewProvider;
         if (provider) {
             provider._pendingMessages.push(message);
+            // E7: never grow unbounded if the webview never becomes ready.
+            if (provider._pendingMessages.length > 500) provider._pendingMessages.shift();
         }
     }
     return sent;
