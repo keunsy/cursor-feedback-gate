@@ -158,6 +158,7 @@ class FeedbackGateServer:
         # evicted trigger) are kept here and delivered — clearly marked — on the
         # next call for the same session.
         self._delayed_replies = {}
+        self._ancestor_pids_cache: list[int] | None = None
         self._session_to_eh_pid: dict[str, int] = {}
         self._session_to_workspace: dict[str, str] = {}
         self._last_response_eh_pid: int | None = None
@@ -288,6 +289,15 @@ class FeedbackGateServer:
             logger.debug(f"Ancestor PID walk stopped: {e}")
         return ancestors
 
+    async def _ancestor_pids_async(self) -> list[int]:
+        """Non-blocking, cached variant of _get_ancestor_pids (F6). The ancestor
+        chain never changes during the process lifetime, so compute it once —
+        off the event loop — and reuse. Previously every trigger write ran up
+        to ten synchronous `ps` subprocesses directly on the event loop."""
+        if self._ancestor_pids_cache is None:
+            self._ancestor_pids_cache = await asyncio.to_thread(self._get_ancestor_pids, self._server_pid)
+        return self._ancestor_pids_cache
+
     def _write_pid_file(self):
         """Write a PID-specific marker file so the extension can identify its MCP server instance.
         
@@ -299,7 +309,9 @@ class FeedbackGateServer:
         """
         try:
             pid_file = Path(get_temp_path(f"feedback_gate_mcp_{self._server_pid}.pid"))
-            ancestors = self._get_ancestor_pids(self._server_pid)
+            if self._ancestor_pids_cache is None:
+                self._ancestor_pids_cache = self._get_ancestor_pids(self._server_pid)
+            ancestors = self._ancestor_pids_cache
             # NOTE: WORKSPACE_FOLDER_PATHS reflects the window that started the
             # MCP, not necessarily the window whose agent calls tools.  Stored
             # here for debugging only; trigger routing must NOT rely on it.
@@ -399,7 +411,10 @@ class FeedbackGateServer:
                 raise
             except Exception as e:
                 logger.error(f"💥 Tool call error for {name}: {e}")
-                error_trigger = _current_trigger_var.get(None) or self._pending_trigger_id
+                # F7: only clean up the trigger THIS coroutine owns (contextvar set).
+                # The old fallback to the shared _pending_trigger_id could evict a live
+                # trigger belonging to another concurrent conversation mid-wait.
+                error_trigger = _current_trigger_var.get(None)
                 if error_trigger:
                     logger.warning(f"🧹 Clearing trigger {error_trigger} due to exception")
                     self._active_triggers.pop(error_trigger, None)
@@ -969,12 +984,20 @@ class FeedbackGateServer:
             pid_trigger_file = Path(get_temp_path(f"feedback_gate_trigger_pid{self._server_pid}.json"))
             check_file = my_trigger_file or pid_trigger_file
             extension_alive = False
-            for _ in range(10):
+            # F3: consumption window is configurable via FEEDBACK_GATE_TRIGGER_TIMEOUT
+            # (seconds, default 5). CLI/remote-control setups can extend it because
+            # their extension may poll more slowly. Keeps the default behaviour intact.
+            try:
+                _consume_timeout = float(os.environ.get("FEEDBACK_GATE_TRIGGER_TIMEOUT", "5"))
+            except (TypeError, ValueError):
+                _consume_timeout = 5.0
+            _consume_deadline = time.time() + max(_consume_timeout, 0.5)
+            extension_alive = False
+            while time.time() < _consume_deadline:
                 await asyncio.sleep(0.5)
                 if not check_file.exists():
                     extension_alive = True
                     break
-            
             if not extension_alive:
                 logger.warning("⚠️ Trigger file not consumed — no Feedback Gate extension detected")
                 self._active_triggers.pop(trigger_id, None)
@@ -1047,11 +1070,16 @@ class FeedbackGateServer:
                 return result
             else:
                 trigger_info = self._active_triggers.get(trigger_id)
-                if trigger_info:
-                    trigger_info["heartbeat_count"] = trigger_info.get("heartbeat_count", 0) + 1
-                    hb_count = trigger_info["heartbeat_count"]
-                else:
-                    hb_count = 1
+                if trigger_info is None:
+                    # F8: the trigger was evicted while we waited (a newer trigger for
+                    # the same session replaced it). Suppress the heartbeat exactly like
+                    # the re-enter path does, so this stale coroutine stops competing
+                    # with the newer trigger's response loop.
+                    logger.info(f"🚫 first-wait trigger {trigger_id} was evicted during wait — suppressing heartbeat")
+                    _log_event("HEARTBEAT_SUPPRESSED", f"trigger={trigger_id} reason=evicted path=first-wait")
+                    return [TextContent(type="text", text=f"SKIP: This feedback request ({trigger_id[:20]}...) has been superseded by a newer request. Do NOT re-call — the newer request is already active.")]
+                trigger_info["heartbeat_count"] = trigger_info.get("heartbeat_count", 0) + 1
+                hb_count = trigger_info["heartbeat_count"]
                 elapsed_total = hb_count * wait_secs
                 elapsed_min = elapsed_total / 60
                 wall_elapsed = time.time() - call_entry_time
@@ -1386,7 +1414,7 @@ class FeedbackGateServer:
             "data": data,
             "pid": self._server_pid,
             "ppid": os.getppid(),
-            "ancestor_pids": self._get_ancestor_pids(self._server_pid),
+            "ancestor_pids": await self._ancestor_pids_async(),
             "target_extension_host_pid": None,
             "workspace_folders": ws,
             "active_window": True,
@@ -1460,6 +1488,12 @@ class FeedbackGateServer:
         
         start_time = time.time()
         check_interval = 0.25
+        # W4: after a window reload/restart the claiming EH is replaced by a new
+        # PID that never saw the trigger file. The recovery rewrite used to run
+        # only at heartbeat boundaries (up to wait_secs apart — minutes), leaving
+        # the popup gone while the user stares at nothing. Probe every 10s; the
+        # rewrite is a no-op while the holder EH is alive.
+        _last_recovery_probe = start_time
         
         while time.time() - start_time < timeout:
             try:
@@ -1479,6 +1513,12 @@ class FeedbackGateServer:
                     else:
                         logger.warning(f"⚠️ Empty or unreadable response file for trigger {trigger_id}")
                 
+                if time.time() - _last_recovery_probe >= 10:
+                    _last_recovery_probe = time.time()
+                    _tinfo = self._active_triggers.get(trigger_id)
+                    if _tinfo:
+                        await self._rewrite_trigger_for_recovery(trigger_id, _tinfo)
+
                 await asyncio.sleep(check_interval)
                 
             except Exception as e:
@@ -1549,7 +1589,7 @@ class FeedbackGateServer:
                 "data": data,
                 "pid": self._server_pid,
                 "ppid": os.getppid(),
-                "ancestor_pids": self._get_ancestor_pids(self._server_pid),
+                "ancestor_pids": await self._ancestor_pids_async(),
                 "target_extension_host_pid": _target_eh_pid,
                 "workspace_folders": _target_workspace or "",
                 "active_window": True,

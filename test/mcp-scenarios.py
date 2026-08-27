@@ -645,6 +645,92 @@ def _(s):
 
 
 # ═══════════════════════════════════════════════════
+# Wave-3 Python batch mirrors (F3/F6/F7/F8/W4)
+# ═══════════════════════════════════════════════════
+
+def mirror_consume_window(env_value):
+    """F3 mirror: FEEDBACK_GATE_TRIGGER_TIMEOUT parsing."""
+    try:
+        v = float(env_value)
+    except (TypeError, ValueError):
+        v = 5.0
+    return max(v, 0.5)
+
+def mirror_ancestor_calls(trigger_writes):
+    """F6 mirror: cached ancestor walk computes exactly once."""
+    calls = 0
+    cache = None
+    for _ in range(trigger_writes):
+        if cache is None:
+            calls += 1
+            cache = [123, 456]
+    return calls
+
+def mirror_error_cleanup(state, own_trigger_id):
+    """F7 mirror: exception cleanup only touches this coroutine's trigger."""
+    error_trigger = own_trigger_id  # contextvar only, no shared fallback
+    if error_trigger:
+        state._active_triggers.pop(error_trigger, None)
+
+def mirror_first_wait_heartbeat(state, trigger_id):
+    """F8 mirror: first-wait timeout branch after eviction."""
+    trigger_info = state._active_triggers.get(trigger_id)
+    if trigger_info is None:
+        return "SKIP_SUPERSEDED"
+    trigger_info["heartbeat_count"] = trigger_info.get("heartbeat_count", 0) + 1
+    return "WAITING"
+
+def mirror_recovery_probes(wait_seconds, probe_interval=10, tick=0.25):
+    """W4 mirror: probe cadence inside the wait loop."""
+    count = 0
+    last = 0.0
+    t = 0.0
+    while t < wait_seconds:
+        t += tick
+        if t - last >= probe_interval:
+            last = t
+            count += 1
+    return count
+
+@scenario("F3-1: trigger consume window honors FEEDBACK_GATE_TRIGGER_TIMEOUT")
+def _(s):
+    assert mirror_consume_window("30") == 30.0
+    assert mirror_consume_window(None) == 5.0     # unset → default unchanged
+    assert mirror_consume_window("bad") == 5.0    # invalid → default unchanged
+    assert mirror_consume_window("0") == 0.5      # sane lower bound
+
+@scenario("F6-1: ancestor PID walk computed once across many trigger writes")
+def _(s):
+    assert mirror_ancestor_calls(10) == 1
+
+@scenario("F7-1: exception cleanup removes only the failing coroutine's trigger")
+def _(s):
+    t_own = s.create_trigger(session_id="sid-own")
+    t_other = s.create_trigger(session_id="sid-other")
+    mirror_error_cleanup(s, t_own)
+    assert t_own not in s._active_triggers
+    assert t_other in s._active_triggers, "concurrent conversation's trigger must survive"
+
+@scenario("F7-2: exception before trigger assignment cleans nothing")
+def _(s):
+    t = s.create_trigger(session_id="sid-A")
+    mirror_error_cleanup(s, None)
+    assert t in s._active_triggers
+
+@scenario("F8-1: evicted first-wait trigger suppresses heartbeat (parity with re-enter)")
+def _(s):
+    t1 = s.create_trigger(session_id="sid-A")
+    t2 = s.create_trigger(session_id="sid-A")  # evicts t1
+    assert mirror_first_wait_heartbeat(s, t1) == "SKIP_SUPERSEDED"
+    assert mirror_first_wait_heartbeat(s, t2) == "WAITING"
+
+@scenario("W4-1: recovery probe fires every 10s inside the wait loop")
+def _(s):
+    assert mirror_recovery_probes(35) == 3   # ~10s, ~20s, ~30s
+    assert mirror_recovery_probes(5) == 0    # short waits rely on heartbeat boundary
+
+
+# ═══════════════════════════════════════════════════
 # Results
 # ═══════════════════════════════════════════════════
 
