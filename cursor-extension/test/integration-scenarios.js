@@ -1438,6 +1438,113 @@ scenario('QM-5: no old PID files — loadQueue works normally', () => {
 try { fs.rmSync(qmTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════
+// AD: Adoption recency (N4) — long-idle sessions must not be resurrected
+// ═══════════════════════════════════════════════════════════════
+
+function createAdoptionHarness() {
+    // Mirrors getOrCreateSessionForTrigger / _tryAdoptUnboundSession in extension.js
+    const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
+    const ADOPT_MAX_SESSION_AGE_MS = 60 * 60 * 1000;
+
+    // Decision when a trigger arrives with an UNKNOWN sessionId and exactly one
+    // existing session: adopt the sole session or create a new one.
+    function decideAdoption(onlySession, incomingSessionId, now) {
+        const hasDifferentActiveSession = onlySession.sessionId && onlySession.sessionId !== incomingSessionId
+            && onlySession.triggerData && (now - onlySession.lastActiveAt) < ADOPT_STALE_TRIGGER_MS;
+        const sessionTooOld = (now - onlySession.lastActiveAt) > ADOPT_MAX_SESSION_AGE_MS;
+        if (hasDifferentActiveSession || sessionTooOld) return 'create';
+        const triggerStale = onlySession.triggerData && (now - onlySession.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
+        if (!onlySession.triggerData || triggerStale) return 'adopt';
+        return 'create';
+    }
+
+    // Mirrors _tryAdoptUnboundSession for triggers WITHOUT session_id.
+    function decideUnboundAdopt(onlySession, now) {
+        if (onlySession.triggerData && (now - onlySession.lastActiveAt) < ADOPT_STALE_TRIGGER_MS) return false;
+        if ((now - onlySession.lastActiveAt) > ADOPT_MAX_SESSION_AGE_MS) return false;
+        return true;
+    }
+
+    return { decideAdoption, decideUnboundAdopt };
+}
+
+scenario('AD-1: recent sole session is adopted on context compaction (new sessionId)', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const s = { sessionId: 'old-uuid', triggerData: null, lastActiveAt: now - 5 * 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'adopt');
+});
+
+scenario('AD-2: sole session idle >1h → new session created, old conversation not resurrected', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const s = { sessionId: 'old-uuid', triggerData: null, lastActiveAt: now - 61 * 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'create');
+});
+
+scenario('AD-3: boundary — session idle for exactly 1h is still adoptable', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const s = { sessionId: 'old-uuid', triggerData: null, lastActiveAt: now - 60 * 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'adopt');
+});
+
+scenario('AD-4: unbound restored session idle >1h is NOT bound to a no-sessionId trigger', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const s = { triggerData: null, lastActiveAt: now - 2 * 60 * 60 * 1000 };
+    assert.strictEqual(h.decideUnboundAdopt(s, now), false);
+});
+
+scenario('AD-5: recently restored unbound session is still bound', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const s = { triggerData: null, lastActiveAt: now - 10 * 60 * 1000 };
+    assert.strictEqual(h.decideUnboundAdopt(s, now), true);
+});
+
+scenario('AD-6: sole session with a different ACTIVE conversation stays protected', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const s = { sessionId: 'other-uuid', triggerData: { trigger_id: 't1' }, lastActiveAt: now - 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'create');
+});
+
+// ═══════════════════════════════════════════════════════════════
+// CL: Close-session guard feedback (N6)
+// ═══════════════════════════════════════════════════════════════
+
+function decideClose(session, now) {
+    // Mirrors closeSessionByKey in extension.js. Returns { allowed, warned }.
+    if (session.triggerData) {
+        const triggerAge = now - session.lastActiveAt;
+        if (triggerAge < 2 * 60 * 1000) {
+            return { allowed: false, warned: true };
+        }
+    }
+    return { allowed: true, warned: false };
+}
+
+scenario('CL-1: closing a session with a fresh trigger is blocked WITH a warning', () => {
+    const now = Date.now();
+    const r = decideClose({ triggerData: { trigger_id: 't' }, lastActiveAt: now - 30 * 1000 }, now);
+    assert.strictEqual(r.allowed, false);
+    assert.strictEqual(r.warned, true, 'user must be told why the close failed');
+});
+
+scenario('CL-2: closing a session with a stale (>2min) trigger is allowed', () => {
+    const now = Date.now();
+    const r = decideClose({ triggerData: { trigger_id: 't' }, lastActiveAt: now - 3 * 60 * 1000 }, now);
+    assert.strictEqual(r.allowed, true);
+});
+
+scenario('CL-3: closing a session without a trigger is allowed silently', () => {
+    const r = decideClose({ triggerData: null, lastActiveAt: Date.now() }, Date.now());
+    assert.strictEqual(r.allowed, true);
+    assert.strictEqual(r.warned, false);
+});
+
+// ═══════════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════════
 

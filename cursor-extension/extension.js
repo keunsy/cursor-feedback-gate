@@ -209,6 +209,9 @@ function _tryAdoptUnboundSession(mcpPid, now) {
     if (unbound.length !== 1) return null;
     const only = unbound[0];
     if (only.triggerData && (now - only.lastActiveAt) < 15 * 60 * 1000) return null;
+    // Never bind a session that has been idle for over an hour — it belongs to an
+    // old conversation; adopting it would resurrect stale history for a new trigger.
+    if ((now - only.lastActiveAt) > 60 * 60 * 1000) return null;
     only.mcpPid = mcpPid;
     only.lastActiveAt = now;
     delete only.restoredAt;
@@ -234,14 +237,16 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
         // Unknown session_id — likely context compaction causing a fresh UUID,
         // or the first call with session_id after an initial call without one.
         // Adopt the sole existing session if it's safe to do so.
-        const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
+            const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
+            const ADOPT_MAX_SESSION_AGE_MS = 60 * 60 * 1000; // never resurrect a conversation idle for over 1h
         if (sessions.size === 1) {
             const only = sessions.values().next().value;
             // Skip if the sole session already owns a DIFFERENT sessionId AND has
             // a non-stale trigger (truly a separate active conversation).
             const hasDifferentActiveSession = only.sessionId && only.sessionId !== sessionId
                 && only.triggerData && (now - only.lastActiveAt) < ADOPT_STALE_TRIGGER_MS;
-            if (!hasDifferentActiveSession) {
+            const sessionTooOld = (now - only.lastActiveAt) > ADOPT_MAX_SESSION_AGE_MS;
+            if (!hasDifferentActiveSession && !sessionTooOld) {
                 const triggerStale = only.triggerData && (now - only.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
                 if (!only.triggerData || triggerStale) {
                     if (triggerStale) {
@@ -638,7 +643,10 @@ function closeSessionByKey(key) {
     // Only block closing if trigger is active and recent.
     if (toClose.triggerData) {
         const triggerAge = Date.now() - toClose.lastActiveAt;
-        if (triggerAge < 2 * 60 * 1000) return;
+        if (triggerAge < 2 * 60 * 1000) {
+            vscode.window.showWarningMessage('Feedback Gate: 该会话有正在等待的反馈请求，请先回复或稍后再关闭');
+            return;
+        }
         // Stale trigger — auto-respond before closing
         const staleTid = toClose.triggerData.trigger_id;
         if (staleTid) {
