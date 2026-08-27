@@ -1181,27 +1181,39 @@ function activate(context) {
                 const pendingTriggers = [];
                 for (const session of sessions.values()) {
                     if (session.triggerData && session.triggerData.trigger_id) {
-                        pendingTriggers.push(session.triggerData.trigger_id);
-                        session.triggerData = null;
+                        pendingTriggers.push({ triggerId: session.triggerData.trigger_id, session });
                     }
                 }
                 if (currentTriggerData && currentTriggerData.trigger_id) {
-                    pendingTriggers.push(currentTriggerData.trigger_id);
-                    currentTriggerData = null;
+                    pendingTriggers.push({ triggerId: currentTriggerData.trigger_id, session: null });
                 }
-                for (const triggerId of pendingTriggers) {
+                for (const pending of pendingTriggers) {
+                    const { triggerId, session } = pending;
                     const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
-                    if (!fs.existsSync(responseFile)) {
-                        const tmpPath = responseFile + '.tmp';
-                        fs.writeFileSync(tmpPath, JSON.stringify({
-                            response: "TASK_COMPLETE",
-                            auto_response: true,
-                            feedback_gate_disabled: true,
-                            timestamp: new Date().toISOString(),
-                            trigger_id: triggerId
-                        }, null, 2));
-                        fs.renameSync(tmpPath, responseFile);
-                        console.log(`Feedback Gate: auto-responded TASK_COMPLETE for pending trigger ${triggerId}`);
+                    // An already-written response means the agent can proceed regardless.
+                    let responded = fs.existsSync(responseFile);
+                    if (!responded) {
+                        try {
+                            const tmpPath = responseFile + '.tmp';
+                            fs.writeFileSync(tmpPath, JSON.stringify({
+                                response: "TASK_COMPLETE",
+                                auto_response: true,
+                                feedback_gate_disabled: true,
+                                timestamp: new Date().toISOString(),
+                                trigger_id: triggerId
+                            }, null, 2));
+                            fs.renameSync(tmpPath, responseFile);
+                            responded = true;
+                            console.log(`Feedback Gate: auto-responded TASK_COMPLETE for pending trigger ${triggerId}`);
+                        } catch (e) {
+                            console.log(`Feedback Gate: failed to auto-respond for pending trigger ${triggerId}: ${e.message}`);
+                        }
+                    }
+                    if (responded) {
+                        // Drop the popup state only once the agent can actually proceed;
+                        // a failed write keeps the popup alive so nothing is orphaned.
+                        if (session) session.triggerData = null;
+                        else currentTriggerData = null;
                     }
                 }
                 syncTabsToWebview();
@@ -2058,21 +2070,36 @@ function checkTriggerFile(context, filePath) {
             // Auto-passthrough when disabled
             if (!feedbackGateEnabled) {
                 if (triggerId) {
-                    const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
-                    const tmpPath = responseFile + '.tmp';
-                    fs.writeFileSync(tmpPath, JSON.stringify({
-                        response: "TASK_COMPLETE",
-                        auto_response: true,
-                        feedback_gate_disabled: true,
-                        timestamp: new Date().toISOString(),
-                        trigger_id: triggerId
-                    }, null, 2));
-                    fs.renameSync(tmpPath, responseFile);
-                    sendExtensionAcknowledgement(triggerId, (triggerData.data && triggerData.data.tool) || 'feedback_gate_chat');
+                    let passOk = false;
+                    try {
+                        const responseFile = getTempPath(`feedback_gate_response_${triggerId}.json`);
+                        const tmpPath = responseFile + '.tmp';
+                        fs.writeFileSync(tmpPath, JSON.stringify({
+                            response: "TASK_COMPLETE",
+                            auto_response: true,
+                            feedback_gate_disabled: true,
+                            timestamp: new Date().toISOString(),
+                            trigger_id: triggerId
+                        }, null, 2));
+                        fs.renameSync(tmpPath, responseFile);
+                        passOk = true;
+                    } catch (e) {
+                        console.log(`Feedback Gate: disabled-passthrough write failed for ${triggerId}: ${e.message}`);
+                    }
+                    if (passOk) {
+                        sendExtensionAcknowledgement(triggerId, (triggerData.data && triggerData.data.tool) || 'feedback_gate_chat');
+                        try { fs.unlinkSync(filePath); } catch {}
+                        console.log('Feedback Gate disabled — auto-passthrough sent');
+                        return;
+                    }
+                    // Write failed AFTER the trigger was claimed: fall through to the
+                    // popup route instead of dropping the trigger.
+                    console.log('Feedback Gate disabled — passthrough write FAILED, falling back to popup route');
+                } else {
+                    try { fs.unlinkSync(filePath); } catch {}
+                    console.log('Feedback Gate disabled — auto-passthrough sent');
+                    return;
                 }
-                try { fs.unlinkSync(filePath); } catch {}
-                console.log('Feedback Gate disabled — auto-passthrough sent');
-                return;
             }
             
             // Check queue first: if messages waiting, auto-respond with queue head.

@@ -1888,6 +1888,83 @@ scenario('EC-2: response write FAILS → item requeued + trigger routed to popup
     assert.strictEqual(r.queueItem.status, 'pending', 'message must be requeued, not lost');
     assert.strictEqual(r.queueItem.processingAt, undefined);
 });
+// ═══════════════════════════════════════════════════════════════
+// TG: Toggle-disable must not orphan pending triggers (E3)
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors the feedbackGate.toggle disable branch: for each pending trigger,
+// attempt to write a TASK_COMPLETE response (per-item try/catch); clear the
+// session's triggerData ONLY when a response actually exists. A failed write
+// must keep the popup alive so the trigger is not orphaned.
+function mirrorToggleDisable(pendingTriggers, opts) {
+    const failIds = new Set(opts.failIds || []);
+    const existingResponses = new Set(opts.existingResponses || []);
+    let uncaught = null;
+    const cleared = [];
+    const kept = [];
+    try {
+        for (const triggerId of pendingTriggers) {
+            let responded = existingResponses.has(triggerId);
+            if (!responded) {
+                try {
+                    if (failIds.has(triggerId)) throw new Error('disk full');
+                    responded = true; // write succeeded
+                } catch (e) { /* per-item swallow */ }
+            }
+            if (responded) cleared.push(triggerId); else kept.push(triggerId);
+        }
+    } catch (e) { uncaught = e; }
+    return { cleared, kept, uncaught };
+}
+
+scenario('TG-1: all writes succeed → every pending trigger cleared', () => {
+    const r = mirrorToggleDisable(['t1', 't2'], {});
+    assert.deepStrictEqual(r.cleared, ['t1', 't2']);
+    assert.deepStrictEqual(r.kept, []);
+    assert.strictEqual(r.uncaught, null);
+});
+
+scenario('TG-2: one write fails → that popup stays, others cleared, no throw', () => {
+    const r = mirrorToggleDisable(['t1', 't2', 't3'], { failIds: ['t2'] });
+    assert.deepStrictEqual(r.cleared, ['t1', 't3']);
+    assert.deepStrictEqual(r.kept, ['t2'], 'failed trigger must keep its popup');
+    assert.strictEqual(r.uncaught, null, 'failure must not abort the loop');
+});
+
+scenario('TG-3: pre-existing response counts as answered → cleared', () => {
+    const r = mirrorToggleDisable(['t1'], { existingResponses: ['t1'] });
+    assert.deepStrictEqual(r.cleared, ['t1']);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DP: Disabled auto-passthrough must survive a write failure (E3)
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors the disabled-passthrough branch in checkTriggerFile. The trigger is
+// ALREADY claimed before this runs, so a failed write must fall through to the
+// popup route instead of returning.
+function mirrorDisabledPassthrough(writeOk, hasTriggerId) {
+    if (!hasTriggerId) return { consumed: true, fellThrough: false };
+    if (writeOk) return { consumed: true, fellThrough: false };
+    return { consumed: false, fellThrough: true };
+}
+
+scenario('DP-1: disabled passthrough write succeeds → consumed', () => {
+    const r = mirrorDisabledPassthrough(true, true);
+    assert.strictEqual(r.consumed, true);
+    assert.strictEqual(r.fellThrough, false);
+});
+
+scenario('DP-2: disabled passthrough write FAILS → falls through to popup (trigger not dropped)', () => {
+    const r = mirrorDisabledPassthrough(false, true);
+    assert.strictEqual(r.consumed, false);
+    assert.strictEqual(r.fellThrough, true);
+});
+
+scenario('DP-3: legacy trigger without id → consumed via filePath unlink', () => {
+    const r = mirrorDisabledPassthrough(false, false);
+    assert.strictEqual(r.consumed, true);
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Results
