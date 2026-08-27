@@ -399,3 +399,5 @@ $RECYCLE.BIN/
 # Network shortcuts
 *.url
 *.lnk
+# Editor/harness internal state
+.dsh_better_edit/

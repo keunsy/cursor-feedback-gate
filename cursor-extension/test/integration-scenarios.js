@@ -1441,6 +1441,37 @@ scenario('QM-5: no old PID files — loadQueue works normally', () => {
     } finally { cleanup(); }
 });
 
+scenario('QM-6: reload keeps session tags on own-PID queue file (E2)', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(66670, [
+        { id: 1, text: 'tagged survives reload', status: 'pending', sessionKey: 'sess_alive' },
+        { id: 2, text: 'untagged stays', status: 'pending', sessionKey: '' },
+    ]);
+    const { qm, cleanup } = freshQueueModule(66670);
+    try {
+        qm.loadQueue();
+        assert.strictEqual(qm.getPendingQueueCount('sess_alive'), 1, 'tagged item keeps its session across reload');
+        assert.strictEqual(qm.getPendingQueueCount(''), 1, 'untagged item stays untagged');
+    } finally { cleanup(); }
+});
+
+scenario('QM-7: migrateOrphanSessionKeys de-tags only vanished sessions (E2)', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(66680, [
+        { id: 1, text: 'live', status: 'pending', sessionKey: 'sess_alive' },
+        { id: 2, text: 'gone', status: 'pending', sessionKey: 'sess_gone' },
+    ]);
+    const { qm, cleanup } = freshQueueModule(66680);
+    try {
+        qm.loadQueue();
+        assert.strictEqual(qm.getPendingQueueCount('sess_gone'), 1, 'tags intact right after load');
+        qm.migrateOrphanSessionKeys(new Set(['sess_alive']));
+        assert.strictEqual(qm.getPendingQueueCount('sess_alive'), 1, 'live session keeps its message');
+        assert.strictEqual(qm.getPendingQueueCount('sess_gone'), 0, 'orphan tag dropped');
+        assert.strictEqual(qm.getPendingQueueCount(''), 1, 'orphan message now in untagged pool');
+    } finally { cleanup(); }
+});
+
 try { fs.rmSync(qmTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════

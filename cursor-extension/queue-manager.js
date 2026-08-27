@@ -107,11 +107,6 @@ function loadQueue() {
                     delete m.processingAt;
                     changed = true;
                 }
-                if (m.sessionKey) {
-                    m._prevSessionKey = m.sessionKey;
-                    m.sessionKey = '';
-                    changed = true;
-                }
             });
             messageQueue = messageQueue.filter(m => m.status !== 'done');
             if (changed || messageQueue.length !== (data.items || []).length) {

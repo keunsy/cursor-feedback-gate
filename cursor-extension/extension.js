@@ -1224,6 +1224,11 @@ function activate(context) {
     
     // Load persisted queue
     queue.loadQueue();
+    // Sessions are restored BEFORE the queue loads: keep session tags that
+    // still point at a live (restored) session, and only de-tag items whose
+    // session no longer exists. Reload must not shuffle tagged messages back
+    // into the untagged global pool where another session could eat them.
+    queue.migrateOrphanSessionKeys(new Set(sessions.keys()));
     
     vscode.window.showInformationMessage('Feedback Gate 已激活！等待 MCP 工具调用即可。');
 }
