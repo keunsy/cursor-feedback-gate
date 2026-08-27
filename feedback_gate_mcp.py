@@ -153,6 +153,11 @@ class FeedbackGateServer:
         self._server_pid = os.getpid()
         self._active_triggers = {}
         self._last_responded_by_session = {}
+        # F1/F2 delayed-reply stash: {session_id: [{text, ts, origin_trigger_id}]}.
+        # Replies that were consumed but never delivered (cancelled tool call,
+        # evicted trigger) are kept here and delivered — clearly marked — on the
+        # next call for the same session.
+        self._delayed_replies = {}
         self._session_to_eh_pid: dict[str, int] = {}
         self._session_to_workspace: dict[str, str] = {}
         self._last_response_eh_pid: int | None = None
@@ -424,6 +429,54 @@ class FeedbackGateServer:
         self._heartbeat_count = 0
         self._last_trigger_responded_at = time.time() if responded else 0
 
+    # ── Delayed-reply stash (F1/F2) ────────────────────────────────────────
+    _DELAYED_REPLY_TTL = 3600  # seconds; older stashed replies are dropped
+
+    def _stash_delayed_reply(self, session_id: str, text: str, origin_trigger_id: str):
+        if not session_id or not text:
+            return
+        self._delayed_replies.setdefault(session_id, []).append({
+            "text": text,
+            "ts": time.time(),
+            "origin_trigger_id": origin_trigger_id or "",
+        })
+        logger.info(f"📦 Stashed delayed reply for session {session_id[:8]}... (origin trigger ...{(origin_trigger_id or '')[-12:]})")
+        _log_event("STASH_DELAYED_REPLY", f"session={session_id} trigger={origin_trigger_id}")
+
+    def _remove_stashed_reply(self, session_id: str, trigger_id: str):
+        """Called on normal delivery: the reply reached Cursor, drop the safety copy."""
+        entries = self._delayed_replies.get(session_id)
+        if not entries:
+            return
+        self._delayed_replies[session_id] = [e for e in entries if e.get("origin_trigger_id") != trigger_id]
+        if not self._delayed_replies[session_id]:
+            del self._delayed_replies[session_id]
+
+    def _pop_delayed_replies(self, session_id: str) -> list:
+        entries = self._delayed_replies.pop(session_id, [])
+        if not entries:
+            return []
+        now = time.time()
+        fresh = [e for e in entries if (now - e.get("ts", 0)) <= self._DELAYED_REPLY_TTL]
+        dropped = len(entries) - len(fresh)
+        if dropped:
+            logger.info(f"🗑️ Dropped {dropped} expired delayed reply(ies) for session {session_id[:8]}...")
+        return fresh
+
+    def _drain_response_to_stash(self, trigger_id: str, session_id: str):
+        """Rescue an already-written response BEFORE its trigger record is evicted.
+        Without this, a reply that lands moments after eviction becomes an orphan
+        file that nobody consumes (F2)."""
+        if not session_id or not trigger_id:
+            return
+        response_file = Path(get_temp_path(f"feedback_gate_response_{trigger_id}.json"))
+        if not response_file.exists():
+            return
+        user_input = self._read_and_consume_response(response_file)
+        if user_input:
+            logger.warning(f"📦 Eviction of trigger ...{trigger_id[-12:]} found an undelivered reply — stashing for session {session_id[:8]}...")
+            self._stash_delayed_reply(session_id, user_input, trigger_id)
+
     def _read_and_consume_response(self, response_file: Path) -> str | None:
         """Read a response JSON file, populate _last_attachments/_last_files, delete the file.
         Returns user_input string or None if parsing failed.
@@ -618,6 +671,28 @@ class FeedbackGateServer:
         logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | session_id={session_id or 'none'} | msg_preview={message[:80]}...")
         _log_event("ENTERED", f"trigger={self._pending_trigger_id} hb={self._heartbeat_count} sid={session_id or 'none'} msg={message[:60]}")
         
+        # F1/F2: deliver replies that were consumed but never reached the agent
+        # for this session (cancelled tool call / evicted trigger). They come back
+        # clearly marked; afterwards this call proceeds normally (fresh popup for
+        # the current question on the next invocation).
+        if session_id:
+            _delayed = self._pop_delayed_replies(session_id)
+            if _delayed:
+                _parts = []
+                for _e in _delayed:
+                    _origin = (_e.get("origin_trigger_id") or "")[-12:]
+                    _parts.append(
+                        f"[DELAYED REPLY — the user answered a PREVIOUS request (trigger ...{_origin}) "
+                        f"that was cancelled or expired before delivery. It is NOT the answer to the "
+                        f"current question.]\n{_e.get('text', '')}"
+                    )
+                _combined = "\n\n---\n\n".join(_parts)
+                self._last_trigger_responded_at = time.time()
+                self._last_responded_by_session[session_id or "__global__"] = time.time()
+                logger.info(f"📬 Delivering {len(_delayed)} delayed reply(ies) for session {session_id[:8]}...")
+                _log_event("DELIVER_DELAYED_REPLY", f"session={session_id} count={len(_delayed)}")
+                return [TextContent(type="text", text=f"User Response: {_combined}{_FEEDBACK_REPLY_SUFFIX}")]
+
         is_remote = bool(self._find_routing_file())
         
         # --- Multi-conversation support ---
@@ -658,6 +733,7 @@ class FeedbackGateServer:
             for tid in same_session_stale:
                 logger.warning(f"🧹 Evicting same-session stale trigger {tid} (session={session_id}, keeping={my_trigger_id})")
                 _log_event("EVICT_SAME_SESSION", f"evicted={tid} kept={my_trigger_id} session={session_id}")
+                self._drain_response_to_stash(tid, session_id)
                 del self._active_triggers[tid]
                 if self._pending_trigger_id == tid:
                     self._clear_trigger_state(responded=False)
@@ -673,6 +749,7 @@ class FeedbackGateServer:
         for tid in stale_ids:
             logger.warning(f"🧹 Clearing stale trigger {tid}")
             _log_event("TRIGGER_EXPIRED", f"trigger={tid}")
+            self._drain_response_to_stash(tid, (self._active_triggers.get(tid) or {}).get("session_id") or "")
             del self._active_triggers[tid]
         
         _MAX_ACTIVE_TRIGGERS = 20
@@ -681,6 +758,7 @@ class FeedbackGateServer:
             if evict_candidates:
                 oldest_tid = min(evict_candidates, key=lambda t: self._active_triggers[t].get("created_at", 0))
                 logger.warning(f"🧹 Evicting oldest trigger {oldest_tid} (cap={_MAX_ACTIVE_TRIGGERS})")
+                self._drain_response_to_stash(oldest_tid, (self._active_triggers.get(oldest_tid) or {}).get("session_id") or "")
                 del self._active_triggers[oldest_tid]
                 if self._pending_trigger_id == oldest_tid:
                     self._clear_trigger_state(responded=False)
@@ -690,6 +768,10 @@ class FeedbackGateServer:
                           if (now - t) > _SESSION_COOLDOWN_TTL]
         for k in stale_sessions:
             del self._last_responded_by_session[k]
+        _stale_reply_keys = [k for k, entries in self._delayed_replies.items()
+                             if not entries or (now - max(e.get("ts", 0) for e in entries)) > self._DELAYED_REPLY_TTL]
+        for k in _stale_reply_keys:
+            del self._delayed_replies[k]
         
         if self._pending_trigger_id and self._pending_trigger_id not in self._active_triggers:
             stale_age = now - self._pending_trigger_created_at if self._pending_trigger_created_at else float('inf')
@@ -858,6 +940,7 @@ class FeedbackGateServer:
                 for tid in old_session_triggers:
                     logger.warning(f"🧹 Evicting old trigger {tid} before registering new trigger {trigger_id} (session={session_id})")
                     _log_event("EVICT_ON_NEW_TRIGGER", f"evicted={tid} new={trigger_id} session={session_id}")
+                    self._drain_response_to_stash(tid, session_id)
                     del self._active_triggers[tid]
                     if self._pending_trigger_id == tid:
                         self._clear_trigger_state(responded=False)
@@ -945,6 +1028,8 @@ class FeedbackGateServer:
             
             if user_input:
                 self._active_triggers.pop(trigger_id, None)
+                if session_id:
+                    self._remove_stashed_reply(session_id, trigger_id)
                 if session_id and self._last_response_eh_pid:
                     self._session_to_eh_pid[session_id] = self._last_response_eh_pid
                 if session_id and self._last_response_workspace:
@@ -1381,6 +1466,14 @@ class FeedbackGateServer:
                 if primary_response.exists():
                     user_input = self._read_and_consume_response(primary_response)
                     if user_input:
+                        # F1 recovery stash: the response FILE is already consumed at this
+                        # point. If the coroutine is cancelled between here and the tool
+                        # result reaching Cursor, the reply would vanish. Keep a safety copy
+                        # keyed by session; the normal completion path removes it, while a
+                        # cancellation leaves it behind for next-call delivery.
+                        _stash_sid = (self._active_triggers.get(trigger_id) or {}).get("session_id") or ""
+                        if _stash_sid:
+                            self._stash_delayed_reply(_stash_sid, user_input, trigger_id)
                         logger.info(f"🎉 RECEIVED USER INPUT for trigger {trigger_id}: {user_input[:100]}...")
                         return user_input
                     else:

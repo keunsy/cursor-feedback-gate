@@ -23,6 +23,9 @@ class MockFeedbackGateState:
     def __init__(self):
         self._active_triggers = {}
         self._last_responded_by_session = {}
+        self._delayed_replies = {}
+        self._response_files = {}
+        self._DELAYED_REPLY_TTL = 3600
         self._session_to_eh_pid = {}
         self._session_to_workspace = {}
         self._pending_trigger_id = None
@@ -51,6 +54,55 @@ class MockFeedbackGateState:
         self._pending_trigger_message = None
         self._heartbeat_count = 0
 
+    # ── Delayed-reply stash mirrors (F1/F2) ────────────────────────────────
+    def _stash_delayed_reply(self, session_id, text, origin_trigger_id):
+        if not session_id or not text:
+            return
+        self._delayed_replies.setdefault(session_id, []).append({
+            "text": text, "ts": self._now(), "origin_trigger_id": origin_trigger_id or "",
+        })
+
+    def _remove_stashed_reply(self, session_id, trigger_id):
+        entries = self._delayed_replies.get(session_id)
+        if not entries:
+            return
+        self._delayed_replies[session_id] = [e for e in entries if e.get("origin_trigger_id") != trigger_id]
+        if not self._delayed_replies[session_id]:
+            del self._delayed_replies[session_id]
+
+    def _pop_delayed_replies(self, session_id):
+        entries = self._delayed_replies.pop(session_id, [])
+        if not entries:
+            return []
+        now = self._now()
+        return [e for e in entries if (now - e.get("ts", 0)) <= self._DELAYED_REPLY_TTL]
+
+    def set_response_file(self, trigger_id, text):
+        self._response_files[trigger_id] = text
+
+    def _drain_response_to_stash(self, trigger_id, session_id):
+        text = self._response_files.pop(trigger_id, None)
+        if text:
+            self._stash_delayed_reply(session_id, text, trigger_id)
+
+    def consume_reply(self, session_id, trigger_id, text, cancelled):
+        """Mirror of _wait_for_user_input consumption + first-wait completion (F1).
+        The reply is ALWAYS stashed the moment it is consumed; normal completion
+        removes the safety copy, cancellation leaves it for next-call delivery."""
+        self._stash_delayed_reply(session_id, text, trigger_id)
+        if not cancelled:
+            self._remove_stashed_reply(session_id, trigger_id)
+            return text
+        return None
+
+    def next_call_deliver_delayed(self, session_id):
+        """Mirror of _handle_feedback_gate_chat entry (delayed-reply delivery)."""
+        delayed = self._pop_delayed_replies(session_id)
+        if not delayed:
+            return None
+        parts = [f"[DELAYED REPLY]\n{e['text']}" for e in delayed]
+        return "\n\n---\n\n".join(parts)
+
     def create_trigger(self, session_id="", message="test"):
         """Simulates new trigger creation (success path after extension consumes file)."""
         self._trigger_counter += 1
@@ -62,6 +114,7 @@ class MockFeedbackGateState:
             old = [tid for tid, info in self._active_triggers.items()
                    if info.get("session_id") == session_id]
             for tid in old:
+                self._drain_response_to_stash(tid, session_id)
                 del self._active_triggers[tid]
                 if self._pending_trigger_id == tid:
                     self._clear_trigger_state(responded=False)
@@ -544,6 +597,51 @@ def _(s):
     cleaned = s.clean_stale_triggers(is_remote=False, exclude_tid=t_new)
     assert t_old in cleaned
     assert t_new in s._active_triggers
+
+
+# ═══════════════════════════════════════════════════
+# DR: Delayed-reply stash (F1 cancel race / F2 eviction orphans)
+# ═══════════════════════════════════════════════════
+
+@scenario("DR-1: F1 — reply consumed then call cancelled → delivered (marked) on next same-session call")
+def _(s):
+    tid = s.create_trigger(session_id="sid-A")
+    s.consume_reply("sid-A", tid, "我的回复", cancelled=True)
+    out = s.next_call_deliver_delayed("sid-A")
+    assert out is not None
+    assert "我的回复" in out
+    assert "DELAYED REPLY" in out
+
+@scenario("DR-2: F1 — normal delivery removes the safety stash")
+def _(s):
+    tid = s.create_trigger(session_id="sid-A")
+    s.consume_reply("sid-A", tid, "正常回复", cancelled=False)
+    assert s.next_call_deliver_delayed("sid-A") is None
+
+@scenario("DR-3: F2 — eviction drains an already-written response into the stash")
+def _(s):
+    t1 = s.create_trigger(session_id="sid-A")
+    s.set_response_file(t1, "迟到的回复")
+    t2 = s.create_trigger(session_id="sid-A")  # evicts t1
+    assert t1 not in s._active_triggers
+    out = s.next_call_deliver_delayed("sid-A")
+    assert out is not None and "迟到的回复" in out
+    assert t2 in s._active_triggers
+
+@scenario("DR-4: stashed reply older than TTL is dropped, not delivered")
+def _(s):
+    tid = s.create_trigger(session_id="sid-A")
+    s.consume_reply("sid-A", tid, "过期回复", cancelled=True)
+    s.advance(s._DELAYED_REPLY_TTL + 10)
+    assert s.next_call_deliver_delayed("sid-A") is None
+
+@scenario("DR-5: delayed replies are isolated per session")
+def _(s):
+    tid = s.create_trigger(session_id="sid-A")
+    s.consume_reply("sid-A", tid, "A 的回复", cancelled=True)
+    assert s.next_call_deliver_delayed("sid-B") is None
+    out = s.next_call_deliver_delayed("sid-A")
+    assert out is not None and "A 的回复" in out
 
 
 # ═══════════════════════════════════════════════════
