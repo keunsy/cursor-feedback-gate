@@ -536,7 +536,7 @@ function cleanupStaleSessions() {
     }
     for (const key of toRemove) {
         console.log(`Feedback Gate: cleaning stale session ${key}`);
-        queue.migrateSessionKey(key, '');
+        queue.removeItemsForSession(key); // W1: discard, don't orphan
         const removedSession = sessions.get(key);
         if (removedSession) releaseSessionLease(removedSession.sessionId);
         sessions.delete(key);
@@ -731,7 +731,7 @@ function closeSessionByKey(key) {
             }
         }
     }
-    queue.migrateSessionKey(key, '');
+    queue.removeItemsForSession(key); // W1: discard, don't orphan
     releaseSessionLease(toClose.sessionId);
     sessions.delete(key);
     persistSessions();
@@ -2256,7 +2256,7 @@ function checkTriggerFile(context, filePath) {
                 if (triggerSessionId && s.sessionId === triggerSessionId) continue;
                 if (!isProcessAlive(s.mcpPid)) {
                     console.log(`Feedback Gate: cleaning dead session ${sKey} (PID ${s.mcpPid} gone)`);
-                    queue.migrateSessionKey(sKey, '');
+                    queue.removeItemsForSession(sKey); // W1: discard, don't orphan
                     releaseSessionLease(s.sessionId);
                     sessions.delete(sKey);
                     if (activeSessionKey === sKey) {

@@ -1489,6 +1489,59 @@ scenario('QM-7: migrateOrphanSessionKeys de-tags only vanished sessions (E2)', (
     } finally { cleanup(); }
 });
 
+scenario('QM-8: removeItemsForSession discards messages of a closed session (W1)', () => {
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66690);
+    try {
+        qm.setActiveSessionKey('sess_a');
+        qm.enqueueMessage('a1');
+        qm.enqueueMessage('a2');
+        qm.setActiveSessionKey('sess_b');
+        qm.enqueueMessage('b1');
+        const removed = qm.removeItemsForSession('sess_a');
+        assert.strictEqual(removed, 2, 'both messages of the closed session discarded');
+        assert.strictEqual(qm.getPendingQueueCount('sess_a'), 0);
+        assert.strictEqual(qm.getPendingQueueCount('sess_b'), 1, 'other session untouched');
+    } finally { cleanup(); }
+});
+
+scenario('QM-9: removeItemsForSession also drops untagged leftovers (W1)', () => {
+    // Messages de-tagged earlier (reload/orphan migration) still carry
+    // _prevSessionKey — closing that session must discard them too.
+    clearQmTmpDir();
+    writeOldPidQueueFile(66700, [
+        { id: 1, text: 'orphan', status: 'pending', sessionKey: 'sess_gone' },
+        { id: 2, text: 'keep', status: 'pending', sessionKey: 'sess_keep' },
+    ]);
+    const { qm, cleanup } = freshQueueModule(66700);  // own pid → tags intact
+    try {
+        qm.loadQueue();
+        qm.migrateOrphanSessionKeys(new Set(['sess_keep']));  // de-tags sess_gone only
+        const removed = qm.removeItemsForSession('sess_gone');
+        assert.strictEqual(removed, 1, 'untagged leftover of closed session discarded');
+        assert.strictEqual(qm.getPendingQueueCount('sess_keep'), 1, 'live session untouched');
+        assert.strictEqual(qm.getPendingQueueCount(''), 0, 'no untagged leftovers');
+    } finally { cleanup(); }
+});
+
+scenario('QM-9b: removeItemsForSession persists the removal across reload (W1)', () => {
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66710);
+    try {
+        qm.setActiveSessionKey('sess_a');
+        qm.enqueueMessage('a1');
+        qm.setActiveSessionKey('sess_b');
+        qm.enqueueMessage('b1');
+        qm.removeItemsForSession('sess_a');
+        const { qm: qm2, cleanup: cleanup2 } = freshQueueModule(66710);
+        try {
+            qm2.loadQueue();
+            assert.strictEqual(qm2.getPendingQueueCount('sess_a'), 0, 'removal survived reload');
+            assert.strictEqual(qm2.getPendingQueueCount('sess_b'), 1);
+        } finally { cleanup2(); }
+    } finally { cleanup(); }
+});
+
 try { fs.rmSync(qmTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════

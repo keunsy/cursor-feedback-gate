@@ -148,6 +148,23 @@ function migrateSessionKey(fromKey, toKey) {
     if (changed) saveQueue();
 }
 
+// W1: when a session disappears (user closes it, or it is cleaned as dead/stale),
+// its queued messages are discarded outright — the user chose drop over keeping
+// them as untagged orphans. Also matches leftovers de-tagged earlier via
+// _prevSessionKey (reload / orphan migration).
+function removeItemsForSession(sessionKey) {
+    if (!sessionKey) return 0;
+    const before = messageQueue.length;
+    messageQueue = messageQueue.filter(m => m.sessionKey !== sessionKey && m._prevSessionKey !== sessionKey);
+    const removed = before - messageQueue.length;
+    if (removed > 0) {
+        saveQueue();
+        console.log(`Feedback Gate queue: W1 discarded ${removed} message(s) for closed session "${sessionKey}"`);
+        syncToWebview(sessionKey);
+    }
+    return removed;
+}
+
 function migrateOrphanSessionKeys(validKeys) {
     let changed = false;
     messageQueue.forEach(m => {
@@ -372,5 +389,6 @@ module.exports = {
     syncToWebview,
     setActiveSessionKey,
     migrateSessionKey,
+    removeItemsForSession,
     migrateOrphanSessionKeys,
 };
