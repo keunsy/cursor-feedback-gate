@@ -2030,6 +2030,35 @@ scenario('B1-4: nothing pending anywhere → active-trigger fallback', () => {
     assert.strictEqual(r.key, 'k1');
     assert.strictEqual(r.via, 'active-trigger');
 });
+// ═══════════════════════════════════════════════════════════════
+// NX: expired triggers must be announced in the UI (N5)
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors the cleanupStaleSessions 2h trigger cleanup: clearing a stale
+// trigger must ALSO emit a user-visible system message, so users understand
+// why the popup no longer accepts an answer to the old question.
+function mirrorStaleCleanup(session, ageMs, STALE_TRIGGER_MS) {
+    const events = [];
+    if (session.triggerData && ageMs > STALE_TRIGGER_MS) {
+        session.triggerData = null;
+        events.push('trigger-cleared');
+        events.push('system-message');
+    }
+    return events;
+}
+
+scenario('NX-1: 2h-stale trigger cleared WITH a visible system notification', () => {
+    const s = { triggerData: { trigger_id: 't' } };
+    const events = mirrorStaleCleanup(s, 2.5 * 3600 * 1000, 2 * 3600 * 1000);
+    assert.deepStrictEqual(events, ['trigger-cleared', 'system-message']);
+});
+
+scenario('NX-2: fresh trigger untouched, no notification', () => {
+    const s = { triggerData: { trigger_id: 't' } };
+    const events = mirrorStaleCleanup(s, 60 * 1000, 2 * 3600 * 1000);
+    assert.deepStrictEqual(events, []);
+    assert.ok(s.triggerData);
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Results

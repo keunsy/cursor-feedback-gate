@@ -512,6 +512,11 @@ function cleanupStaleSessions() {
                 session.triggerData = null;
                 session.lastResponseTime = now;
                 triggerCleared = true;
+                addMessageToSession(key, {
+                    text: '⏰ 该反馈请求超过 2 小时未回复，已自动结束。此后的输入将排队，等待 agent 的下一次请求。',
+                    type: 'system',
+                    plain: true
+                });
             } else {
                 continue;
             }
@@ -1812,6 +1817,12 @@ function startFeedbackGateIntegration(context) {
             lastTriggerTime = 0;
             unregisterIdeSession();
             console.log('Feedback Gate: session expired — idle for 2h');
+            broadcastToAllWebviews({
+                command: 'addMessage',
+                text: '⏰ 会话已闲置 2 小时自动休眠。此后的输入将排队，等待下一次请求。',
+                type: 'system',
+                plain: true
+            });
         }
     }, 250);
     
