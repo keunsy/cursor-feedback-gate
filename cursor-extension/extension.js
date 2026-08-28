@@ -243,6 +243,13 @@ function refreshHeldLeases(now) {
     if (now - _leaseRefreshAt < sessionLease.LEASE_REFRESH_INTERVAL_MS) return;
     _leaseRefreshAt = now;
     for (const sid of [..._myLeases.keys()]) {
+        // P1-3: never steal back a lease that another LIVE window legitimately
+        // took over while we were suspended (e.g. laptop sleep past the lease
+        // TTL). Symmetric to removeOwnLease's ownership guard.
+        if (sessionLease.isHeldElsewhere(sid, process.pid, now)) {
+            _myLeases.delete(sid);
+            continue;
+        }
         let owner = null;
         for (const s of sessions.values()) { if (s.sessionId === sid) { owner = s; break; } }
         if (!owner) { releaseSessionLease(sid); continue; }
@@ -1603,7 +1610,11 @@ function consumeIdeQueueFile(filePath, isRecovery) {
         for (const line of lines) {
             try {
                 const item = JSON.parse(line);
-                if (!item.text) continue;
+                // P1-4: attachment/file-only messages legitimately carry empty
+                // text (e.g. a forwarded screenshot). Dropping them here loses
+                // content the sender already cleared and cannot resend.
+                const hasPayload = item.text || (item.attachments && item.attachments.length) || (item.files && item.files.length);
+                if (!hasPayload) continue;
 
                 if (!isRecovery && item.ts && new Date(item.ts).getTime() < extensionActivatedAt) {
                     stale++;
@@ -1922,10 +1933,18 @@ function checkTriggerFile(context, filePath) {
             // the session. Prevents same-workspace windows from racing for the
             // same conversation and stranding replies in a dead-end queue.
             if (triggerSessionId && sessionLease.isHeldElsewhere(triggerSessionId, myPid)) {
-                return;
+                // P1-2: yield to the holder, but never longer than the MCP
+                // consumption window (default 5s) — a stalled/zombie holder must
+                // not strand the trigger. Same 3s grace as the ws-yield below;
+                // after it expires every window may race (the atomic canonical
+                // unlink still guarantees a single winner).
+                const leaseYieldAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
+                if (leaseYieldAgeMs < 3000) return;
+                console.log(`Feedback Gate: lease yield expired (${leaseYieldAgeMs}ms) for sid=${triggerSessionId.slice(0,8)}... — racing for trigger`);
             }
 
             if (isSibling && !isDirectChild && !isDescendant) {
+                let adoptingOrphan = false; // P1-5: set when the focused window adopts a dead-target orphan (E10) below
                 // Signal 1: target_extension_host_pid — precise redirect
                 if (targetEhPid && targetEhPid !== myPid) {
                     let targetAlive = false;
@@ -1952,7 +1971,11 @@ function checkTriggerFile(context, filePath) {
                             // adopts it (atomic unlink still guards the claim).
                             const triggerAgeMs = triggerData.timestamp ? Date.now() - new Date(triggerData.timestamp).getTime() : 0;
                             const isFocusedNow = vscode.window.state && vscode.window.state.focused;
-                            if (triggerAgeMs >= 15000 && isFocusedNow) {
+                            // P1-5(a): grace must stay BELOW the MCP consumption
+                            // window (default 5s), otherwise the trigger file is
+                            // deleted before adoption can ever fire.
+                            if (triggerAgeMs >= 2000 && isFocusedNow) {
+                                adoptingOrphan = true;
                                 console.log(`Feedback Gate: dead-ehPid orphan trigger sid=${triggerSessionId.slice(0,8)}... — focused window adopting after ${Math.round(triggerAgeMs / 1000)}s`);
                             } else {
                                 return; // Not ours — skip deterministically
@@ -1992,7 +2015,11 @@ function checkTriggerFile(context, filePath) {
                     } else if (weOwnSession) {
                         // We own this session and workspace matches (or no hint)
                         // — proceed to atomic claim below.
-                    } else if (wsPrecise && !wsMatch) {
+                    } else if (wsPrecise && !wsMatch && !adoptingOrphan) {
+                        // P1-5(b): an E10 adoption is NOT voided by a workspace
+                        // mismatch — no live window owns this session, and the
+                        // focused window is the last resort before the trigger
+                        // strands until timeout.
                         return;
                     } else if (wsPrecise && wsMatch) {
                         // Workspace matches precisely — claim even if not focused.
