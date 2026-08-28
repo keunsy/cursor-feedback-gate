@@ -556,10 +556,20 @@ class FeedbackGateServer:
         if self._last_attachments:
             for attachment in self._last_attachments:
                 if attachment.get('mimeType', '').startswith('image/'):
+                    img_data = attachment.get('base64Data') or ''
+                    if not img_data or img_data == '[TOO_LARGE_FOR_QUEUE]':
+                        # P2 (flow audit): the queue downgrades >5MB images to a
+                        # placeholder — never send it as image data. Surface it
+                        # visibly instead (mirrors the file-content guard below).
+                        response_content.append(TextContent(
+                            type="text",
+                            text=f"⚠️ Image '{attachment.get('fileName', 'unknown')}' exceeded the 5MB delivery limit and could not be sent. Ask the user to re-share a smaller image or provide its file path."
+                        ))
+                        continue
                     try:
                         response_content.append(ImageContent(
                             type="image",
-                            data=attachment['base64Data'],
+                            data=img_data,
                             mimeType=attachment['mimeType']
                         ))
                         logger.info(f"📸 Added image to response: {attachment.get('fileName', 'unknown')}")
@@ -864,6 +874,12 @@ class FeedbackGateServer:
                 else:
                     del self._active_triggers[my_trigger_id]
                 _resp_sid = (my_trigger_info or {}).get("session_id", "") or session_id
+                # P1 (flow audit): mirror of the first-wait path — the wait loop
+                # stashed a safety copy of this reply; it was just delivered, so
+                # drop it, or the NEXT call re-delivers the same reply as
+                # [DELAYED REPLY].
+                if _resp_sid:
+                    self._remove_stashed_reply(_resp_sid, my_trigger_id)
                 if _resp_sid and self._last_response_eh_pid:
                     self._session_to_eh_pid[_resp_sid] = self._last_response_eh_pid
                 if _resp_sid and self._last_response_workspace:
