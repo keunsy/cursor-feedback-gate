@@ -472,6 +472,19 @@ class FeedbackGateServer:
         entries = self._delayed_replies.pop(session_id, [])
         if not entries:
             return []
+        # P1-1 (hardened): every stashed entry — fresh or TTL-expired — proves
+        # its origin trigger's response was consumed and the popup closed.
+        # Remove those triggers BEFORE the TTL filter drops the evidence,
+        # otherwise a stale zombie survives and a later call waits on it
+        # (up to 24h) for a response file that can never appear.
+        for _se in entries:
+            _otid = _se.get("origin_trigger_id") or ""
+            if _otid and _otid in self._active_triggers:
+                logger.info(f"🧹 Removing spent origin trigger {_otid} (reply consumed → popup closed)")
+                _log_event("ZOMBIE_TRIGGER_REMOVED", f"trigger={_otid} session={session_id[:8]}")
+                del self._active_triggers[_otid]
+                if self._pending_trigger_id == _otid:
+                    self._clear_trigger_state(responded=True)
         now = time.time()
         fresh = [e for e in entries if (now - e.get("ts", 0)) <= self._DELAYED_REPLY_TTL]
         dropped = len(entries) - len(fresh)
@@ -704,18 +717,6 @@ class FeedbackGateServer:
         if session_id:
             _delayed = self._pop_delayed_replies(session_id)
             if _delayed:
-                # P1-1: a stashed reply proves its origin trigger's response was
-                # already consumed and the popup closed. Drop those triggers now —
-                # otherwise the NEXT call for this session matches the zombie and
-                # waits (up to 24h) for a response file that can never appear.
-                for _de in _delayed:
-                    _otid = _de.get("origin_trigger_id") or ""
-                    if _otid and _otid in self._active_triggers:
-                        logger.info(f"🧹 Removing spent origin trigger {_otid} (reply consumed → popup closed)")
-                        _log_event("ZOMBIE_TRIGGER_REMOVED", f"trigger={_otid} session={session_id[:8]}")
-                        del self._active_triggers[_otid]
-                        if self._pending_trigger_id == _otid:
-                            self._clear_trigger_state(responded=True)
                 _parts = []
                 for _e in _delayed:
                     _origin = (_e.get("origin_trigger_id") or "")[-12:]
