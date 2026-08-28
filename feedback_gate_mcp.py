@@ -13,6 +13,7 @@ import contextvars
 import json
 import sys
 import logging
+import math
 import os
 import time
 import uuid
@@ -693,6 +694,18 @@ class FeedbackGateServer:
         if session_id:
             _delayed = self._pop_delayed_replies(session_id)
             if _delayed:
+                # P1-1: a stashed reply proves its origin trigger's response was
+                # already consumed and the popup closed. Drop those triggers now —
+                # otherwise the NEXT call for this session matches the zombie and
+                # waits (up to 24h) for a response file that can never appear.
+                for _de in _delayed:
+                    _otid = _de.get("origin_trigger_id") or ""
+                    if _otid and _otid in self._active_triggers:
+                        logger.info(f"🧹 Removing spent origin trigger {_otid} (reply consumed → popup closed)")
+                        _log_event("ZOMBIE_TRIGGER_REMOVED", f"trigger={_otid} session={session_id[:8]}")
+                        del self._active_triggers[_otid]
+                        if self._pending_trigger_id == _otid:
+                            self._clear_trigger_state(responded=True)
                 _parts = []
                 for _e in _delayed:
                     _origin = (_e.get("origin_trigger_id") or "")[-12:]
@@ -989,6 +1002,9 @@ class FeedbackGateServer:
             try:
                 _consume_timeout = float(os.environ.get("FEEDBACK_GATE_TRIGGER_TIMEOUT", "5"))
             except (TypeError, ValueError):
+                _consume_timeout = 5.0
+            if not math.isfinite(_consume_timeout):
+                logger.warning(f"⚠️ FEEDBACK_GATE_TRIGGER_TIMEOUT non-finite ({_consume_timeout!r}) — using default 5s")
                 _consume_timeout = 5.0
             _consume_deadline = time.time() + max(_consume_timeout, 0.5)
             extension_alive = False
