@@ -618,8 +618,8 @@ class FeedbackGateServer:
     # consecutive aborts the Agent model gives up entirely.  We return a heartbeat
     # every N minutes so the call never hits the 1h limit.
     # Override with FEEDBACK_GATE_IDE_WAIT_SECONDS env var.
-    _IDE_WAIT_SECONDS = int(os.environ.get("FEEDBACK_GATE_IDE_WAIT_SECONDS", "600"))
-    _IDE_MAX_TOTAL_SECONDS = 86400  # 24h max total wait for IDE
+    _IDE_WAIT_SECONDS = int(os.environ.get("FEEDBACK_GATE_IDE_WAIT_SECONDS", "300"))
+    _IDE_MAX_TOTAL_SECONDS = 3600  # 1h max total wait for IDE
 
     # Heartbeat config file for dynamic (no-restart) configuration.
     # Falls back to env vars, then defaults.

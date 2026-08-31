@@ -94,7 +94,8 @@ Agent 触发时自动跳转到配置的默认位置。如果默认位置不可�
 |------|--------|------|
 | `heartbeat_mode` | `"waiting"` | `waiting`: 超时后继续等待；`user_response`: 超时后伪装为用户回复 |
 | `heartbeat_reply` | `"当前时间"` | `user_response` 模式下的自动回复内容 |
-| `wait_seconds` | `600` | 等待超时秒数（不建议超过 3300，Cursor 约 1 小时后会中断 MCP 调用） |
+| `wait_seconds` | `300` | 等待超时秒数（不建议超过 3300，Cursor 约 1 小时后会中断 MCP 调用） |
+| `max_total_seconds` | `3600` | 最大总等待秒数（跨心跳累计），超过后返回 TIMEOUT 并清理触发器 |
 
 也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
 
