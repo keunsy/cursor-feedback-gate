@@ -99,22 +99,29 @@ function createHarness() {
                 }
             }
             const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
+            const ADOPT_MAX_SESSION_AGE_MS = 60 * 60 * 1000;
             if (sessions.size === 1) {
                 const only = sessions.values().next().value;
-                const hasDifferentActiveSession = only.sessionId && only.sessionId !== sessionId
-                    && only.triggerData && (now - only.lastActiveAt) < ADOPT_STALE_TRIGGER_MS;
-                if (!hasDifferentActiveSession) {
-                    const triggerStale = only.triggerData && (now - only.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
-                    if (!only.triggerData || triggerStale) {
-                        if (triggerStale) {
-                            writeExpiredIfNeeded(only.triggerData.trigger_id);
-                            only.triggerData = null;
+                // P3-1 (mirrors extension.js): a sole session that already owns a
+                // DIFFERENT session_id is another live conversation in the same
+                // window — never re-label it. Adoption is reserved for identity-less
+                // sessions (legacy first call / no session_id support).
+                const soleHasOtherIdentity = !!only.sessionId && only.sessionId !== sessionId;
+                if (!soleHasOtherIdentity) {
+                    const sessionTooOld = (now - only.lastActiveAt) > ADOPT_MAX_SESSION_AGE_MS;
+                    if (!sessionTooOld) {
+                        const triggerStale = only.triggerData && (now - only.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
+                        if (!only.triggerData || triggerStale) {
+                            if (triggerStale) {
+                                writeExpiredIfNeeded(only.triggerData.trigger_id);
+                                only.triggerData = null;
+                            }
+                            only.sessionId = sessionId;
+                            only.mcpPid = mcpPid;
+                            only.lastActiveAt = now;
+                            persistSessions();
+                            return only;
                         }
-                        only.sessionId = sessionId;
-                        only.mcpPid = mcpPid;
-                        only.lastActiveAt = now;
-                        persistSessions();
-                        return only;
                     }
                 }
             }
@@ -260,16 +267,22 @@ scenario('S2: second trigger same PID reuses idle session', (h) => {
     assert.strictEqual(h.sessions.size, 1);
 });
 
-// S3: Compaction — new session_id, sole idle session
-scenario('S3: compaction adopts sole idle session with new session_id', (h) => {
+// S3: Second conversation in the SAME window (P3-1) — session_id is authoritative
+scenario('S3: a second conversation never adopts the sole session of the first one', (h) => {
     setAlive(9999, true);
     const s1 = h.getOrCreateSessionForTrigger(9999, 'uuid-A');
     s1.messages.push({ text: 'hello', type: 'system' });
     advance(1000);
+    // Conversation B calls the gate for the first time. A is idle (no pending
+    // trigger), which used to be enough for B to take over A's session — merging
+    // the histories and letting B's trigger consume A's queued input.
     const s2 = h.getOrCreateSessionForTrigger(9999, 'uuid-B');
-    assert.strictEqual(s1.key, s2.key, 'should adopt, not create new tab');
+    assert.notStrictEqual(s1.key, s2.key, 'must create a separate session');
+    assert.strictEqual(s1.sessionId, 'uuid-A', 'A keeps its identity');
     assert.strictEqual(s2.sessionId, 'uuid-B');
-    assert.strictEqual(h.sessions.size, 1);
+    assert.strictEqual(h.sessions.size, 2);
+    assert.strictEqual(s1.messages.length, 1, 'A keeps its own history');
+    assert.strictEqual(s2.messages.length, 0);
 });
 
 // S4: Active trigger blocks adoption (<15min)
@@ -283,10 +296,11 @@ scenario('S4: active trigger blocks adoption of different session_id', (h) => {
     assert.strictEqual(h.sessions.size, 2);
 });
 
-// S5: Stale trigger (>15min) allows adoption
-scenario('S5: stale trigger (>15min) cleared and session adopted', (h) => {
+// S5: Stale trigger (>15min) allows adoption — only for identity-less sessions
+scenario('S5: stale trigger (>15min) cleared and identity-less session adopted', (h) => {
     setAlive(9999, true);
-    const s1 = h.getOrCreateSessionForTrigger(9999, 'uuid-A');
+    const s1 = h.getOrCreateSessionForTrigger(9999, '');   // legacy: no session_id yet
+    assert.strictEqual(s1.sessionId, null);
     s1.triggerData = { trigger_id: 't-stale', message: 'old' };
     advance(16 * 60 * 1000);
     const s2 = h.getOrCreateSessionForTrigger(9999, 'uuid-B');
@@ -420,6 +434,55 @@ scenario('S15: flush after delete-all persists empty (deactivate must flush)', (
     h.globalState.set('feedbackGateSessions', []);
     h.globalState.set('feedbackGateActiveSession', null);
     assert.strictEqual(h.globalState.get('feedbackGateSessions').length, 0);
+});
+
+// S16: Re-entry with the SAME session_id always finds its own conversation
+scenario('S16: same session_id reuses the session regardless of adoption limits', (h) => {
+    setAlive(9999, true);
+    const s1 = h.getOrCreateSessionForTrigger(9999, 'uuid-A');
+    advance(2 * 60 * 60 * 1000);   // far beyond the 1h adoption window
+    const s2 = h.getOrCreateSessionForTrigger(9999, 'uuid-A');
+    assert.strictEqual(s1.key, s2.key, 'identity match wins over recency heuristics');
+    assert.strictEqual(h.sessions.size, 1);
+});
+
+// S17: Identity-less sole session still adopts the first session_id (legacy path)
+scenario('S17: identity-less sole session adopts the first session_id call', (h) => {
+    setAlive(9999, true);
+    const s1 = h.getOrCreateSessionForTrigger(9999, '');
+    assert.strictEqual(s1.sessionId, null);
+    advance(1000);
+    const s2 = h.getOrCreateSessionForTrigger(9999, 'uuid-A');
+    assert.strictEqual(s1.key, s2.key, 'no owner yet → adoption is safe');
+    assert.strictEqual(s2.sessionId, 'uuid-A');
+});
+
+// S18: The reported defect, end to end at the session layer
+scenario('S18: one window, two conversations — the running one is never hijacked', (h) => {
+    setAlive(9999, true);
+    // Conversation A: created first, agent is working (no gate trigger pending).
+    const a = h.getOrCreateSessionForTrigger(9999, 'uuid-A');
+    a.messages.push({ text: 'A: 请帮我生成脚本', type: 'user' });
+    a.label = 'A 脚本';
+    h.setActiveSessionKey(a.key);
+    advance(60 * 1000);
+
+    // Conversation B: first gate call in the same window (same MCP pid).
+    const b = h.getOrCreateSessionForTrigger(9999, 'uuid-B');
+    b.triggerData = { trigger_id: 'tB', message: 'B: 需要确认吗？', session_id: 'uuid-B' };
+
+    assert.notStrictEqual(a.key, b.key, 'B must not take over A');
+    assert.strictEqual(a.sessionId, 'uuid-A');
+    assert.strictEqual(a.label, 'A 脚本', 'A keeps its tab label');
+    assert.strictEqual(a.triggerData, null, 'A is not marked as waiting for B');
+    assert.strictEqual(a.messages.length, 1, 'A keeps its own transcript');
+    assert.strictEqual(h.sessions.size, 2);
+
+    // B's re-entry still resolves to B, never to A.
+    advance(5000);
+    const bAgain = h.getOrCreateSessionForTrigger(9999, 'uuid-B');
+    assert.strictEqual(bAgain.key, b.key);
+    assert.strictEqual(a.triggerData, null);
 });
 
 const passed = results.filter(r => r.ok).length;

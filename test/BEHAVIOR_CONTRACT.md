@@ -22,7 +22,7 @@
 | Q2 | Trigger 到达时队列有消息 | Auto-consume：agent 消息先显示，然后队列消息显示 | G3-*, MO-1 |
 | Q3 | 多条消息排队 | 按 FIFO 顺序被逐个 trigger 消费 | E2E-3, G4-* |
 | Q4 | 已显示的消息不重复显示 | `_displayed` 标记防止 auto-consume 二次添加 | MO-3, G10-* |
-| Q5 | 不同 session 的队列互相隔离 | Session A 的 trigger 不消费 Session B 的消息 | G7-*, G8-*, E2E-6 |
+| Q5 | 不同 session 的队列互相隔离 | Session A 的 trigger 不消费 Session B 的消息；**同一窗口内以 `session_id` 为权威身份**（见 §11） | G7-*, G8-*, E2E-6, P3-1…P3-6, P3-19, QM-10…QM-12 |
 | Q6 | Reload/关闭后重开同 workspace | 仅迁移**已退出进程**的旧 PID 队列文件；pending 消息合并到新 PID，清空 sessionKey，删除旧文件；存活 PID 的文件不触碰 | QM-* |
 
 ## 3. Session 管理
@@ -35,6 +35,9 @@
 | S4 | Session 有活跃 trigger 时新请求到达 | 创建新 tab（多 tab 并发） | S4, S14 |
 | S5 | Reload 后 | Session 持久化到 globalState，reload 后恢复（mcpPid=0） | S7, S12, E2E-11 |
 | S6 | MCP 重启（PID 变更） | Session 通过 session_id 重新绑定新 PID | S13, DC-2, E2E-12 |
+| S7 | **同一窗口**第二个对话首次调用（已有 session 带 `session_id`） | 创建独立 session/tab，**绝不接管**已有对话（`SESSION_ID_ISOLATION`）；即使它没有 pending trigger、刚刚活跃过 | S3, S18, AD-7, AD-9 |
+| S8 | 上下文压缩后 agent **复用同一** `session_id` | 命中原 session（身份匹配优先于任何新鲜度启发式，无 1h 限制） | S16 |
+| S9 | 无 `session_id` 的旧式调用 + 唯一 session 尚无身份 | 仍可 adopt（向后兼容），stale trigger 照旧清理并写 `[EXPIRED]` | S5, S17, AD-1 |
 
 ## 4. Trigger 路由（多窗口）
 
@@ -109,6 +112,26 @@
 | MS2 | Log > 30s + 无活进程 | mcpStatus = inactive | MS-2 |
 | MS3 | Log > 30s + 有活进程 | mcpStatus = active | MS-3 |
 
+## 11. 同一窗口多对话（Intra-Window Isolation, P3）
+
+> 前提：**Cursor 每个窗口只运行一个 MCP 进程**，窗口内所有对话共享它。
+> 因此 `mcpPid` / `triggerPid` **无法**区分同窗口的不同对话 —— `session_id`
+> 是窗口内唯一的对话身份（`FeedbackGate.mdc`：一个对话 = 一个 session_id）。
+
+| # | 场景 | 期望行为 | 验证测试 |
+|---|------|----------|----------|
+| IW1 | 对话 A 正在跑（无 pending trigger、输入在队列里），对话 B 首次 trigger 到达 | B 得到独立 session；A 的排队消息**一条都不许**被 B 消费；A 的 tab 标题/历史不变 | P3-19, AD-7, S18 |
+| IW2 | 队列项带 `session_id`，与 trigger 的 `session_id` 不一致 | 拒绝消费 + `requeueItem` 归还给原对话，并打印 `⚠️ QUEUE_SESSION_MISMATCH`（auto-consume / post-route / drain 三条路径均生效） | P3-4, QM-12 |
+| IW3 | 队列项或 trigger 缺 `session_id` | "无法证伪" → 允许消费（兼容旧队列项与不传 session_id 的 MCP 调用） | P3-1, P3-2, P3-3 |
+| IW4 | 存在 untagged 残留消息，但另一对话仍有排队输入 | **不** auto-consume untagged（B 的首个 trigger 不许花掉无主残留） | P3-5, P3-6 |
+| IW5 | 用户正在对话 A 输入，对话 B 的 trigger 到达 | **不自动切换 Tab**（`auto-switch … SUPPRESSED`），改为节流通知「查看该对话」，点击才切换；Tab 上的 pending 圆点照常显示 | P3-7, P3-9…P3-12 |
+| IW6 | 用户手动点击 Tab | 始终允许切换（输入内容按 IW8 暂存） | P3-8 |
+| IW7 | 发送时 webview 未带可用 `sessionKey` | 归属到**正在输入的对话**（`resolveSendSession`）；多 session 时打印 `⚠️ SEND_WITHOUT_SESSION_KEY` | P3-13…P3-15 |
+| IW8 | 切换/关闭 Tab 时输入框有未发送内容 | 文本、图片附件、文件附件、代码引用**按对话**暂存并在切回时恢复（`_compositionStash`，上限 8 个对话，发送或关闭 Tab 即清除） | — (webview) |
+| IW9 | 广播消息带 `sessionKey` 且不是当前可见对话 | webview **不渲染**（不串台）；无 `sessionKey` 的旧式广播仍然渲染 | P3-16…P3-18 |
+| IW10 | 切换 Tab / 保存草稿 | 草稿归属"**离开的那个对话**"（`fromSessionKey`），而不是切换后的活动对话 | — (extension) |
+| IW11 | 队列项入队 | 同时写入 `sessionKey`（窗口内 bucket）与 `sessionId`（对话身份），PID 队列迁移后 `sessionId` 必须保留 | QM-10, QM-11 |
+| IW12 | 唯一 session 采纳 untagged 残留（`migrateSessionKey('', key)`） | 只采纳**无身份**或**身份一致**的残留；带其它对话 `session_id` 的残留保持 untagged，既不可见也不可被消费 | QM-13 |
 
 ---
 

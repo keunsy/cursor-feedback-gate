@@ -1001,6 +1001,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 <div class="code-ref-code">\${escapeHtml(displayCode)}</div>
             \`;
             codeRefsArea.appendChild(card);
+            reportComposition();
         }
         
         function removeCodeReference(refId) {
@@ -1010,6 +1011,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
                 inputSessionKey = null;
             }
+            reportComposition();
         }
         window.removeCodeReference = removeCodeReference;
         
@@ -1062,6 +1064,11 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             document.querySelectorAll('[data-file-id]').forEach(el => el.remove());
             document.querySelectorAll('[data-image-id]').forEach(el => el.remove());
             adjustTextareaHeight();
+            // P3-2/P3-3: the composition has been sent — drop the stash and let the
+            // extension know the input box is free again (so a pending trigger from
+            // another conversation may now switch tabs).
+            if (sentSessionKey) _compositionStash.delete(sentSessionKey);
+            reportComposition();
             if (sentSessionKey) {
                 vscode.postMessage({ command: 'saveDraft', sessionKey: sentSessionKey, draft: '' });
             }
@@ -1100,6 +1107,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
             
             updateImageCounter();
+            reportComposition();
         }
         
         // Remove image function
@@ -1116,6 +1124,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
                 inputSessionKey = null;
             }
+            reportComposition();
             
             console.log(\`🗑️ Image removed: \${imageId}\`);
             vscode.postMessage({
@@ -1321,6 +1330,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             \`;
             messagesContainer.appendChild(filePreview);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            reportComposition();
         }
         
         function removeFile(fileId) {
@@ -1330,6 +1340,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
                 inputSessionKey = null;
             }
+            reportComposition();
         }
         
         window.removeFile = removeFile;
@@ -1342,6 +1353,11 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             } else if (!messageInput.value.trim() && attachedImages.length === 0 && attachedFiles.length === 0 && codeReferences.length === 0) {
                 inputSessionKey = null;
             }
+            // P3-2: report immediately on the empty→composing transition (that is the
+            // exact moment an automatic tab switch would steal the input box) and on
+            // the way back down; debounce everything in between.
+            if (_compositionHasContent() !== _lastReportedComposition) reportComposition();
+            else reportCompositionSoon();
         });
         
         messageInput.addEventListener('keydown', (e) => {
@@ -1375,9 +1391,12 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
             
             switch (message.command) {
                 case 'addMessage':
+                    // P3-3: never render another conversation's traffic here.
+                    if (isForeignSessionMessage(message)) break;
                     addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files, message.timestamp || null);
                     break;
                 case 'newMessage':
+                    if (isForeignSessionMessage(message)) break;
                     addMessage(message.text, message.type || 'system', message.toolData, message.plain || false, false, message.attachments, message.files, message.timestamp || null);
                     if (message.mcpIntegration) {
                         mcpIntegration = true;
@@ -1409,6 +1428,9 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 case 'loadSession':
                     if (currentSessionKey && currentSessionKey !== message.sessionKey) {
                         vscode.postMessage({ command: 'saveDraft', sessionKey: currentSessionKey, draft: messageInput.value || '' });
+                        // P3-3: keep text AND attachments/code refs of the conversation
+                        // we are leaving; loadSession() below wipes the input area.
+                        stashComposition(currentSessionKey);
                     }
                     loadSession(message.sessionKey, message.label, message.messages, message.draft, message.hasPendingTrigger);
                     break;
@@ -1554,6 +1576,70 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
         // Make removeImage globally accessible for onclick handlers
         window.removeImage = removeImage;
         
+        // ===== P3-2 / P3-3: composition ownership =====
+        // The extension needs to know which conversation the user is typing into, so
+        // a trigger arriving for ANOTHER conversation cannot flip the tab and re-tag
+        // the next Enter. Locally we also stash the unfinished composition (text +
+        // attachments + code refs) per conversation, so any tab switch — manual or
+        // forced — gives the user back exactly what they had not sent yet.
+        const _compositionStash = new Map();
+        const COMPOSITION_STASH_MAX = 8;
+        let _compositionTimer = null;
+        let _lastReportedComposition = false;
+
+        function _compositionHasContent() {
+            return !!(messageInput.value.trim() || attachedImages.length || attachedFiles.length || codeReferences.length);
+        }
+
+        function stashComposition(sessionKey) {
+            if (!sessionKey) return;
+            if (!_compositionHasContent()) { _compositionStash.delete(sessionKey); return; }
+            if (_compositionStash.size >= COMPOSITION_STASH_MAX && !_compositionStash.has(sessionKey)) {
+                const oldest = _compositionStash.keys().next().value;
+                if (oldest) _compositionStash.delete(oldest);
+            }
+            _compositionStash.set(sessionKey, {
+                text: messageInput.value || '',
+                images: attachedImages.map(function (i) { return Object.assign({}, i); }),
+                files: attachedFiles.map(function (f) { return Object.assign({}, f); }),
+                codeRefs: codeReferences.map(function (c) { return Object.assign({}, c); }),
+            });
+        }
+
+        function restoreComposition(sessionKey) {
+            const stashed = sessionKey ? _compositionStash.get(sessionKey) : null;
+            if (!stashed) return false;
+            _compositionStash.delete(sessionKey);
+            if (stashed.text) messageInput.value = stashed.text;
+            stashed.images.forEach(function (img) { try { handleImageUploaded(img); } catch (e) {} });
+            stashed.files.forEach(function (f) { try { addFileAttachment(f); } catch (e) {} });
+            stashed.codeRefs.forEach(function (c) { try { addCodeReference(c); } catch (e) {} });
+            if (!inputSessionKey) inputSessionKey = sessionKey;
+            adjustTextareaHeight();
+            return true;
+        }
+
+        function reportComposition() {
+            const hasText = _compositionHasContent();
+            vscode.postMessage({
+                command: 'compositionChanged',
+                sessionKey: inputSessionKey || currentSessionKey || '',
+                hasText: hasText,
+            });
+            _lastReportedComposition = hasText;
+        }
+
+        function reportCompositionSoon() {
+            if (_compositionTimer) return;
+            _compositionTimer = setTimeout(function () { _compositionTimer = null; reportComposition(); }, 250);
+        }
+
+        // A message that belongs to another conversation in this window must not be
+        // rendered into the transcript the user is currently reading.
+        function isForeignSessionMessage(message) {
+            return !!(message.sessionKey && currentSessionKey && message.sessionKey !== currentSessionKey);
+        }
+
         function renderSessionTabs(tabs, activeKey) {
             if (!tabs || tabs.length <= 1) {
                 sessionTabs.classList.remove('visible');
@@ -1582,9 +1668,14 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     if (e.target.classList.contains('tab-close')) return;
                     const key = tab.dataset.sessionKey;
                     if (key && key !== currentSessionKey) {
+                        // P3-2/P3-3: tell the extension which conversation we are
+                        // leaving so its draft lands there, and keep the local
+                        // composition (text + attachments) for when we come back.
+                        stashComposition(currentSessionKey);
                         vscode.postMessage({
                             command: 'switchSession',
                             sessionKey: key,
+                            fromSessionKey: currentSessionKey || '',
                             draft: messageInput.value || '',
                         });
                     }
@@ -1595,6 +1686,7 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                     e.stopPropagation();
                     const key = btn.dataset.closeKey;
                     if (key) {
+                        _compositionStash.delete(key);
                         vscode.postMessage({ command: 'closeSession', sessionKey: key });
                     }
                 });
@@ -1618,8 +1710,12 @@ function getFeedbackGateHTML(title = "Feedback Gate", mcpIntegration = false) {
                 });
             }
             messageInput.value = draft || '';
+            // P3-3: an unfinished reply for THIS conversation beats the text-only
+            // server draft — put back exactly what the user had typed/attached.
+            restoreComposition(sessionKey);
             adjustTextareaHeight();
             updateMcpStatus(mcpActive, hasPendingTrigger);
+            reportComposition();
             messageInput.focus();
         }
         

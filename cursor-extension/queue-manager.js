@@ -78,6 +78,10 @@ function _migrateOldPidQueues() {
                     m._prevSessionKey = m.sessionKey;
                     m.sessionKey = '';
                 }
+                // P3-1b: sessionId is deliberately preserved across migration — it is
+                // the only conversation identity that survives a window/PID change, so
+                // the consume-time ownership guard can still reject cross-talk.
+                if (typeof m.sessionId !== 'string') m.sessionId = '';
                 messageQueue.push(m);
                 migrated++;
             }
@@ -137,15 +141,20 @@ function setActiveSessionKey(key) {
     _activeSessionKey = key || '';
 }
 
-function migrateSessionKey(fromKey, toKey) {
-    let changed = false;
+// P3-1c: `keep(item)` optionally narrows which items are adopted. An item the
+// predicate rejects stays in the source bucket untouched — it belongs to another
+// conversation and must not become visible or consumable under the new key.
+// Returns how many items were migrated.
+function migrateSessionKey(fromKey, toKey, keep) {
+    let migrated = 0;
     messageQueue.forEach(m => {
-        if (m.sessionKey === fromKey) {
-            m.sessionKey = toKey;
-            changed = true;
-        }
+        if (m.sessionKey !== fromKey) return;
+        if (typeof keep === 'function' && !keep(m)) return;
+        m.sessionKey = toKey;
+        migrated++;
     });
-    if (changed) saveQueue();
+    if (migrated > 0) saveQueue();
+    return migrated;
 }
 
 // W1: when a session disappears (user closes it, or it is cleaned as dead/stale),
@@ -233,10 +242,15 @@ function enqueueMessage(text, attachments, files, meta) {
         sourceLabel: meta?.sourceLabel || '',
         chatId: meta?.chatId || '',
         sessionKey: (meta?.sessionKey != null ? meta.sessionKey : _activeSessionKey) || '',
+        // P3-1b: conversation identity stamped at enqueue time. sessionKey is only
+        // a window-local handle — it can be shared if a session is ever re-labelled
+        // (adoption/compaction). sessionId lets the consumer verify that the item
+        // really belongs to the conversation whose trigger is about to eat it.
+        sessionId: meta?.sessionId || '',
     };
     messageQueue.push(item);
     saveQueue();
-    console.log(`Feedback Gate queue: enqueued "${item.text?.slice(0,30)}" sessionKey="${item.sessionKey}", _activeSessionKey="${_activeSessionKey}", total=${messageQueue.length}`);
+    console.log(`Feedback Gate queue: enqueued "${item.text?.slice(0,30)}" sessionKey="${item.sessionKey}", sessionId="${(item.sessionId || '').slice(0,8)}", _activeSessionKey="${_activeSessionKey}", total=${messageQueue.length}`);
     syncToWebview(item.sessionKey);
     return item;
 }

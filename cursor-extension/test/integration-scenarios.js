@@ -1542,6 +1542,70 @@ scenario('QM-9b: removeItemsForSession persists the removal across reload (W1)',
     } finally { cleanup(); }
 });
 
+scenario('QM-10 (P3-1b): enqueued messages carry the conversation identity (session_id)', () => {
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66720);
+    try {
+        qm.enqueueMessage('from conversation A', [], [], { sessionKey: 'sess_a', sessionId: 'uuid-A' });
+        qm.enqueueMessage('from conversation B', [], [], { sessionKey: 'sess_a', sessionId: 'uuid-B' });
+        const first = qm.dequeueMessage('sess_a');
+        assert.strictEqual(first.sessionId, 'uuid-A', 'sessionKey alone cannot tell conversations apart — sessionId can');
+        const second = qm.dequeueMessage('sess_a');
+        assert.strictEqual(second.sessionId, 'uuid-B', 'both items live in the same window bucket but keep their own identity');
+    } finally { cleanup(); }
+});
+
+scenario('QM-11 (P3-1b): sessionId survives PID-queue migration even though sessionKey is dropped', () => {
+    clearQmTmpDir();
+    writeOldPidQueueFile(66731, [
+        { id: 1, text: 'typed into A', status: 'pending', sessionKey: 'sess_a', sessionId: 'uuid-A' },
+    ]);
+    const { qm, cleanup } = freshQueueModule(66730);  // different pid → migration path
+    try {
+        qm.loadQueue();
+        const migrated = qm.dequeueMessage('');
+        assert.ok(migrated, 'item migrated into the untagged pool');
+        assert.strictEqual(migrated.sessionId, 'uuid-A', 'conversation identity must survive migration');
+    } finally { cleanup(); }
+});
+
+scenario('QM-12 (P3-1b): requeueItem puts a rejected message back for its own conversation', () => {
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66740);
+    try {
+        qm.enqueueMessage('A reply', [], [], { sessionKey: 'sess_a', sessionId: 'uuid-A' });
+        const item = qm.dequeueMessage('sess_a');
+        assert.strictEqual(qm.getPendingQueueCount('sess_a'), 0, 'consumed');
+        qm.requeueItem(item.id);
+        assert.strictEqual(qm.getPendingQueueCount('sess_a'), 1, 'requeued after the mismatch guard rejected it');
+        const again = qm.dequeueMessage('sess_a');
+        assert.strictEqual(again.sessionId, 'uuid-A', 'identity preserved across the requeue');
+    } finally { cleanup(); }
+});
+
+scenario('QM-13 (P3-1c): untagged adoption skips leftovers of another conversation', () => {
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66750);
+    const owner = createOwnershipHarness();
+    try {
+        // Two untagged leftovers: one identity-less (legacy) and one stamped uuid-A.
+        qm.enqueueMessage('legacy leftover', [], [], { sessionKey: '' });
+        qm.enqueueMessage('A 的排队消息', [], [], { sessionKey: '', sessionId: 'uuid-A' });
+        assert.strictEqual(qm.getPendingQueueCount(''), 2);
+
+        // Mirrors setCurrentTriggerData's sole-session adoption for conversation B.
+        const migrated = qm.migrateSessionKey('', 'sess_b',
+            (item) => owner.queueItemBelongsToConversation(item, 'uuid-B'));
+        assert.strictEqual(migrated, 1, 'only the identity-less leftover is adopted');
+        assert.strictEqual(qm.getPendingQueueCount('sess_b'), 1);
+        assert.strictEqual(qm.getPendingQueueCount(''), 1, 'the foreign item stays untagged');
+
+        const remaining = qm.dequeueMessage('');
+        assert.strictEqual(remaining.sessionId, 'uuid-A', 'still owned by conversation A');
+        qm.requeueItem(remaining.id);
+    } finally { cleanup(); }
+});
+
 try { fs.rmSync(qmTmpDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════════════
@@ -1556,10 +1620,13 @@ function createAdoptionHarness() {
     // Decision when a trigger arrives with an UNKNOWN sessionId and exactly one
     // existing session: adopt the sole session or create a new one.
     function decideAdoption(onlySession, incomingSessionId, now) {
-        const hasDifferentActiveSession = onlySession.sessionId && onlySession.sessionId !== incomingSessionId
-            && onlySession.triggerData && (now - onlySession.lastActiveAt) < ADOPT_STALE_TRIGGER_MS;
+        // P3-1: session_id is the authority inside a window. A sole session that
+        // already belongs to a DIFFERENT conversation is never re-labelled — even
+        // when it has no pending trigger (that was the reported defect: conversation
+        // B's first call hijacked conversation A's session and then drained A's queue).
+        if (onlySession.sessionId && onlySession.sessionId !== incomingSessionId) return 'create';
         const sessionTooOld = (now - onlySession.lastActiveAt) > ADOPT_MAX_SESSION_AGE_MS;
-        if (hasDifferentActiveSession || sessionTooOld) return 'create';
+        if (sessionTooOld) return 'create';
         const triggerStale = onlySession.triggerData && (now - onlySession.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
         if (!onlySession.triggerData || triggerStale) return 'adopt';
         return 'create';
@@ -1575,25 +1642,25 @@ function createAdoptionHarness() {
     return { decideAdoption, decideUnboundAdopt };
 }
 
-scenario('AD-1: recent sole session is adopted on context compaction (new sessionId)', () => {
+scenario('AD-1: identity-less sole session is adopted by the first session_id call', () => {
     const h = createAdoptionHarness();
     const now = Date.now();
-    const s = { sessionId: 'old-uuid', triggerData: null, lastActiveAt: now - 5 * 60 * 1000 };
+    const s = { sessionId: '', triggerData: null, lastActiveAt: now - 5 * 60 * 1000 };
     assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'adopt');
 });
 
 scenario('AD-2: sole session idle >1h → new session created, old conversation not resurrected', () => {
     const h = createAdoptionHarness();
     const now = Date.now();
-    const s = { sessionId: 'old-uuid', triggerData: null, lastActiveAt: now - 61 * 60 * 1000 };
-    assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'create');
+    const s = { sessionId: 'same-uuid', triggerData: null, lastActiveAt: now - 61 * 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(s, 'same-uuid', now), 'create');
 });
 
 scenario('AD-3: boundary — session idle for exactly 1h is still adoptable', () => {
     const h = createAdoptionHarness();
     const now = Date.now();
-    const s = { sessionId: 'old-uuid', triggerData: null, lastActiveAt: now - 60 * 60 * 1000 };
-    assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'adopt');
+    const s = { sessionId: 'same-uuid', triggerData: null, lastActiveAt: now - 60 * 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(s, 'same-uuid', now), 'adopt');
 });
 
 scenario('AD-4: unbound restored session idle >1h is NOT bound to a no-sessionId trigger', () => {
@@ -1615,6 +1682,29 @@ scenario('AD-6: sole session with a different ACTIVE conversation stays protecte
     const now = Date.now();
     const s = { sessionId: 'other-uuid', triggerData: { trigger_id: 't1' }, lastActiveAt: now - 60 * 1000 };
     assert.strictEqual(h.decideAdoption(s, 'new-uuid', now), 'create');
+});
+
+scenario('AD-7 (P3-1): second conversation in the same window is NOT adopted into the first one even when it has no pending trigger', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    // Conversation A: running, no gate trigger pending (its user input sits queued).
+    const a = { sessionId: 'conv-A', triggerData: null, lastActiveAt: now - 30 * 1000 };
+    // Conversation B calls the gate for the first time with its own session_id.
+    assert.strictEqual(h.decideAdoption(a, 'conv-B', now), 'create');
+});
+
+scenario('AD-8 (P3-1): re-entry with the SAME session_id still reuses the session', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const a = { sessionId: 'conv-A', triggerData: null, lastActiveAt: now - 30 * 1000 };
+    assert.strictEqual(h.decideAdoption(a, 'conv-A', now), 'adopt');
+});
+
+scenario('AD-9 (P3-1): a foreign conversation is never adopted, however long it has been idle', () => {
+    const h = createAdoptionHarness();
+    const now = Date.now();
+    const a = { sessionId: 'conv-A', triggerData: null, lastActiveAt: now - 2 * 60 * 60 * 1000 };
+    assert.strictEqual(h.decideAdoption(a, 'conv-B', now), 'create');
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -2240,6 +2330,233 @@ scenario('E7-1: pending message buffer is capped at 500 (oldest dropped first)',
     }
     assert.strictEqual(buf.length, 500);
     assert.strictEqual(buf[0].id, 100, 'oldest entries dropped first');
+});
+
+// ═══════════════════════════════════════════════════════════════
+// P3: two conversations inside ONE Cursor window
+// (Cursor shares a single MCP process per window, so mcpPid cannot
+//  separate conversations — session_id is the only authority.)
+// ═══════════════════════════════════════════════════════════════
+
+function createOwnershipHarness() {
+    // Mirrors queueItemBelongsToConversation() in extension.js — keep in sync.
+    function queueItemBelongsToConversation(queueItem, sessionId) {
+        if (!queueItem) return false;
+        const itemSid = queueItem.sessionId || '';
+        const triggerSid = sessionId || '';
+        if (!itemSid || !triggerSid) return true;
+        return itemSid === triggerSid;
+    }
+
+    // Mirrors the "!targetSession" auto-consume branches in checkTriggerFile (P3-1c).
+    function decideUntaggedConsume(state) {
+        const anySessionHasTrigger = state.sessions.some(s => !!s.triggerData);
+        const anySessionHasQueuedInput = state.sessions.some(s => s.queued > 0);
+        return state.untagged > 0
+            && !anySessionHasTrigger
+            && !state.currentTriggerData
+            && !anySessionHasQueuedInput;
+    }
+
+    return { queueItemBelongsToConversation, decideUntaggedConsume };
+}
+
+scenario('P3-1: a legacy queue item (no session_id) may still be consumed', () => {
+    const h = createOwnershipHarness();
+    assert.strictEqual(h.queueItemBelongsToConversation({ sessionId: '' }, 'uuid-B'), true);
+});
+
+scenario('P3-2: a trigger without session_id may consume a stamped item (legacy MCP)', () => {
+    const h = createOwnershipHarness();
+    assert.strictEqual(h.queueItemBelongsToConversation({ sessionId: 'uuid-A' }, ''), true);
+});
+
+scenario('P3-3: the same conversation may consume its own queued reply', () => {
+    const h = createOwnershipHarness();
+    assert.strictEqual(h.queueItemBelongsToConversation({ sessionId: 'uuid-A' }, 'uuid-A'), true);
+});
+
+scenario('P3-4 (P3-1b): another conversation may NOT consume the reply — the reported defect', () => {
+    const h = createOwnershipHarness();
+    assert.strictEqual(h.queueItemBelongsToConversation({ sessionId: 'uuid-A' }, 'uuid-B'), false);
+});
+
+scenario('P3-5 (P3-1c): untagged leftovers stay put while another conversation has queued input', () => {
+    const h = createOwnershipHarness();
+    const blocked = h.decideUntaggedConsume({
+        untagged: 1,
+        currentTriggerData: null,
+        sessions: [
+            { key: 'sess_A', triggerData: null, queued: 2 },  // conversation A still running
+        ],
+    });
+    assert.strictEqual(blocked, false, 'B\'s first trigger must not spend A\'s messages');
+});
+
+scenario('P3-6 (P3-1c): untagged leftovers are consumable when no conversation owns anything', () => {
+    const h = createOwnershipHarness();
+    const allowed = h.decideUntaggedConsume({
+        untagged: 1,
+        currentTriggerData: null,
+        sessions: [{ key: 'sess_A', triggerData: null, queued: 0 }],
+    });
+    assert.strictEqual(allowed, true);
+});
+
+function createCompositionHarness() {
+    // Mirrors noteComposition / isComposingElsewhere / switchToSession in extension.js.
+    const COMPOSITION_STALE_MS = 90 * 1000;
+
+    function isComposingElsewhere(composition, sessionKey, sessions, now) {
+        if (!composition.hasText || !composition.sessionKey) return false;
+        if (composition.sessionKey === sessionKey) return false;
+        if (now - composition.at > COMPOSITION_STALE_MS) return false;
+        return sessions.has(composition.sessionKey);
+    }
+
+    // Returns 'switched' | 'suppressed'.
+    function decideSwitch(composition, targetKey, sessions, isManual, now) {
+        if (!isManual && isComposingElsewhere(composition, targetKey, sessions, now)) return 'suppressed';
+        return 'switched';
+    }
+
+    // Mirrors resolveSendSession().
+    function resolveSendSession(rawSessionKey, composition, sessions, now) {
+        if (rawSessionKey && sessions.has(rawSessionKey)) return rawSessionKey;
+        if (composition.sessionKey && sessions.has(composition.sessionKey)
+            && (now - composition.at) < COMPOSITION_STALE_MS) return composition.sessionKey;
+        return null;
+    }
+
+    return { isComposingElsewhere, decideSwitch, resolveSendSession };
+}
+
+scenario('P3-7 (P3-2): a trigger for another conversation does not steal the input box', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}], ['sess_B', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 3 * 1000 };
+    assert.strictEqual(h.decideSwitch(composing, 'sess_B', sessions, false, now), 'suppressed');
+});
+
+scenario('P3-8 (P3-2): the user can always switch tabs manually', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}], ['sess_B', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 3 * 1000 };
+    assert.strictEqual(h.decideSwitch(composing, 'sess_B', sessions, true, now), 'switched');
+});
+
+scenario('P3-9 (P3-2): a stale composition (>90s) no longer blocks the switch', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}], ['sess_B', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 91 * 1000 };
+    assert.strictEqual(h.decideSwitch(composing, 'sess_B', sessions, false, now), 'switched');
+});
+
+scenario('P3-10 (P3-2): an empty input box never blocks a switch', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}], ['sess_B', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: false, at: now - 1000 };
+    assert.strictEqual(h.decideSwitch(composing, 'sess_B', sessions, false, now), 'switched');
+});
+
+scenario('P3-11 (P3-2): composing in the TARGET conversation is not "elsewhere"', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 1000 };
+    assert.strictEqual(h.decideSwitch(composing, 'sess_A', sessions, false, now), 'switched');
+});
+
+scenario('P3-12 (P3-2): closing the composing conversation releases the guard', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_B', {}]]);   // sess_A was closed
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 1000 };
+    assert.strictEqual(h.decideSwitch(composing, 'sess_B', sessions, false, now), 'switched');
+});
+
+scenario('P3-13 (P3-4): a send carrying its own sessionKey is never re-attributed', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}], ['sess_B', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 1000 };
+    assert.strictEqual(h.resolveSendSession('sess_B', composing, sessions, now), 'sess_B');
+});
+
+scenario('P3-14 (P3-4): a send without sessionKey goes to the conversation being composed', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}], ['sess_B', {}]]);
+    const composing = { sessionKey: 'sess_A', hasText: true, at: now - 1000 };
+    assert.strictEqual(h.resolveSendSession('', composing, sessions, now), 'sess_A');
+});
+
+scenario('P3-15 (P3-4): a send with no key and no composition falls back to the active session', () => {
+    const h = createCompositionHarness();
+    const now = Date.now();
+    const sessions = new Map([['sess_A', {}]]);
+    const composing = { sessionKey: '', hasText: false, at: 0 };
+    assert.strictEqual(h.resolveSendSession('', composing, sessions, now), null);
+});
+
+// Mirrors isForeignSessionMessage() in webview-template.js.
+function isForeignSessionMessage(message, currentSessionKey) {
+    return !!(message.sessionKey && currentSessionKey && message.sessionKey !== currentSessionKey);
+}
+
+scenario('P3-16 (P3-3): another conversation\'s confirmation is not rendered into this transcript', () => {
+    assert.strictEqual(isForeignSessionMessage({ sessionKey: 'sess_B', text: 'ok' }, 'sess_A'), true);
+});
+
+scenario('P3-17 (P3-3): this conversation\'s confirmation is rendered', () => {
+    assert.strictEqual(isForeignSessionMessage({ sessionKey: 'sess_A', text: 'ok' }, 'sess_A'), false);
+});
+
+scenario('P3-18 (P3-3): untagged legacy messages still render', () => {
+    assert.strictEqual(isForeignSessionMessage({ text: 'ok' }, 'sess_A'), false);
+});
+
+scenario('P3-19: end-to-end — conversation B\'s first trigger must not drain conversation A\'s queue', () => {
+    // Reproduces the reported defect with the REAL queue module:
+    // one window (one MCP pid), conversation A running with queued user input,
+    // conversation B calling the gate for the first time.
+    try { fs.mkdirSync(qmTmpDir, { recursive: true }); } catch {}
+    clearQmTmpDir();
+    const { qm, cleanup } = freshQueueModule(66800);
+    const owner = createOwnershipHarness();
+    const adopt = createAdoptionHarness();
+    try {
+        // Conversation A: agent is running, no pending gate trigger, user typed twice.
+        qm.enqueueMessage('帮我生成一个类似meigui这样淘股吧', [], [], { sessionKey: 'sess_A', sessionId: 'uuid-A' });
+        qm.enqueueMessage('再补充一点：只要情绪周期部分', [], [], { sessionKey: 'sess_A', sessionId: 'uuid-A' });
+        assert.strictEqual(qm.getPendingQueueCount('sess_A'), 2);
+
+        const now = Date.now();
+        const sessionA = { key: 'sess_A', sessionId: 'uuid-A', triggerData: null, lastActiveAt: now - 30 * 1000 };
+
+        // Conversation B's first trigger arrives with its own session_id.
+        const decision = adopt.decideAdoption(sessionA, 'uuid-B', now);
+        assert.strictEqual(decision, 'create', 'B must get its own session, never A\'s');
+
+        // B's trigger targets B's session — which has nothing queued.
+        assert.strictEqual(qm.getPendingQueueCount('sess_B'), 0, 'B has no queued reply to consume');
+
+        // And even if routing ever landed on A's bucket, the identity guard refuses.
+        const stolen = qm.dequeueMessage('sess_A');
+        assert.strictEqual(owner.queueItemBelongsToConversation(stolen, 'uuid-B'), false,
+            'A\'s message must not answer B\'s trigger');
+        qm.requeueItem(stolen.id);
+        assert.strictEqual(qm.getPendingQueueCount('sess_A'), 2, 'A keeps both messages for its own trigger');
+
+        // When A's own trigger finally arrives, the message is released to A.
+        const forA = qm.dequeueMessage('sess_A');
+        assert.strictEqual(owner.queueItemBelongsToConversation(forA, 'uuid-A'), true);
+        assert.strictEqual(forA.text, '帮我生成一个类似meigui这样淘股吧');
+    } finally { cleanup(); try { fs.rmSync(qmTmpDir, { recursive: true }); } catch {} }
 });
 
 // ═══════════════════════════════════════════════════════════════

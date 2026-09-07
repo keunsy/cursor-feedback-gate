@@ -300,19 +300,31 @@ function getOrCreateSessionForTrigger(mcpPid, sessionId) {
                 return s;
             }
         }
-        // Unknown session_id — likely context compaction causing a fresh UUID,
-        // or the first call with session_id after an initial call without one.
-        // Adopt the sole existing session if it's safe to do so.
+        // Unknown session_id — either context compaction produced a fresh UUID for
+        // the SAME conversation, or this is a DIFFERENT conversation in the same
+        // window (Cursor runs one MCP process per window, so mcpPid/triggerPid can
+        // never tell them apart — session_id is the only conversation identity).
         const ADOPT_STALE_TRIGGER_MS = 15 * 60 * 1000;
         const ADOPT_MAX_SESSION_AGE_MS = 60 * 60 * 1000; // never resurrect a conversation idle for over 1h
         if (sessions.size === 1) {
             const only = sessions.values().next().value;
-            // Skip if the sole session already owns a DIFFERENT sessionId AND has
-            // a non-stale trigger (truly a separate active conversation).
-            const hasDifferentActiveSession = only.sessionId && only.sessionId !== sessionId
-                && only.triggerData && (now - only.lastActiveAt) < ADOPT_STALE_TRIGGER_MS;
+            // P3-1 (session_id is authoritative inside one window): a sole session
+            // that already owns a DIFFERENT session_id is a live, separate
+            // conversation. Adopting it used to re-label that conversation, which
+            // meant (a) its history/tab got merged into the newcomer's and (b) its
+            // queued user input — tagged with the very same sessionKey — was
+            // auto-consumed as the answer to the OTHER conversation's trigger
+            // (violates contract Q5). So we refuse and give the newcomer its own
+            // session. Cost: an agent that regenerates its UUID after compaction
+            // now gets a second tab instead of reusing the old one; that is
+            // cosmetic and recoverable, unlike cross-conversation delivery.
+            const soleHasOtherIdentity = !!only.sessionId && only.sessionId !== sessionId;
+            if (soleHasOtherIdentity) {
+                console.log(`Feedback Gate: SESSION_ID_ISOLATION — refusing to adopt sole session ${only.key} (owner ${(only.sessionId || '').slice(0,8)}…, pendingQueue=${getPendingQueueCount(only.key)}, idle ${((now - only.lastActiveAt) / 1000).toFixed(0)}s) for new session_id ${(sessionId || '').slice(0,8)}…; creating a separate session`);
+                return createSession(mcpPid, now, sessionId);
+            }
             const sessionTooOld = (now - only.lastActiveAt) > ADOPT_MAX_SESSION_AGE_MS;
-            if (!hasDifferentActiveSession && !sessionTooOld) {
+            if (!sessionTooOld) {
                 const triggerStale = only.triggerData && (now - only.lastActiveAt) > ADOPT_STALE_TRIGGER_MS;
                 if (!only.triggerData || triggerStale) {
                     if (triggerStale) {
@@ -415,10 +427,84 @@ function getActiveSession() {
 let lastManualSwitchAt = 0;
 const MANUAL_SWITCH_GUARD_MS = 10000;
 
+// P3-2: composition guard. The webview reports what the user is currently typing
+// (and in which tab). An AUTOMATIC switch (trigger arrival, queue drain, post-reply
+// hop) must never yank the input box out from under the user: it used to replace the
+// text with the other session's draft and re-tag the next Enter to that session, so a
+// reply composed for conversation A was consumed by conversation B's trigger.
+let _composition = { sessionKey: '', hasText: false, at: 0 };
+const COMPOSITION_STALE_MS = 90 * 1000;
+let _lastBackgroundTriggerNoticeAt = 0;
+let _lastBackgroundTriggerNoticeKey = '';
+
+function noteComposition(sessionKey, hasText) {
+    _composition = {
+        sessionKey: sessionKey || '',
+        hasText: !!hasText,
+        at: Date.now(),
+    };
+}
+
+function isComposingElsewhere(sessionKey) {
+    if (!_composition.hasText || !_composition.sessionKey) return false;
+    if (_composition.sessionKey === sessionKey) return false;
+    if (Date.now() - _composition.at > COMPOSITION_STALE_MS) return false;
+    return sessions.has(_composition.sessionKey);
+}
+
+// P3-2: persist the unsent text of a specific session (the one the user is leaving).
+function saveDraftForSession(sessionKey, draft) {
+    if (!sessionKey) return;
+    const s = sessions.get(sessionKey);
+    if (!s) return;
+    const next = draft || '';
+    if (s.draft === next) return;
+    s.draft = next;
+    persistSessions();
+}
+
+// P3-4: resolve which conversation a webview 'send' belongs to. The webview's own
+// sessionKey always wins. If it is missing (webview rebuilt before the first
+// loadSession), prefer the session the user is actually composing in over the
+// globally active one — the active session may have been re-pointed by a trigger
+// from another conversation a moment ago.
+function resolveSendSession(rawSessionKey) {
+    if (rawSessionKey && sessions.has(rawSessionKey)) return sessions.get(rawSessionKey);
+    if (_composition.sessionKey && sessions.has(_composition.sessionKey)
+        && (Date.now() - _composition.at) < COMPOSITION_STALE_MS) {
+        console.log(`Feedback Gate: send without usable sessionKey — attributed to composing session ${_composition.sessionKey}`);
+        return sessions.get(_composition.sessionKey);
+    }
+    return null;
+}
+
+// The suppressed trigger still has to be visible — the tab shows a pending dot and
+// the user gets one actionable notification instead of a forced tab flip.
+function notifyBackgroundTrigger(sessionKey, label, message) {
+    const now = Date.now();
+    if (_lastBackgroundTriggerNoticeKey === sessionKey && (now - _lastBackgroundTriggerNoticeAt) < 10000) return;
+    _lastBackgroundTriggerNoticeKey = sessionKey;
+    _lastBackgroundTriggerNoticeAt = now;
+    const preview = (message || '').replace(/\s+/g, ' ').slice(0, 80);
+    vscode.window.showInformationMessage(
+        `Feedback Gate：对话「${label || sessionKey}」在等你回复${preview ? '：' + preview : ''}（你正在输入，未自动切换）`,
+        '查看该对话'
+    ).then(selection => {
+        if (selection === '查看该对话') switchToSession(sessionKey, true);
+    });
+}
+
 function switchToSession(sessionKey, isManual) {
-    if (activeSessionKey === sessionKey) return;
+    if (activeSessionKey === sessionKey) return true;
     const session = sessions.get(sessionKey);
-    if (!session) return;
+    if (!session) return false;
+
+    if (!isManual && isComposingElsewhere(sessionKey)) {
+        console.log(`Feedback Gate: auto-switch to ${sessionKey} (${session.label}) SUPPRESSED — user is composing in ${_composition.sessionKey}`);
+        syncTabsToWebview();
+        notifyBackgroundTrigger(sessionKey, session.label, session.triggerData && session.triggerData.message);
+        return false;
+    }
 
     if (isManual) lastManualSwitchAt = Date.now();
 
@@ -431,6 +517,7 @@ function switchToSession(sessionKey, isManual) {
     syncTabsToWebview();
     syncQueueToWebview(sessionKey);
     console.log(`Feedback Gate: switched to session ${sessionKey} (${session.label}) ${isManual ? '[manual]' : '[auto]'}`);
+    return true;
 }
 
 function syncSessionToWebview(session) {
@@ -588,6 +675,9 @@ function addMessageToSession(sessionKey, msg) {
     if (sessionKey === activeSessionKey) {
         broadcastToAllWebviews({
             command: 'addMessage',
+            // P3-3: tag the owner so a webview showing another conversation of the
+            // same window can drop it instead of mixing transcripts.
+            sessionKey: sessionKey,
             text: msg.text,
             type: msg.type,
             plain: msg.plain || false,
@@ -640,9 +730,15 @@ function setCurrentTriggerData(triggerData, mcpPid) {
         // Adopt untagged queue messages when this is the sole active session.
         // This prevents the global-pool fallback in post-route from being
         // needed — messages are tagged to the session at creation time.
+        // P3-1c: leftovers stamped with a DIFFERENT conversation's session_id are
+        // NOT adopted. They belong to a chat that has no session here (closed, or
+        // in another window); pulling them in would surface — and eventually let a
+        // trigger consume — somebody else's reply.
         if (getPendingQueueCount('') > 0 && sessions.size === 1) {
-            queue.migrateSessionKey('', session.key);
-            console.log(`Feedback Gate: migrated untagged messages to session ${session.key}`);
+            const migrated = queue.migrateSessionKey('', session.key, (item) =>
+                queueItemBelongsToConversation(item, sessionId || session.sessionId || ''));
+            const skipped = getPendingQueueCount('');
+            console.log(`Feedback Gate: migrated ${migrated} untagged message(s) to session ${session.key}${skipped > 0 ? `; ${skipped} left untagged (foreign session_id)` : ''}`);
         }
         // Name the tab from the latest interaction content
         if (triggerData && triggerData.message) {
@@ -708,6 +804,18 @@ const editQueueItem = (id, t) => queue.editQueueItem(id, t);
 const reorderQueue = (ids) => queue.reorderQueue(ids);
 const getPendingQueueCount = (sessionKey) => queue.getPendingQueueCount(sessionKey);
 const syncQueueToWebview = (sessionKey) => queue.syncToWebview(sessionKey);
+
+// P3-1b: conversation-level ownership check for a queued message. sessionKey only
+// proves the item sits in the same window-local bucket; sessionId proves it was
+// typed into the same Cursor conversation. Missing evidence on either side means
+// "cannot disprove" → allow (legacy items and legacy MCP calls carry no session_id).
+function queueItemBelongsToConversation(queueItem, sessionId) {
+    if (!queueItem) return false;
+    const itemSid = queueItem.sessionId || '';
+    const triggerSid = sessionId || '';
+    if (!itemSid || !triggerSid) return true;
+    return itemSid === triggerSid;
+}
 
 function closeSessionByKey(key) {
     if (!key) return;
@@ -865,7 +973,10 @@ class FeedbackGatePanelProvider {
                 switch (webviewMessage.command) {
                     case 'send': {
                         const rawSessionKey = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
-                        const sendSession = (rawSessionKey ? sessions.get(rawSessionKey) : null) || activeSession;
+                        const sendSession = resolveSendSession(rawSessionKey) || activeSession;
+                        if (!rawSessionKey && sessions.size > 1) {
+                            console.log(`Feedback Gate: ⚠️ SEND_WITHOUT_SESSION_KEY — webview sent no sessionKey with ${sessions.size} sessions open; falling back to ${sendSession ? sendSession.key : 'none'}`);
+                        }
                         if (sendSession && sendSession.sessionId && sessionLease.isHeldElsewhere(sendSession.sessionId, process.pid)) {
                             if (forwardMessageToLeaseHolder(sendSession, webviewMessage.text, webviewMessage.attachments, webviewMessage.files)) {
                                 vscode.window.showInformationMessage('Feedback Gate: 该会话由另一个窗口持有，消息已转发');
@@ -880,6 +991,7 @@ class FeedbackGatePanelProvider {
                         else pendingRemoteReply = null;
                         const enqueuedItem = enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files, {
                             sessionKey: sendSessionKey,
+                            sessionId: sendSession ? (sendSession.sessionId || '') : '',
                         });
                         logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                         const sendTrigger = sendSession ? sendSession.triggerData : null;
@@ -892,12 +1004,18 @@ class FeedbackGatePanelProvider {
                     }
                     case 'switchSession':
                         if (webviewMessage.sessionKey) {
-                            if (activeSession && webviewMessage.draft !== undefined) {
-                                activeSession.draft = webviewMessage.draft || '';
-                                persistSessions();
+                            // P3-2: save the draft to the session the user is LEAVING
+                            // (reported by the webview), not to whatever the extension
+                            // currently considers active — the two can differ when a
+                            // trigger from another conversation moved activeSessionKey.
+                            if (webviewMessage.draft !== undefined) {
+                                saveDraftForSession(webviewMessage.fromSessionKey || activeSessionKey, webviewMessage.draft);
                             }
                             switchToSession(webviewMessage.sessionKey, true);
                         }
+                        break;
+                    case 'compositionChanged':
+                        noteComposition(webviewMessage.sessionKey, webviewMessage.hasText);
                         break;
                     case 'closeSession':
                         closeSessionByKey(webviewMessage.sessionKey);
@@ -912,10 +1030,7 @@ class FeedbackGatePanelProvider {
                         syncQueueToWebview(activeSessionKey || '');
                         break;
                     case 'saveDraft':
-                        if (webviewMessage.sessionKey) {
-                            const draftSession = sessions.get(webviewMessage.sessionKey);
-                            if (draftSession) { draftSession.draft = webviewMessage.draft || ''; persistSessions(); }
-                        }
+                        saveDraftForSession(webviewMessage.sessionKey, webviewMessage.draft);
                         break;
                     case 'moveQueueItem':
                         moveQueueItem(webviewMessage.itemId, webviewMessage.direction);
@@ -1647,16 +1762,21 @@ function consumeIdeQueueFile(filePath, isRecovery) {
                     sourceLabel: SOURCE_LABELS[item.source] || item.source,
                     chatId: item.chatId,
                     sessionKey: remoteSessionKey,
+                    // P3-1b: forwarded messages name their target conversation.
+                    sessionId: item.targetSessionId || (routedTarget ? (routedTarget.sessionId || '') : ''),
                 });
                 count++;
 
                 const label = SOURCE_LABELS[item.source] || item.source || '远程';
-                broadcastToAllWebviews({
-                    command: 'addMessage',
+                // P3-3: keep the "queued" notice inside the conversation it belongs to
+                // instead of rendering it into whichever tab the user is looking at.
+                const queuedNotice = {
                     text: `📨 来自${label}的消息已入队: ${item.text}`,
                     type: 'system',
                     plain: true
-                });
+                };
+                if (routedTarget) addMessageToSession(routedTarget.key, queuedNotice);
+                else broadcastToAllWebviews({ command: 'addMessage', ...queuedNotice });
             } catch {}
         }
 
@@ -2181,15 +2301,31 @@ function checkTriggerFile(context, filePath) {
             } else if (!targetSession && !targetSessionId) {
                 // No session matched, no session_id — consume untagged messages only
                 const anySessionHasTrigger = [...sessions.values()].some(s => s.triggerData);
-                shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData;
+                // P3-1c: untagged leftovers must not be handed to a conversation while
+                // another conversation in this window still has input of its own waiting.
+                const anySessionHasQueuedInput = [...sessions.values()].some(s => getPendingQueueCount(s.key) > 0);
+                shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData && !anySessionHasQueuedInput;
             } else if (!targetSession && targetSessionId) {
                 // Has session_id but no matching session yet (first trigger or session was cleaned).
                 // Check for untagged queue messages that were enqueued before any session existed.
                 const anySessionHasTrigger = [...sessions.values()].some(s => s.triggerData);
-                shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData;
+                // P3-1c: same guard — this is the exact shape of the reported defect:
+                // conversation B's FIRST trigger arriving while conversation A is still
+                // running with queued input must not consume anything that is not B's.
+                const anySessionHasQueuedInput = [...sessions.values()].some(s => getPendingQueueCount(s.key) > 0);
+                shouldAutoConsume = getPendingQueueCount('') > 0 && !anySessionHasTrigger && !currentTriggerData && !anySessionHasQueuedInput;
             }
             if (shouldAutoConsume) {
-                const queueItem = dequeueMessage(targetSessionKey);
+                let queueItem = dequeueMessage(targetSessionKey);
+                // P3-1b: hard stop for cross-conversation consumption. The item was
+                // stamped with the session_id of the conversation the user typed it
+                // into; if this trigger belongs to a different conversation, the
+                // message must stay queued no matter how the sessionKeys line up.
+                if (queueItem && !queueItemBelongsToConversation(queueItem, targetSessionId)) {
+                    console.error(`Feedback Gate: ⚠️ QUEUE_SESSION_MISMATCH — queued "${(queueItem.text || '').slice(0, 30)}" belongs to session_id ${String(queueItem.sessionId).slice(0, 8)}… but trigger ${triggerId} belongs to ${String(targetSessionId).slice(0, 8)}…; requeued, NOT consumed`);
+                    queue.requeueItem(queueItem.id);
+                    queueItem = null;
+                }
                 if (queueItem) {
                     const session = targetSession || (triggerPid ? getOrCreateSessionForTrigger(triggerPid, targetSessionId) : null);
                     if (queueItem.source && queueItem.source !== 'local' && queueItem.chatId) {
@@ -2318,14 +2454,25 @@ function checkTriggerFile(context, filePath) {
                 const otherSessionHasTrigger = [...sessions.values()].some(
                     s => s.key !== session.key && s.triggerData
                 );
-                const canFallbackToUntagged = postRouteCount === 0 && !otherSessionHasTrigger;
+                // P3-1c: another conversation still has input waiting → untagged
+                // leftovers are not ours to spend.
+                const otherSessionHasQueuedInput = [...sessions.values()].some(
+                    s => s.key !== session.key && getPendingQueueCount(s.key) > 0
+                );
+                const canFallbackToUntagged = postRouteCount === 0 && !otherSessionHasTrigger && !otherSessionHasQueuedInput;
                 if (canFallbackToUntagged) {
                     postRouteCount = getPendingQueueCount('');
                 }
                 if (postRouteCount > 0) {
-                    const postItem = canFallbackToUntagged
+                    let postItem = canFallbackToUntagged
                         ? (dequeueMessage(session.key) || dequeueMessage(''))
                         : dequeueMessage(session.key);
+                    // P3-1b: identity check before this trigger eats the message.
+                    if (postItem && !queueItemBelongsToConversation(postItem, (session.triggerData && session.triggerData.session_id) || '')) {
+                        console.error(`Feedback Gate: ⚠️ QUEUE_SESSION_MISMATCH (post-route) — queued "${(postItem.text || '').slice(0, 30)}" belongs to session_id ${String(postItem.sessionId).slice(0, 8)}… but trigger ${session.triggerData.trigger_id} belongs to ${String((session.triggerData.session_id) || '').slice(0, 8)}…; requeued, NOT consumed`);
+                        queue.requeueItem(postItem.id);
+                        postItem = null;
+                    }
                     if (postItem) {
                         if (postItem.source && postItem.source !== 'local' && postItem.chatId) {
                             session.pendingRemoteReply = { chatId: postItem.chatId, source: postItem.source, originalText: postItem.text || '', enqueuedAt: Date.now() };
@@ -2728,7 +2875,10 @@ function openFeedbackGatePopup(context, options = {}) {
             switch (webviewMessage.command) {
                 case 'send': {
                     const rawSessionKey2 = (webviewMessage.sessionKey != null ? webviewMessage.sessionKey : activeSessionKey) || '';
-                    const sendSession2 = (rawSessionKey2 ? sessions.get(rawSessionKey2) : null) || activeSession;
+                    const sendSession2 = resolveSendSession(rawSessionKey2) || activeSession;
+                    if (!rawSessionKey2 && sessions.size > 1) {
+                        console.log(`Feedback Gate: ⚠️ SEND_WITHOUT_SESSION_KEY (panel) — falling back to ${sendSession2 ? sendSession2.key : 'none'}`);
+                    }
                     if (sendSession2 && sendSession2.sessionId && sessionLease.isHeldElsewhere(sendSession2.sessionId, process.pid)) {
                         if (forwardMessageToLeaseHolder(sendSession2, webviewMessage.text, webviewMessage.attachments, webviewMessage.files)) {
                             vscode.window.showInformationMessage('Feedback Gate: 该会话由另一个窗口持有，消息已转发');
@@ -2743,6 +2893,7 @@ function openFeedbackGatePopup(context, options = {}) {
                     else pendingRemoteReply = null;
                     const enqueuedItem2 = enqueueMessage(webviewMessage.text, webviewMessage.attachments, webviewMessage.files, {
                         sessionKey: sendSessionKey2,
+                        sessionId: sendSession2 ? (sendSession2.sessionId || '') : '',
                     });
                     logUserInput(`Queued: ${webviewMessage.text}`, 'QUEUED', null);
                     const sendTrigger2 = sendSession2 ? sendSession2.triggerData : null;
@@ -2760,12 +2911,15 @@ function openFeedbackGatePopup(context, options = {}) {
                 }
                 case 'switchSession':
                     if (webviewMessage.sessionKey) {
-                        if (activeSession && webviewMessage.draft !== undefined) {
-                            activeSession.draft = webviewMessage.draft || '';
-                            persistSessions();
+                        // P3-2: draft belongs to the session being left.
+                        if (webviewMessage.draft !== undefined) {
+                            saveDraftForSession(webviewMessage.fromSessionKey || activeSessionKey, webviewMessage.draft);
                         }
                         switchToSession(webviewMessage.sessionKey, true);
                     }
+                    break;
+                case 'compositionChanged':
+                    noteComposition(webviewMessage.sessionKey, webviewMessage.hasText);
                     break;
                 case 'closeSession':
                     closeSessionByKey(webviewMessage.sessionKey);
@@ -2780,10 +2934,7 @@ function openFeedbackGatePopup(context, options = {}) {
                     syncQueueToWebview(activeSessionKey || '');
                     break;
                 case 'saveDraft':
-                    if (webviewMessage.sessionKey) {
-                        const draftSession2 = sessions.get(webviewMessage.sessionKey);
-                        if (draftSession2) { draftSession2.draft = webviewMessage.draft || ''; persistSessions(); }
-                    }
+                    saveDraftForSession(webviewMessage.sessionKey, webviewMessage.draft);
                     break;
                 case 'moveQueueItem':
                     moveQueueItem(webviewMessage.itemId, webviewMessage.direction);
@@ -2941,8 +3092,16 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
     const sessionKey = targetSession ? targetSession.key : '';
     if (getPendingQueueCount(sessionKey) === 0) return;
 
-    const queueItem = dequeueMessage(sessionKey);
+    let queueItem = dequeueMessage(sessionKey);
     if (!queueItem) return;
+
+    // P3-1b: the trigger may only consume input typed into its OWN conversation.
+    const drainSessionId = (activeTrigger && activeTrigger.session_id) || '';
+    if (!queueItemBelongsToConversation(queueItem, drainSessionId)) {
+        console.error(`Feedback Gate: ⚠️ QUEUE_SESSION_MISMATCH (drain) — queued "${(queueItem.text || '').slice(0, 30)}" belongs to session_id ${String(queueItem.sessionId).slice(0, 8)}… but trigger ${activeTrigger.trigger_id} belongs to ${String(drainSessionId).slice(0, 8)}…; requeued, NOT consumed`);
+        queue.requeueItem(queueItem.id);
+        return;
+    }
 
     if (queueItem.source && queueItem.source !== 'local' && queueItem.chatId) {
         const rr = { chatId: queueItem.chatId, source: queueItem.source, originalText: queueItem.text || '', enqueuedAt: Date.now() };
@@ -3012,14 +3171,23 @@ function processQueueForPendingTrigger(directSend, targetSessionKey) {
 function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, specialHandling) {
     // Clear trigger from the session that owns this triggerId, not just the active tab
     let cleared = false;
+    // P3-3: confirmations belong to the conversation that asked. Every message below
+    // is tagged with that session key so the webview can refuse to render it inside
+    // another conversation's transcript.
+    let ownerSessionKey = '';
     if (triggerId) {
         for (const s of sessions.values()) {
             if (s.triggerData && s.triggerData.trigger_id === triggerId) {
+                ownerSessionKey = s.key;
                 clearSessionTrigger(s.key);
                 cleared = true;
                 break;
             }
         }
+    }
+    if (!ownerSessionKey) {
+        const act = getActiveSession();
+        ownerSessionKey = act ? act.key : '';
     }
     if (!cleared && !triggerId) {
         const activeSession = getActiveSession();
@@ -3056,7 +3224,8 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
                 broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `🛑 关闭已确认: "${text}"\n\n用户已批准 MCP 服务器关闭。\n\nCursor 将执行优雅关闭。`,
-                    type: 'system'
+                    type: 'system',
+                    sessionKey: ownerSessionKey
                 });
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
@@ -3067,7 +3236,8 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
                 broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `💡 替代指令: "${text}"\n\n你的指令已发送给 Cursor，替代关闭确认。\n\nCursor 将处理你的替代请求。`,
-                    type: 'system'
+                    type: 'system',
+                    sessionKey: ownerSessionKey
                 });
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
@@ -3079,7 +3249,8 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
                 broadcastToAllWebviews({
                     command: 'addMessage',
                     text: `🔄 文本输入已处理: "${text}"\n\n你的反馈已发送给 Cursor。\n\nCursor 将基于你的输入继续处理。`,
-                    type: 'system'
+                    type: 'system',
+                    sessionKey: ownerSessionKey
                 });
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
@@ -3092,7 +3263,8 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
                 command: 'addMessage',
                 text: randomResponse,
                 type: 'system',
-                plain: true
+                plain: true,
+                sessionKey: ownerSessionKey
             });
             setTimeout(() => { updateChatPanelStatus(); }, 1000);
         }, 500);

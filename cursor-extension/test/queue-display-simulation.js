@@ -64,8 +64,17 @@ function createQueueManager() {
         return items;
     }
 
-    function migrateSessionKey(from, to) {
-        messageQueue.forEach(m => { if (m.sessionKey === from) m.sessionKey = to; });
+    // Mirrors queue-manager.migrateSessionKey (P3-1c adds the optional `keep`
+    // predicate: rejected items stay in the source bucket).
+    function migrateSessionKey(from, to, keep) {
+        let migrated = 0;
+        messageQueue.forEach(m => {
+            if (m.sessionKey !== from) return;
+            if (typeof keep === 'function' && !keep(m)) return;
+            m.sessionKey = to;
+            migrated++;
+        });
+        return migrated;
     }
 
     function saveQueue() { /* no-op in test */ }

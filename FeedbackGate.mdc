@@ -67,6 +67,9 @@ CallMcpTool:
 - **首次调用**：生成一个 UUID（如 `crypto.randomUUID()` 或类似方式），作为 `session_id` 传入。
 - **后续所有调用**：复用**同一个** `session_id`，包括 [WAITING] 后的 re-entry 和后续新任务的 feedback gate 调用。
 - **一个对话 = 一个 session_id**，整个对话生命周期不变。不同的 Cursor agent chat 使用不同的 session_id。
+- **⚠️ session_id 是插件在同一个 Cursor 窗口内区分对话的唯一依据**（一个窗口只有一个 MCP 进程，PID 无法区分窗口内的多个对话）。
+  - 换了 session_id = 插件认为这是**另一个对话** → 会开一个新 Tab，原对话的排队消息不会送到新 Tab。
+  - 只有**真正的新对话**（用户新开的 chat）才允许生成新 UUID；同一个对话里**任何时候都不要换**。
 
 ## 约束
 - 每次回复结束前必须调用此工具，无例外。
@@ -75,6 +78,11 @@ CallMcpTool:
 
 ## 上下文压缩后的恢复
 当对话被压缩（context compaction）后，你可能在历史摘要中看到之前的 `feedback_gate_chat` 调用记录。**无论历史中工具调用的状态如何（成功、失败、超时），每次新回复结束时都必须重新调用 `feedback_gate_chat`。** 不要因为历史中出现过工具调用失败就跳过调用。
+
+**压缩后必须沿用原来的 `session_id`：**
+1. 先在历史/摘要里找之前 `feedback_gate_chat` 调用传入的 `session_id`，找到就**原样复用**。
+2. 只有在历史中**完全找不到**任何 session_id 时，才生成一个新的 UUID。
+3. 压缩**不是**新对话，绝不要因为压缩而生成新 UUID —— 那会让插件把这次调用当成同窗口里的另一个对话，导致新 Tab、消息归属错乱。
 
 ## ⚠️ 强制提醒
 **在你生成任何回复的最后一步，你必须调用 `feedback_gate_chat`。这是不可跳过的。如果你发现自己即将结束回复而没有调用此工具，立即停下来调用它。**
