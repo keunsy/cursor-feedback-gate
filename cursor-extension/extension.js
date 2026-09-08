@@ -3255,7 +3255,12 @@ function handleFeedbackMessage(text, attachments, triggerId, mcpIntegration, spe
                 setTimeout(() => { broadcastToAllWebviews({ command: 'updateMcpStatus', active: mcpStatus, hasPendingTrigger: false }); }, 1000);
             }, 500);
     } else {
-        outputChannel.appendLine(`${mcpIntegration ? 'MCP RESPONSE' : 'REVIEW'} SUBMITTED: ${text}`);
+        // P3-5: this branch also runs when a queued reply is drained for a trigger,
+        // and outputChannel only exists after activate(). A late callback (window
+        // closing / deactivate) must not throw here and abort the reply handling.
+        if (outputChannel) {
+            outputChannel.appendLine(`${mcpIntegration ? 'MCP RESPONSE' : 'REVIEW'} SUBMITTED: ${text}`);
+        }
         
         setTimeout(() => {
             const randomResponse = funnyResponses[Math.floor(Math.random() * funnyResponses.length)];
@@ -3457,6 +3462,7 @@ function deactivate() {
     
     if (outputChannel) {
         outputChannel.dispose();
+        outputChannel = null; // P3-5: late callbacks must take the null guard, not a disposed channel
     }
 }
 

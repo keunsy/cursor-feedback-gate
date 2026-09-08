@@ -22,7 +22,7 @@
 | Q2 | Trigger 到达时队列有消息 | Auto-consume：agent 消息先显示，然后队列消息显示 | G3-*, MO-1 |
 | Q3 | 多条消息排队 | 按 FIFO 顺序被逐个 trigger 消费 | E2E-3, G4-* |
 | Q4 | 已显示的消息不重复显示 | `_displayed` 标记防止 auto-consume 二次添加 | MO-3, G10-* |
-| Q5 | 不同 session 的队列互相隔离 | Session A 的 trigger 不消费 Session B 的消息；**同一窗口内以 `session_id` 为权威身份**（见 §11） | G7-*, G8-*, E2E-6, P3-1…P3-6, P3-19, QM-10…QM-12 |
+| Q5 | 不同 session 的队列互相隔离 | Session A 的 trigger 不消费 Session B 的消息；**同一窗口内以 `session_id` 为权威身份**（见 §11） | G7-*, G8-*, E2E-6, P3-1…P3-6, P3-19, QM-10…QM-12, **RC-1…RC-14（真实代码）** |
 | Q6 | Reload/关闭后重开同 workspace | 仅迁移**已退出进程**的旧 PID 队列文件；pending 消息合并到新 PID，清空 sessionKey，删除旧文件；存活 PID 的文件不触碰 | QM-* |
 
 ## 3. Session 管理
@@ -132,6 +132,9 @@
 | IW10 | 切换 Tab / 保存草稿 | 草稿归属"**离开的那个对话**"（`fromSessionKey`），而不是切换后的活动对话 | — (extension) |
 | IW11 | 队列项入队 | 同时写入 `sessionKey`（窗口内 bucket）与 `sessionId`（对话身份），PID 队列迁移后 `sessionId` 必须保留 | QM-10, QM-11 |
 | IW12 | 唯一 session 采纳 untagged 残留（`migrateSessionKey('', key)`） | 只采纳**无身份**或**身份一致**的残留；带其它对话 `session_id` 的残留保持 untagged，既不可见也不可被消费 | QM-13 |
+| IW13 | 回复处理的晚期回调（P3-5） | `outputChannel` 只在 `activate()` 创建、`deactivate()` 释放；任何回复分支（含队列 drain 出来的回复）都不得因其为 null/已释放而抛错中断后续处理 | RC-8 |
+
+> §11 的 IW1–IW13 由 `cursor-extension/test/real-code-intrawindow.js` 用**真实 `extension.js`**（附加测试 seam 后原样加载）驱动验证；IW5–IW11 的 webview 侧由 `cursor-extension/test/real-code-webview.js` 用**真实 `webview-template.js` 产出的内联脚本**（`vm` 原样执行 + 最小 DOM shim，经真实 `message` 路由驱动）验证。其余套件是逻辑镜像。改完必须全部跑。
 
 ---
 
@@ -141,10 +144,22 @@
 node cursor-extension/test/scenario-simulation.js \
   && node cursor-extension/test/queue-display-simulation.js \
   && node cursor-extension/test/integration-scenarios.js \
+  && node cursor-extension/test/real-code-intrawindow.js \
+  && node cursor-extension/test/real-code-webview.js \
   && python3 test/mcp-scenarios.py
 ```
 
 全部通过 = 行为契约满足。任何修改后必须跑此命令。
+
+`real-code-*.js` 与其它三个 JS 套件的区别：它们不复制逻辑，而是把线上文件**原样加载后驱动**——
+`real-code-intrawindow.js` 加载 `extension.js`（附加测试 seam + 最小 `vscode` stub + 真实
+`queue-manager`），直接调用 `setCurrentTriggerData` / `processQueueForPendingTrigger` /
+`switchToSession` / `resolveSendSession`；`real-code-webview.js` 用 `vm` 执行
+`webview-template.js` 产出的内联脚本，通过真实 `window.addEventListener('message')` 路由
+投递 `loadSession` / `addMessage` / `syncTabs`，并触发真实 input 监听器。
+两者都已通过**变异测试**：逐个关掉 P3-1 / P3-1b / P3-1c / P3-2 守卫（→ RC-1、RC-5~RC-9 变红）
+与 webview 的 foreign 过滤 / 路由 stash / send 归属（→ WV-4、WV-6~WV-9 变红），
+因此它们绿了才等于线上代码真的绿了。
 
 ---
 
