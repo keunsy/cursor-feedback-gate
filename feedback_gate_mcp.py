@@ -911,6 +911,7 @@ class FeedbackGateServer:
                 elapsed_min = elapsed_total / 60
                 wall_elapsed = time.time() - call_entry_time
                 if elapsed_total >= max_secs:
+                    self._drain_response_to_stash(my_trigger_id, session_id)
                     del self._active_triggers[my_trigger_id]
                     if self._pending_trigger_id == my_trigger_id:
                         self._clear_trigger_state(responded=False)
@@ -1116,6 +1117,7 @@ class FeedbackGateServer:
                 elapsed_min = elapsed_total / 60
                 wall_elapsed = time.time() - call_entry_time
                 if elapsed_total >= max_secs:
+                    self._drain_response_to_stash(trigger_id, session_id)
                     self._active_triggers.pop(trigger_id, None)
                     if self._pending_trigger_id == trigger_id:
                         self._clear_trigger_state(responded=False)
