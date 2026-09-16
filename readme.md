@@ -25,8 +25,8 @@ Feedback Gate 在 Agent 完成工作后弹出一个输入窗口，你可以在�
 当前版本支持**多 Tab 并发对话**和**多窗口会话隔离**，但由于 Cursor MCP 架构的限制（单进程共享、多窗口路由等），在以下场景中可能出现不稳定：
 
 **多窗口（3 个及以上）场景：**
-- 窗口过多时，Extension Host 可能重建 Webview，导致个别窗口的 Feedback Gate 短暂不可用（已加入 8 秒自动重试机制）
-- 当某窗口的 Webview 被销毁但 Extension Host 仍存活时，会话 lease 可能延迟释放（已加入活跃 Webview 检测，无活跃 Webview 时自动释放所有 lease）
+- 窗口过多时，Cursor 可能重建 Feedback Gate 界面，导致个别窗口短暂不可用（已加入 8 秒自动重试机制）
+- 某些窗口的 Feedback Gate 界面可能被 Cursor 回收但后台进程仍在运行，导致会话占用延迟释放（已加入自动检测和释放机制）
 - 极端情况下（5+ 窗口同时活跃），trigger 路由可能出现短暂延迟
 
 **多 Tab 场景：**
@@ -108,7 +108,7 @@ Agent 触发时自动跳转到配置的默认位置。如果默认位置不可�
 
 - **`wait_seconds: 300`**（5 分钟）：Cursor IDE 对单次 MCP 工具调用有超时限制，等待太久可能被 Cursor 自动结束。设为 300 秒意味着每 5 分钟主动返回一次心跳，防止被判定超时。最初默认 600 秒，经实际使用调优为 300 秒。**不建议设得太短**（如 < 60 秒），过于频繁的心跳返回-重新调用循环可能被 Cursor 视为异常行为；**也不建议设得太长**（如 > 3300 秒），接近 Cursor 硬超时限制可能导致对话被强制中断。推荐范围 **120-600 秒**。
 - **`max_total_seconds: 3600`**（1 小时）：与 Cursor 的 MCP 硬超时对齐。超过 1 小时无用户响应，大概率是用户已离开，此时返回 TIMEOUT 并释放资源。最初默认 86400 秒（24 小时），实际使用中发现过长的等待会导致 Agent 长期挂起占用资源，调优为 1 小时。**注意：心跳机制可能导致额外的请求消耗。** 心跳超时后 Agent 会重新调用 `feedback_gate_chat`，这在某些情况下可能被 Cursor 计为一次请求（具体机制因 Cursor 版本而异，并非每次都会消耗）。如果你发现请求额度消耗异常，可以适当增大 `wait_seconds`（如 600 秒），代价是用户输入后的响应延迟会增加。
-- **`heartbeat_mode: "waiting"`**：推荐默认值。Agent 收到 `[WAITING]` 后知道用户还没回复，会立即重新调用。相比 `user_response` 模式，不会消耗额外的 Agent 请求次数（`user_response` 模式下 Agent 会认为收到了新输入并处理）。
+- **`heartbeat_mode: "waiting"`**：推荐默认值。Agent 收到 `[WAITING]` 后知道用户还没回复，会立即重新调用继续等待。`user_response` 模式下 Agent 会认为收到了用户的新输入并进行处理，可能产生不必要的操作。
 
 也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
 
