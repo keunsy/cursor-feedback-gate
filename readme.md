@@ -107,7 +107,7 @@ Agent 触发时自动跳转到配置的默认位置。如果默认位置不可�
 **默认值选择依据：**
 
 - **`wait_seconds: 300`**（5 分钟）：Cursor IDE 对单次 MCP 工具调用有超时限制，如果一次 MCP 调用长时间无返回，Cursor 可能自动结束该调用或整个 Agent 对话。设为 300 秒意味着每 5 分钟主动返回一次心跳，防止被 Cursor 判定为超时而强制中断。最初默认 600 秒，经实际使用调优为 300 秒——间隔越短，被 Cursor 误判超时的概率越低，Agent 对用户输入的响应也越快。
-- **`max_total_seconds: 3600`**（1 小时）：与 Cursor 的 MCP 硬超时对齐。超过 1 小时无用户响应，大概率是用户已离开，此时返回 TIMEOUT 并释放资源。最初默认 86400 秒（24 小时），实际使用中发现过长的等待会导致 Agent 长期挂起占用资源，调优为 1 小时。**注意：由于 Cursor 的机制，每次心跳超时后 Agent 重新调用 `feedback_gate_chat` 会消耗一次请求额度。以默认配置计算，1 小时内最多产生约 12 次额外请求（3600 / 300 = 12）。** 如果你对请求额度敏感，可以适当增大 `wait_seconds`（如 600 秒，每小时约 6 次额外请求），代价是用户输入后的响应延迟会增加。
+- **`max_total_seconds: 3600`**（1 小时）：与 Cursor 的 MCP 硬超时对齐。超过 1 小时无用户响应，大概率是用户已离开，此时返回 TIMEOUT 并释放资源。最初默认 86400 秒（24 小时），实际使用中发现过长的等待会导致 Agent 长期挂起占用资源，调优为 1 小时。**注意：心跳机制可能导致额外的请求消耗。** 心跳超时后 Agent 会重新调用 `feedback_gate_chat`，这在某些情况下可能被 Cursor 计为一次请求（具体机制因 Cursor 版本而异，并非每次都会消耗）。如果你发现请求额度消耗异常，可以适当增大 `wait_seconds`（如 600 秒），代价是用户输入后的响应延迟会增加。
 - **`heartbeat_mode: "waiting"`**：推荐默认值。Agent 收到 `[WAITING]` 后知道用户还没回复，会立即重新调用。相比 `user_response` 模式，不会消耗额外的 Agent 请求次数（`user_response` 模式下 Agent 会认为收到了新输入并处理）。
 
 也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
