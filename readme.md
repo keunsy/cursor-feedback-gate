@@ -20,14 +20,21 @@ Feedback Gate 在 Agent 完成工作后弹出一个输入窗口，你可以在�
 
 技术上：Agent 通过 MCP 协议调用 `feedback_gate_chat` 工具，触发 Cursor 扩展弹出输入界面。用户的回复通过临时文件回传给 MCP 服务器，Agent 读取后继续执行。
 
-## ⚠️ 稳定性说明
+## ⚠️ 多窗口/多 Tab 已知限制
 
-当前版本（v1.2.x）支持**多 Tab 并发对话**，但由于 Cursor MCP 架构的限制（单进程共享、多窗口路由等），在以下场景中可能出现不稳定：
+当前版本支持**多 Tab 并发对话**和**多窗口会话隔离**，但由于 Cursor MCP 架构的限制（单进程共享、多窗口路由等），在以下场景中可能出现不稳定：
 
-- Cursor 所有窗口共享同一个 MCP 进程，多窗口/多 Tab 并发时 trigger 路由可能失败或延迟
+**多窗口（3 个及以上）场景：**
+- 窗口过多时，Extension Host 可能重建 Webview，导致个别窗口的 Feedback Gate 短暂不可用（已加入 8 秒自动重试机制）
+- 当某窗口的 Webview 被销毁但 Extension Host 仍存活时，会话 lease 可能延迟释放（已加入活跃 Webview 检测，无活跃 Webview 时自动释放所有 lease）
+- 极端情况下（5+ 窗口同时活跃），trigger 路由可能出现短暂延迟
+
+**多 Tab 场景：**
+- 同一窗口内多个 Agent 对话同时等待 Feedback Gate 时，消息路由依赖 session_id 匹配，通常准确
+- 极少数情况下，Tab 切换瞬间发送的消息可能被路由到错误的对话（已有 draft stash 保护机制）
 - MCP 协议本身无并发会话支持，极端情况下多个对话的消息可能交错
 
-**如果你不需要多 Tab 支持，建议使用早期稳定版本**，单对话场景下更加可靠。
+**建议**：日常使用 1-2 个 Cursor 窗口体验最佳。如需多窗口，建议不超过 3 个同时活跃。
 
 ## 功能
 
@@ -107,6 +114,7 @@ cursor-feedback-gate/
 ├── cursor-extension/
 │   ├── extension.js           Cursor 扩展主入口
 │   ├── queue-manager.js       消息队列管理
+│   ├── session-lease.js       多窗口会话租约管理
 │   ├── webview-template.js    Webview UI 模板
 │   ├── utils.js               工具函数
 │   ├── package.json           扩展清单
