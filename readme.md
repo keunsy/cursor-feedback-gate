@@ -147,6 +147,8 @@ cursor-feedback-gate/
 
 ### `/ide` 远程指令入队
 
+> ⚠️ **实验性功能**：远程指令入队在多窗口场景下可能存在路由不稳定的问题。消息可能投递到非预期的窗口，或在窗口切换/重启后丢失。建议仅在单窗口场景下使用，多窗口时通过 `#序号` 或 `#PID` 明确指定目标窗口。
+
 搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control)，从 IM 直接向 IDE 的 Feedback Gate 队列投递消息。消息入队后，Agent 下次调用 `feedback_gate_chat` 时自动出队处理。
 
 **前提**：需要同时安装并运行 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control)（IM 中继服务）和本项目（Cursor Extension + MCP）。
