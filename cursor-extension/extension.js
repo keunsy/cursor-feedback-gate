@@ -238,10 +238,29 @@ function releaseSessionLease(sessionId) {
     _myLeases.delete(sessionId);
 }
 
+function _hasLiveWebview() {
+    if (chatViewProvider && chatViewProvider._view && chatViewProvider._view.webview) return true;
+    if (sidebarViewProvider && sidebarViewProvider._view && sidebarViewProvider._view.webview) return true;
+    if (chatPanel && chatPanel.webview) return true;
+    return false;
+}
+
 function refreshHeldLeases(now) {
     if (!_myLeases.size) return;
     if (now - _leaseRefreshAt < sessionLease.LEASE_REFRESH_INTERVAL_MS) return;
     _leaseRefreshAt = now;
+
+    // If this window has no live webview, release ALL leases so other windows
+    // can claim the sessions. This prevents the scenario where a window's
+    // Extension Host is alive but its webview is disposed/unresponsive,
+    // causing other windows to yield indefinitely.
+    if (!_hasLiveWebview()) {
+        for (const sid of [..._myLeases.keys()]) {
+            releaseSessionLease(sid);
+        }
+        return;
+    }
+
     for (const sid of [..._myLeases.keys()]) {
         // P1-3: never steal back a lease that another LIVE window legitimately
         // took over while we were suspended (e.g. laptop sleep past the lease
@@ -958,12 +977,25 @@ class FeedbackGatePanelProvider {
         const isRebuild = this._readyReceived;
         this._view = webviewView;
         this._readyReceived = false;
+        if (this._readyTimeout) { clearTimeout(this._readyTimeout); this._readyTimeout = null; }
 
         webviewView.webview.options = {
             enableScripts: true
         };
 
         webviewView.webview.html = getFeedbackGateHTML("Feedback Gate", false);
+
+        // Guard against webview loading failure: if 'ready' is not received
+        // within 8 seconds, re-set the HTML to force a retry. This prevents
+        // the "forever loading" state when VS Code rebuilds the webview
+        // during multi-window layout changes.
+        this._readyTimeout = setTimeout(() => {
+            this._readyTimeout = null;
+            if (!this._readyReceived && this._view && this._view.webview) {
+                console.log(`Feedback Gate: webview ${this._viewId} did not send 'ready' within 8s — retrying HTML`);
+                this._view.webview.html = getFeedbackGateHTML("Feedback Gate", false);
+            }
+        }, 8000);
 
         webviewView.webview.onDidReceiveMessage(
             webviewMessage => {
@@ -1066,6 +1098,7 @@ class FeedbackGatePanelProvider {
                         break;
                     case 'ready': {
                         this._readyReceived = true;
+                        if (this._readyTimeout) { clearTimeout(this._readyTimeout); this._readyTimeout = null; }
                         const hasAnyTrigger = [...sessions.values()].some(s => s.triggerData) || !!currentTriggerData;
 
                         // Flush pending messages (same as old code, just unified
@@ -1113,6 +1146,7 @@ class FeedbackGatePanelProvider {
 
         webviewView.onDidDispose(() => {
             this._view = null;
+            if (this._readyTimeout) { clearTimeout(this._readyTimeout); this._readyTimeout = null; }
         });
 
         webviewView.onDidChangeVisibility(() => {
