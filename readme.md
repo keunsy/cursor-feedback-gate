@@ -1,57 +1,59 @@
+English | [中文](README.zh-CN.md)
+
 # Feedback Gate
 
-Cursor IDE 的 Agent 反馈关卡。让 AI 在每次任务完成后等待你的确认，而不是自行结束对话。
+A feedback checkpoint for Cursor IDE Agents. Makes AI wait for your confirmation after each task instead of ending the conversation on its own.
 
-## 它解决什么问题
+## The Problem It Solves
 
-Cursor Agent 处理复杂任务时，经常执行了几步就宣布完成。你不得不发起新的请求来继续，浪费宝贵的请求额度。
+Cursor Agent often declares a complex task "done" after just a few steps. You have to start a new request to continue, wasting precious request quota.
 
-Feedback Gate 在 Agent 完成工作后弹出一个输入窗口，你可以在同一次请求内持续追加指令，直到真正满意为止。
+Feedback Gate pops up an input window after the Agent finishes, letting you keep giving instructions within the same request until you're truly satisfied.
 
-## 效果预览
+## Preview
 
-![Feedback Gate 在 Cursor 中运行](docs/feedback-gate-preview.png)
+![Feedback Gate running in Cursor](docs/feedback-gate-preview.png)
 
-## 工作原理
+## How It Works
 
 ```
-你发出任务 → Agent 执行 → 弹窗等待反馈 → 你追加指令 → Agent 继续 → ... → 输入 Done 结束
+You send a task → Agent executes → Popup waits for feedback → You add instructions → Agent continues → ... → Type Done to finish
 ```
 
-技术上：Agent 通过 MCP 协议调用 `feedback_gate_chat` 工具，触发 Cursor 扩展弹出输入界面。用户的回复通过临时文件回传给 MCP 服务器，Agent 读取后继续执行。
+Technically: The Agent calls the `feedback_gate_chat` tool via MCP protocol, triggering the Cursor extension to show an input UI. User replies are passed back to the MCP server through temp files, and the Agent reads them to continue.
 
-## ⚠️ 多窗口/多 Tab 已知限制
+## ⚠️ Known Limitations (Multi-Window / Multi-Tab)
 
-当前版本支持**多 Tab 并发对话**和**多窗口会话隔离**，但由于 Cursor MCP 架构的限制（单进程共享、多窗口路由等），在以下场景中可能出现不稳定：
+The current version supports **multi-tab concurrent conversations** and **multi-window session isolation**, but due to Cursor's MCP architecture limitations (single process sharing, multi-window routing, etc.), instability may occur in these scenarios:
 
-**多窗口（3 个及以上）场景：**
-- 窗口过多时，Cursor 可能重建 Feedback Gate 界面，导致个别窗口短暂不可用（已加入 8 秒自动重试机制）
-- 某些窗口的 Feedback Gate 界面可能被 Cursor 回收但后台进程仍在运行，导致会话占用延迟释放（已加入自动检测和释放机制）
-- 极端情况下（5+ 窗口同时活跃），trigger 路由可能出现短暂延迟
+**Multiple Windows (3+):**
+- With too many windows, Cursor may rebuild the Feedback Gate UI, causing brief unavailability in some windows (8-second auto-retry mechanism added)
+- Some windows' Feedback Gate UI may be reclaimed by Cursor while the background process is still running, causing delayed session lease release (auto-detection and release mechanism added)
+- In extreme cases (5+ active windows), trigger routing may experience brief delays
 
-**多 Tab 场景：**
-- 同一窗口内多个 Agent 对话同时等待 Feedback Gate 时，消息路由依赖 session_id 匹配，通常准确
-- 极少数情况下，Tab 切换瞬间发送的消息可能被路由到错误的对话（已有 draft stash 保护机制）
-- MCP 协议本身无并发会话支持，极端情况下多个对话的消息可能交错
+**Multiple Tabs:**
+- When multiple Agent conversations wait for Feedback Gate simultaneously, message routing relies on session_id matching — usually accurate
+- In rare cases, messages sent during tab switching may be routed to the wrong conversation (draft stash protection in place)
+- MCP protocol itself doesn't support concurrent sessions; in extreme cases, messages from multiple conversations may interleave
 
-**建议**：日常使用 1-2 个 Cursor 窗口体验最佳。如需多窗口，建议不超过 3 个同时活跃。
+**Recommendation**: 1-2 Cursor windows work best. If using multiple windows, keep no more than 3 active simultaneously.
 
-## 功能
+## Features
 
-- **多 Tab 对话** — 支持同一窗口内多个 Agent 并发对话，每个对话独立标签页，互不干扰
-- **多位置显示** — 支持底部面板、侧边栏（Activity Bar）、编辑器标签页三种位置，可在设置中切换默认位置
-- **底部面板交互** — 不占编辑器空间，Agent 触发时自动弹出
-- **消息队列** — Agent 忙时发送的消息自动排队，不会丢失，支持排序、编辑、删除，出队时完整显示在对话中
-- **智能心跳** — 自动发送心跳消息防止 MCP 调用超时，措辞随机变化避免 Agent 放弃等待
-- **一键开关** — 状态栏绿色 `● FeedBack` 按钮，不需要反馈关卡时一键禁用，Agent 调用时直接放行不弹窗
-- **多窗口隔离** — 每个 Cursor 窗口独立运行，不会串窗
-- **拖拽附件** — 从 Finder 直接拖入图片、文件或文件夹，或按住 Shift 从 Cursor 文件树拖入；也支持 Cmd+V 粘贴截图
-- **代码引用** — 选中代码后右键 "Add to Feedback Gate"，代码片段（含文件路径和行号）附加到消息中发送给 Agent
-- **中文输入法兼容** — Enter 确认候选词不会误发消息
-- **状态感知输入框** — Agent 等待时绿色边框，队列模式蓝色边框，MCP 未连接时禁用
-- **超时保护** — 设有最大等待上限，避免因网络中断等异常导致 Agent 无限挂起
+- **Multi-Tab Conversations** — Multiple concurrent Agent conversations in one window, each with its own tab
+- **Multiple Display Locations** — Bottom panel, sidebar (Activity Bar), or editor tab; configurable in settings
+- **Bottom Panel Interaction** — Doesn't take up editor space; auto-shows when Agent triggers
+- **Message Queue** — Messages sent while Agent is busy are automatically queued; supports sorting, editing, and deletion
+- **Smart Heartbeat** — Auto-sends heartbeat messages to prevent MCP call timeouts; wording varies randomly to keep Agent engaged
+- **One-Click Toggle** — Green `● FeedBack` button in status bar; disable when not needed, Agent calls pass through without popup
+- **Multi-Window Isolation** — Each Cursor window runs independently
+- **Drag & Drop Attachments** — Drag images/files/folders from Finder, or hold Shift to drag from Cursor file tree; also supports Cmd+V paste
+- **Code References** — Right-click selected code → "Add to Feedback Gate"; code snippet (with file path and line numbers) is attached to the message
+- **CJK Input Compatibility** — Enter to confirm IME candidates won't accidentally send the message
+- **State-Aware Input** — Green border when Agent is waiting, blue border in queue mode, disabled when MCP is not connected
+- **Timeout Protection** — Max wait limit prevents Agent from hanging indefinitely due to network issues
 
-## 安装
+## Installation
 
 ```bash
 git clone https://github.com/keunsy/cursor-feedback-gate.git
@@ -59,134 +61,134 @@ cd cursor-feedback-gate
 ./install.sh
 ```
 
-脚本会自动完成：Python 虚拟环境、依赖安装、MCP 配置、扩展打包与安装、Rule 文件部署。
+The script auto-completes: Python venv setup, dependency installation, MCP configuration, extension packaging & installation, and Rule file deployment.
 
-安装后 Reload Cursor 窗口即可使用。
+Reload Cursor window after installation to start using.
 
-## 配置
+## Configuration
 
-### 显示位置
+### Display Location
 
-Feedback Gate 支持三种显示位置，在 Cursor 设置中搜索 `feedbackGate.defaultLocation` 切换：
+Feedback Gate supports three display locations. Search `feedbackGate.defaultLocation` in Cursor settings to switch:
 
-| 值 | 位置 | 说明 |
+| Value | Location | Description |
 |---|---|---|
-| `panel` | 底部面板 | 默认值，与 Terminal 同级 |
-| `sidebar` | 侧边栏 | Activity Bar 图标入口，适合宽屏 |
-| `editor` | 编辑器标签页 | 作为编辑器 tab 打开 |
+| `panel` | Bottom panel | Default; same level as Terminal |
+| `sidebar` | Sidebar | Activity Bar icon entry; good for wide screens |
+| `editor` | Editor tab | Opens as an editor tab |
 
-Agent 触发时自动跳转到配置的默认位置。如果默认位置不可用，会按 panel → sidebar → editor 顺序 fallback。
+Auto-jumps to configured default location when triggered. Falls back in order: panel → sidebar → editor.
 
-## 配置 Rule
+## Rule Configuration
 
-安装脚本会自动将 `FeedbackGate.mdc` 部署到 `~/.cursor/rules/`，通常全局生效。
+The install script auto-deploys `FeedbackGate.mdc` to `~/.cursor/rules/`, which usually takes effect globally.
 
-**如果发现 Agent 不调用 Feedback Gate**，可以手动将规则复制到 Cursor User Rules 中确保生效：
+**If the Agent doesn't call Feedback Gate**, manually copy the rule to Cursor User Rules:
 
-**Cursor Settings → Rules → User Rules** → 粘贴 `FeedbackGate.mdc` 的完整内容
+**Cursor Settings → Rules → User Rules** → Paste the full contents of `FeedbackGate.mdc`
 
-## 高级配置
+## Advanced Configuration
 
-创建 `~/.cursor/feedback-gate-config.json` 自定义心跳行为（实时生效，无需重启）：
+Create `~/.cursor/feedback-gate-config.json` to customize heartbeat behavior (takes effect immediately, no restart needed):
 
 ```json
 {
   "heartbeat_mode": "user_response",
-  "heartbeat_reply": "当前时间",
+  "heartbeat_reply": "current time",
   "wait_seconds": 900
 }
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `heartbeat_mode` | `"waiting"` | `waiting`: 超时后返回 `[WAITING]`，Agent 重新调用继续等待；`user_response`: 超时后伪装为用户回复，Agent 以为用户回复了 |
-| `heartbeat_reply` | `"当前时间"` | `user_response` 模式下的自动回复内容（`"当前时间"` 会被替换为实际时间戳） |
-| `wait_seconds` | `300` | 单次 MCP 调用的等待超时秒数 |
-| `max_total_seconds` | `3600` | 最大总等待秒数（跨心跳累计），超过后返回 TIMEOUT 并清理触发器 |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `heartbeat_mode` | `"waiting"` | `waiting`: returns `[WAITING]` on timeout, Agent re-calls to continue waiting; `user_response`: fakes a user reply on timeout |
+| `heartbeat_reply` | `"当前时间"` | Auto-reply content in `user_response` mode (`"当前时间"` is replaced with actual timestamp) |
+| `wait_seconds` | `300` | Timeout in seconds per MCP call |
+| `max_total_seconds` | `3600` | Max total wait in seconds (cumulative across heartbeats); returns TIMEOUT and cleans up when exceeded |
 
-**默认值选择依据：**
+**Why these defaults:**
 
-- **`wait_seconds: 300`**（5 分钟）：Cursor IDE 对单次 MCP 工具调用有超时限制，等待太久可能被 Cursor 自动结束。设为 300 秒意味着每 5 分钟主动返回一次心跳，防止被判定超时。最初默认 600 秒，经实际使用调优为 300 秒。**不建议设得太短**（如 < 60 秒），过于频繁的心跳返回-重新调用循环可能被 Cursor 视为异常行为；**也不建议设得太长**（如 > 3300 秒），接近 Cursor 硬超时限制可能导致对话被强制中断。推荐范围 **120-600 秒**。
-- **`max_total_seconds: 3600`**（1 小时）：与 Cursor 的 MCP 硬超时对齐。超过 1 小时无用户响应，大概率是用户已离开，此时返回 TIMEOUT 并释放资源。最初默认 86400 秒（24 小时），实际使用中发现过长的等待会导致 Agent 长期挂起占用资源，调优为 1 小时。**注意：心跳机制可能导致额外的请求消耗。** 心跳超时后 Agent 会重新调用 `feedback_gate_chat`，这在某些情况下可能被 Cursor 计为一次请求（具体机制因 Cursor 版本而异，并非每次都会消耗）。如果你发现请求额度消耗异常，可以适当增大 `wait_seconds`（如 600 秒），代价是用户输入后的响应延迟会增加。
-- **`heartbeat_mode: "waiting"`**：推荐默认值。Agent 收到 `[WAITING]` 后知道用户还没回复，会立即重新调用继续等待。`user_response` 模式下 Agent 会认为收到了用户的新输入并进行处理，可能产生不必要的操作。
+- **`wait_seconds: 300`** (5 min): Cursor IDE has a timeout limit on MCP tool calls — waiting too long may cause Cursor to auto-terminate the call. 300 seconds means a heartbeat every 5 minutes to prevent timeout. Originally 600s, tuned down to 300s based on real usage. **Don't set too short** (< 60s may be flagged as abnormal); **don't set too long** (> 3300s risks hitting Cursor's hard timeout). Recommended range: **120-600 seconds**.
+- **`max_total_seconds: 3600`** (1 hour): Aligned with Cursor's MCP hard timeout. After 1 hour with no user response, the user has likely left — returns TIMEOUT and releases resources. Originally 86400s (24h), reduced after finding that excessively long waits left Agents hanging. **Note: Heartbeat mechanism may cause extra request consumption.** Each time the Agent re-calls `feedback_gate_chat` after a heartbeat timeout, it may count as a request in some cases (exact behavior varies by Cursor version). If you notice abnormal quota usage, consider increasing `wait_seconds` (e.g. 600s) at the cost of slower response to user input.
+- **`heartbeat_mode: "waiting"`**: Recommended. Agent knows the user hasn't replied yet and immediately re-calls to continue waiting. In `user_response` mode, the Agent treats the heartbeat as actual user input, which may trigger unnecessary actions.
 
-也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
+Also supports environment variables: `FEEDBACK_GATE_IDE_WAIT_SECONDS`, `FEEDBACK_GATE_HEARTBEAT_MODE`, `FEEDBACK_GATE_HEARTBEAT_REPLY`. Config file takes precedence over environment variables.
 
-## 项目结构
+## Project Structure
 
 ```
 cursor-feedback-gate/
-├── feedback_gate_mcp.py      MCP 服务器（含智能心跳）
+├── feedback_gate_mcp.py      MCP server (with smart heartbeat)
 ├── cursor-extension/
-│   ├── extension.js           Cursor 扩展主入口
-│   ├── queue-manager.js       消息队列管理
-│   ├── session-lease.js       多窗口会话租约管理
-│   ├── webview-template.js    Webview UI 模板
-│   ├── utils.js               工具函数
-│   ├── package.json           扩展清单
-│   ├── icon.png               扩展图标
-│   └── sidebar-icon.svg       Activity Bar 图标
-├── docs/                        设计文档和效果预览
+│   ├── extension.js           Cursor extension entry point
+│   ├── queue-manager.js       Message queue management
+│   ├── session-lease.js       Multi-window session lease management
+│   ├── webview-template.js    Webview UI template
+│   ├── utils.js               Utilities
+│   ├── package.json           Extension manifest
+│   ├── icon.png               Extension icon
+│   └── sidebar-icon.svg       Activity Bar icon
+├── docs/                        Design docs and preview images
 ├── FeedbackGate.mdc           Cursor Rule
-├── install.sh                 安装脚本
-├── uninstall.sh               卸载脚本
-├── mcp.json                   MCP 配置示例
+├── install.sh                 Install script
+├── uninstall.sh               Uninstall script
+├── mcp.json                   MCP config example
 └── LICENSE
 ```
 
-## 远程控制集成
+## Remote Control Integration
 
-搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control) 项目，可以通过即时通讯渠道远程控制 Cursor Agent：
+Paired with [cursor-remote-control](https://github.com/keunsy/cursor-remote-control), you can remotely control Cursor Agent through messaging channels:
 
-- 在手机或其他设备上发送消息，自动转发给正在等待的 Feedback Gate
-- Cursor Agent 的输出也会回传到对应聊天窗口，形成完整的双向交互
-- 支持多渠道同时接入，便于扩展
-- 适合离开工位、移动办公等场景，随时随地与 Agent 交互
+- Send messages from your phone or other devices, auto-forwarded to the waiting Feedback Gate
+- Cursor Agent output is relayed back to the corresponding chat window for full bidirectional interaction
+- Supports multiple channels simultaneously
+- Perfect for away-from-desk or mobile scenarios
 
-远程模式下 MCP 服务器自动调整心跳频率，适配 Agent CLI 更短的工具超时限制。
+In remote mode, the MCP server auto-adjusts heartbeat frequency for the shorter CLI tool timeout.
 
-### `/ide` 远程指令入队
+### `/ide` Remote Command Enqueue
 
-> ⚠️ **实验性功能**：远程指令入队在多窗口场景下可能存在路由不稳定的问题。消息可能投递到非预期的窗口，或在窗口切换/重启后丢失。建议仅在单窗口场景下使用，多窗口时通过 `#序号` 或 `#PID` 明确指定目标窗口。
+> ⚠️ **Experimental**: Remote command enqueue may have unstable routing in multi-window scenarios. Messages may be delivered to unintended windows or lost during window switching/restart. Recommended for single-window use only; use `#number` or `#PID` to specify target window in multi-window setups.
 
-搭配 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control)，从 IM 直接向 IDE 的 Feedback Gate 队列投递消息。消息入队后，Agent 下次调用 `feedback_gate_chat` 时自动出队处理。
+Paired with [cursor-remote-control](https://github.com/keunsy/cursor-remote-control), send messages directly from IM to the IDE's Feedback Gate queue. Queued messages are auto-dequeued when the Agent next calls `feedback_gate_chat`.
 
-**前提**：需要同时安装并运行 [cursor-remote-control](https://github.com/keunsy/cursor-remote-control)（IM 中继服务）和本项目（Cursor Extension + MCP）。
+**Prerequisite**: Both [cursor-remote-control](https://github.com/keunsy/cursor-remote-control) (IM relay service) and this project (Cursor Extension + MCP) must be installed and running.
 
 ```
-/ide                          查看活跃实例列表
-/ide 帮我检查代码               投递到唯一实例（多实例时广播）
-/ide #1 顺便看下性能            按序号指定窗口
-/ide #12345 跑一下测试          按 PID 指定窗口
-/ide on                       开启转发模式（所有消息自动投递 IDE）
-/ide off                      关闭转发模式
+/ide                          List active instances
+/ide check the code            Deliver to the only instance (broadcasts if multiple)
+/ide #1 also check perf        Specify window by index
+/ide #12345 run tests          Specify window by PID
+/ide on                       Enable forwarding mode (all messages auto-delivered to IDE)
+/ide off                      Disable forwarding mode
 ```
 
-特性：
-- **PID 路由** — 每个 Cursor 窗口独立队列文件，指定投递不串窗
-- **转发模式** — `/ide on` 开启后所有非命令消息自动投递，手机操作更便捷
-- **会话注册** — Agent 首次调用后自动注册项目名和 PID，空闲 2 小时自动注销
-- **安全投递** — 检测 Extension 进程是否存活，无活跃实例时拒绝写入
-- **过期保护** — Extension 重启后自动丢弃重启前的积压消息
-- **双向反馈** — Agent 处理完远程消息后，结果自动回传到发起者的 IM 会话（仅回复一条）
+Features:
+- **PID Routing** — Each Cursor window has its own queue file; targeted delivery without cross-window issues
+- **Forwarding Mode** — `/ide on` auto-delivers all non-command messages; convenient for mobile
+- **Session Registration** — Auto-registers project name and PID on first Agent call; auto-deregisters after 2 hours idle
+- **Safe Delivery** — Checks if Extension process is alive; rejects writes when no active instance
+- **Expiry Protection** — Auto-discards messages queued before Extension restart
+- **Bidirectional Feedback** — After Agent processes a remote message, the result is relayed back to the sender's IM chat (one reply)
 
-## 卸载
+## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-## 故障排查
+## Troubleshooting
 
 ```bash
-# MCP 服务器日志
+# MCP server logs
 tail -f /tmp/feedback_gate.log
 
-# 检查 MCP 配置
+# Check MCP config
 cat ~/.cursor/mcp.json
 
-# 检查扩展状态
-# 查看底部状态栏 FeedBack 指示灯
+# Check extension status
+# Look at the FeedBack indicator in the bottom status bar
 ```
 
 ## License
