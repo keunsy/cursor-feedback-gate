@@ -99,10 +99,16 @@ Agent 触发时自动跳转到配置的默认位置。如果默认位置不可�
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `heartbeat_mode` | `"waiting"` | `waiting`: 超时后继续等待；`user_response`: 超时后伪装为用户回复 |
-| `heartbeat_reply` | `"当前时间"` | `user_response` 模式下的自动回复内容 |
-| `wait_seconds` | `300` | 等待超时秒数（不建议超过 3300，Cursor 约 1 小时后会中断 MCP 调用） |
+| `heartbeat_mode` | `"waiting"` | `waiting`: 超时后返回 `[WAITING]`，Agent 重新调用继续等待；`user_response`: 超时后伪装为用户回复，Agent 以为用户回复了 |
+| `heartbeat_reply` | `"当前时间"` | `user_response` 模式下的自动回复内容（`"当前时间"` 会被替换为实际时间戳） |
+| `wait_seconds` | `300` | 单次 MCP 调用的等待超时秒数 |
 | `max_total_seconds` | `3600` | 最大总等待秒数（跨心跳累计），超过后返回 TIMEOUT 并清理触发器 |
+
+**默认值选择依据：**
+
+- **`wait_seconds: 300`**（5 分钟）：Cursor IDE 对单次 MCP 工具调用有约 1 小时的硬超时限制。设为 300 秒可以在 1 小时内完成约 12 次心跳轮询，既能保持 Agent 活跃，又远离 Cursor 的超时限制。最初默认 600 秒，经实际使用调优为 300 秒（心跳间隔越短，Agent 响应用户输入越快）。
+- **`max_total_seconds: 3600`**（1 小时）：与 Cursor 的 MCP 硬超时对齐。超过 1 小时无用户响应，大概率是用户已离开，此时返回 TIMEOUT 并释放资源。最初默认 86400 秒（24 小时），实际使用中发现过长的等待会导致 Agent 长期挂起占用资源，调优为 1 小时。
+- **`heartbeat_mode: "waiting"`**：推荐默认值。Agent 收到 `[WAITING]` 后知道用户还没回复，会立即重新调用。相比 `user_response` 模式，不会消耗额外的 Agent 请求次数（`user_response` 模式下 Agent 会认为收到了新输入并处理）。
 
 也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
 
