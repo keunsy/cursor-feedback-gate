@@ -22,6 +22,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+from feedback_gate_lifecycle import WaitRegistry
 
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
@@ -73,6 +74,12 @@ try:
     handlers.append(file_handler)
 except Exception as e:
     print(f"Warning: Could not create log file: {e}", file=sys.stderr)
+
+if os.name == 'nt' and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except (OSError, ValueError):
+        pass
 
 stderr_handler = logging.StreamHandler(sys.stderr)
 stderr_handler.setLevel(logging.INFO)
@@ -217,11 +224,7 @@ class FeedbackGateServer:
         def _is_pid_alive(pid):
             if pid is None or pid == self._server_pid:
                 return True
-            try:
-                os.kill(pid, 0)
-                return True
-            except OSError:
-                return False
+            return self._is_process_alive(pid)
         
         try:
             for pattern in [
@@ -239,7 +242,7 @@ class FeedbackGateServer:
                 for filepath in glob.glob(os.path.join(temp_dir, pattern)):
                     try:
                         if pattern.endswith(".pid"):
-                            data = json.loads(Path(filepath).read_text())
+                            data = json.loads(Path(filepath).read_text(encoding='utf-8'))
                             if _is_pid_alive(data.get("pid")):
                                 continue
                         else:
@@ -261,6 +264,43 @@ class FeedbackGateServer:
             logger.warning(f"⚠️ Startup cleanup error: {e}")
 
     @staticmethod
+    def _is_process_alive(pid: int | None) -> bool:
+        """Query process state without sending a console event on Windows."""
+        if pid is None or pid <= 0:
+            return False
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                # ERROR_INVALID_PARAMETER means the PID no longer exists.
+                # Access denied or another query failure must not delete live state.
+                return ctypes.get_last_error() != 87
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return True
+                return exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
     def _get_ancestor_pids(start_pid: int, max_depth: int = 10) -> list[int]:
         """Walk the process tree upward from start_pid, returning [parent, grandparent, ...].
         
@@ -271,6 +311,56 @@ class FeedbackGateServer:
         """
         ancestors: list[int] = []
         current = start_pid
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ('dwSize', wintypes.DWORD),
+                    ('cntUsage', wintypes.DWORD),
+                    ('th32ProcessID', wintypes.DWORD),
+                    ('th32DefaultHeapID', ctypes.c_size_t),
+                    ('th32ModuleID', wintypes.DWORD),
+                    ('cntThreads', wintypes.DWORD),
+                    ('th32ParentProcessID', wintypes.DWORD),
+                    ('pcPriClassBase', wintypes.LONG),
+                    ('dwFlags', wintypes.DWORD),
+                    ('szExeFile', wintypes.WCHAR * 260),
+                ]
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            for name in ('Process32FirstW', 'Process32NextW'):
+                function = getattr(kernel32, name)
+                function.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+                function.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+            if snapshot == wintypes.HANDLE(-1).value:
+                return ancestors
+            parents: dict[int, int] = {}
+            try:
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(entry)
+                available = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+                while available:
+                    parents[entry.th32ProcessID] = entry.th32ParentProcessID
+                    available = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            finally:
+                kernel32.CloseHandle(snapshot)
+            seen = {current}
+            for _ in range(max_depth):
+                parent = parents.get(current, 0)
+                if parent <= 1 or parent in seen:
+                    break
+                ancestors.append(parent)
+                seen.add(parent)
+                current = parent
+            return ancestors
         try:
             import subprocess
             for _ in range(max_depth):
@@ -325,7 +415,7 @@ class FeedbackGateServer:
                 "timestamp": datetime.now().isoformat(),
                 "system": "feedback-gate"
             }
-            pid_file.write_text(json.dumps(pid_data))
+            pid_file.write_text(json.dumps(pid_data), encoding='utf-8')
             logger.info(f"📝 PID file written: {pid_file} (PPID: {os.getppid()}, ancestors: {ancestors}, workspace: {workspace_paths})")
         except Exception as e:
             logger.error(f"❌ Failed to write PID file: {e}")
@@ -512,7 +602,7 @@ class FeedbackGateServer:
         IMPORTANT: file is only deleted when valid content is extracted — if content
         is empty/unreadable, the file is left intact so the caller can retry later."""
         try:
-            file_content = response_file.read_text().strip()
+            file_content = response_file.read_text(encoding='utf-8').strip()
             if not file_content:
                 return None
 
@@ -614,12 +704,14 @@ class FeedbackGateServer:
     _REMOTE_WAIT_SECONDS = 50
     _REMOTE_MAX_TOTAL_SECONDS = 86400  # 24h max total wait for CLI
 
-    # Cursor IDE aborts MCP tool calls after exactly 1 hour (3600s).  After 2
-    # consecutive aborts the Agent model gives up entirely.  We return a heartbeat
-    # every N minutes so the call never hits the 1h limit.
-    # Override with FEEDBACK_GATE_IDE_WAIT_SECONDS env var.
-    _IDE_WAIT_SECONDS = int(os.environ.get("FEEDBACK_GATE_IDE_WAIT_SECONDS", "300"))
-    _IDE_MAX_TOTAL_SECONDS = 3600  # 1h max total wait for IDE
+    # Clients without progress support renew before Cursor's 120s idle limit.
+    # Progress-capable calls renew before the separate 1h total request limit.
+    _IDE_CALL_WAIT_CAP_SECONDS = 90
+    # Override with FEEDBACK_GATE_IDE_WAIT_SECONDS env var (still subject to the cap).
+    _IDE_WAIT_SECONDS = int(os.environ.get("FEEDBACK_GATE_IDE_WAIT_SECONDS", "90"))
+    _IDE_MAX_TOTAL_SECONDS = 86400  # 24h, matching the IDE stale-trigger expiry
+    _IDE_PERSISTENT_WAIT_CAP_SECONDS = 3300  # Renew before Cursor's 1h total request limit.
+    _PROGRESS_INTERVAL_SECONDS = 20
 
     # Heartbeat config file for dynamic (no-restart) configuration.
     # Falls back to env vars, then defaults.
@@ -641,7 +733,7 @@ class FeedbackGateServer:
         try:
             cfg_path = Path(cls._HEARTBEAT_CONFIG_PATH)
             if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text())
+                cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
                 mode = cfg.get("heartbeat_mode", mode).lower()
                 reply = cfg.get("heartbeat_reply", reply)
                 if "wait_seconds" in cfg:
@@ -653,6 +745,61 @@ class FeedbackGateServer:
         except Exception as e:
             logger.debug(f"Failed to read heartbeat config: {e}")
         return mode, reply, wait_override, stale_override, max_total_override
+
+    def _get_progress_channel(self):
+        if getattr(self, '_progress_disabled', False):
+            return None
+        try:
+            context = self.server.request_context
+        except (AttributeError, LookupError):
+            return None
+        meta = getattr(context, 'meta', None)
+        token = meta.get('progressToken') if isinstance(meta, dict) else getattr(meta, 'progressToken', None)
+        session = getattr(context, 'session', None)
+        if token is None or not callable(getattr(session, 'send_progress_notification', None)):
+            return None
+        return session, token
+
+    @classmethod
+    def _get_keepalive_options(cls):
+        enabled = os.environ.get('FEEDBACK_GATE_PROGRESS_KEEPALIVE', '1').lower() not in ('0', 'false', 'off')
+        persistent = float(cls._IDE_PERSISTENT_WAIT_CAP_SECONDS)
+        interval = float(cls._PROGRESS_INTERVAL_SECONDS)
+        try:
+            path = Path(cls._HEARTBEAT_CONFIG_PATH)
+            config = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            enabled = enabled and config.get('progress_keepalive', True) is not False
+            persistent = float(config.get('persistent_wait_seconds', persistent))
+            interval = float(config.get('progress_interval_seconds', interval))
+            if not math.isfinite(persistent) or not math.isfinite(interval):
+                raise ValueError('Non-finite keepalive interval')
+        except (OSError, ValueError, TypeError):
+            persistent = float(cls._IDE_PERSISTENT_WAIT_CAP_SECONDS)
+            interval = float(cls._PROGRESS_INTERVAL_SECONDS)
+        return (enabled, min(max(persistent, 1), cls._IDE_PERSISTENT_WAIT_CAP_SECONDS),
+                min(max(interval, 0.05), 30))
+
+    def _get_wait_policy(self, is_remote: bool) -> tuple[float, int]:
+        """Return a per-call wait and cumulative limit safe for the active MCP client."""
+        _, _, wait_override, _, max_total_override = self._load_heartbeat_config()
+        if is_remote:
+            return self._REMOTE_WAIT_SECONDS, self._REMOTE_MAX_TOTAL_SECONDS
+
+        keepalive, persistent_wait, _ = self._get_keepalive_options()
+        if keepalive and self._get_progress_channel() is not None:
+            max_secs = self._IDE_MAX_TOTAL_SECONDS if max_total_override is None else max_total_override
+            return persistent_wait, max_secs
+
+        requested_wait = self._IDE_WAIT_SECONDS if wait_override is None else wait_override
+        wait_secs = min(max(requested_wait, 1), self._IDE_CALL_WAIT_CAP_SECONDS)
+        if wait_secs != requested_wait:
+            logger.info(
+                f"IDE wait_seconds={requested_wait} capped to {wait_secs}s "
+                "to stay below Cursor's 120s MCP idle timeout"
+            )
+
+        max_secs = self._IDE_MAX_TOTAL_SECONDS if max_total_override is None else max_total_override
+        return wait_secs, max_secs
 
     @staticmethod
     def _build_heartbeat_message(count: int, elapsed_min: float, session_id: str = "") -> str:
@@ -690,7 +837,46 @@ class FeedbackGateServer:
         return self._build_heartbeat_message(count, elapsed_min, session_id=session_id)
 
     async def _handle_feedback_gate_chat(self, args: dict) -> list[TextContent]:
-        """Handle Feedback Gate chat popup and wait for user input with 5 minute timeout"""
+        """Track pending waits so Cursor's stop hook can resume this conversation."""
+        session_id = args.get('session_id', '').strip()
+        registry = None
+        call_id = uuid.uuid4().hex
+        if session_id and not self._find_routing_file():
+            registry = getattr(self, '_wait_registry', None)
+            if registry is None:
+                registry = self._wait_registry = WaitRegistry()
+            previous = next((info for info in self._active_triggers.values()
+                             if info.get('session_id') == session_id), {})
+            _, _, _, _, maximum = self._load_heartbeat_config()
+            maximum = self._IDE_MAX_TOTAL_SECONDS if maximum is None else maximum
+            try:
+                registry.begin_wait(session_id, call_id, previous.get('created_at', time.time()), maximum)
+            except OSError as error:
+                logger.warning(f'Cannot record pending feedback wait: {error}')
+                registry = None
+
+        def finish(state):
+            if registry is not None:
+                try:
+                    registry.finish_wait(session_id, call_id, state)
+                except OSError as error:
+                    logger.warning(f'Cannot update pending feedback wait: {error}')
+
+        try:
+            result = await self._handle_feedback_gate_chat_impl(args)
+        except asyncio.CancelledError:
+            finish('interrupted')
+            raise
+        except Exception:
+            finish('closed')
+            raise
+        pending = any(info.get('session_id') == session_id for info in self._active_triggers.values())
+        answered = any(getattr(item, 'text', '').startswith('User Response:') for item in result)
+        finish('waiting' if pending else 'answered' if answered else 'closed')
+        return result
+
+    async def _handle_feedback_gate_chat_impl(self, args: dict) -> list[TextContent]:
+        """Handle the Feedback Gate popup using client-safe heartbeat intervals."""
         message = args.get("message", "请提供你的反馈：")
         title = args.get("title", "Feedback Gate")
         context = args.get("context", "")
@@ -710,6 +896,32 @@ class FeedbackGateServer:
         logger.info(f"📥 [DIAG] feedback_gate_chat ENTERED at {datetime.now().isoformat()} | pending_trigger={self._pending_trigger_id} | heartbeat_count={self._heartbeat_count} | session_id={session_id or 'none'} | msg_preview={message[:80]}...")
         _log_event("ENTERED", f"trigger={self._pending_trigger_id} hb={self._heartbeat_count} sid={session_id or 'none'} msg={message[:60]}")
         
+        # A controlled restart can preserve a reply from the previous MCP process.
+        # Deliver it only to its original session, with its previous-request origin.
+        registry = getattr(self, '_wait_registry', None)
+        preserved = registry.read('reply', session_id) if registry and session_id else {}
+        if preserved.get('session_id') == session_id and preserved.get('trigger_id'):
+            self._last_response_eh_pid = None
+            self._last_response_workspace = None
+            saved_input = self._read_and_consume_response(registry.response_path(session_id))
+            if saved_input:
+                origin = preserved['trigger_id']
+                self._active_triggers.pop(origin, None)
+                if self._pending_trigger_id == origin:
+                    self._clear_trigger_state(responded=True)
+                if self._last_response_eh_pid:
+                    self._session_to_eh_pid[session_id] = self._last_response_eh_pid
+                if self._last_response_workspace:
+                    self._session_to_workspace[session_id] = self._last_response_workspace
+                self._last_responded_by_session[session_id] = time.time()
+                _log_event('DELIVER_PRESERVED_REPLY', f'session={session_id} trigger={origin}')
+                result = [TextContent(type='text', text=(
+                    'User Response: [DELAYED REPLY — the user answered a PREVIOUS request '
+                    'before the MCP server restarted. It is NOT the answer to a new question.]\n'
+                    + saved_input + _FEEDBACK_REPLY_SUFFIX))]
+                self._append_media_to_response(result)
+                return result
+
         # F1/F2: deliver replies that were consumed but never reached the agent
         # for this session (cancelled tool call / evicted trigger). They come back
         # clearly marked; afterwards this call proceeds normally (fresh popup for
@@ -844,14 +1056,9 @@ class FeedbackGateServer:
                     return result
             
             # Re-enter wait loop for this trigger
-            wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-            _, _, wait_override, _, max_total_override = self._load_heartbeat_config()
-            if wait_override is not None and not is_remote:
-                wait_secs = wait_override
-            max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
-            if max_total_override is not None and not is_remote:
-                max_secs = max_total_override
+            wait_secs, max_secs = self._get_wait_policy(is_remote)
             label = "CLI" if is_remote else "IDE"
+            wait_secs = min(wait_secs, max(0, max_secs - (time.time() - my_trigger_info.get('created_at', call_entry_time))))
             
             hb_count = my_trigger_info.get("heartbeat_count", 0)
             logger.info(f"🔄 Re-entering wait for trigger {my_trigger_id} (hb={hb_count}, {label}, {wait_secs}s)")
@@ -907,7 +1114,7 @@ class FeedbackGateServer:
                 
                 hb_count += 1
                 my_trigger_info["heartbeat_count"] = hb_count
-                elapsed_total = hb_count * wait_secs
+                elapsed_total = time.time() - my_trigger_info.get('created_at', call_entry_time)
                 elapsed_min = elapsed_total / 60
                 wall_elapsed = time.time() - call_entry_time
                 if elapsed_total >= max_secs:
@@ -942,7 +1149,7 @@ class FeedbackGateServer:
             routing_file = self._find_routing_file()
             if routing_file and routing_file.exists():
                 try:
-                    routing_data = json.loads(routing_file.read_text())
+                    routing_data = json.loads(routing_file.read_text(encoding='utf-8'))
                     required_model = routing_data.get("model", "")
                 except Exception:
                     pass
@@ -1057,14 +1264,9 @@ class FeedbackGateServer:
             else:
                 logger.warning("⚠️ No extension acknowledgement received — but trigger was consumed, proceeding")
             
-            wait_secs = self._REMOTE_WAIT_SECONDS if is_remote else self._IDE_WAIT_SECONDS
-            _, _, wait_override, _, max_total_override = self._load_heartbeat_config()
-            if wait_override is not None and not is_remote:
-                wait_secs = wait_override
-            max_secs = self._REMOTE_MAX_TOTAL_SECONDS if is_remote else self._IDE_MAX_TOTAL_SECONDS
-            if max_total_override is not None and not is_remote:
-                max_secs = max_total_override
+            wait_secs, max_secs = self._get_wait_policy(is_remote)
             label = "CLI" if is_remote else "IDE"
+            wait_secs = min(wait_secs, max(0, max_secs - (time.time() - self._active_triggers[trigger_id]['created_at'])))
             logger.info(f"⏳ Waiting for user input (timeout={wait_secs}s, {label})...")
             
             self._last_response_eh_pid = None
@@ -1113,7 +1315,7 @@ class FeedbackGateServer:
                     return [TextContent(type="text", text=f"SKIP: This feedback request ({trigger_id[:20]}...) has been superseded by a newer request. Do NOT re-call — the newer request is already active.")]
                 trigger_info["heartbeat_count"] = trigger_info.get("heartbeat_count", 0) + 1
                 hb_count = trigger_info["heartbeat_count"]
-                elapsed_total = hb_count * wait_secs
+                elapsed_total = time.time() - trigger_info.get('created_at', call_entry_time)
                 elapsed_min = elapsed_total / 60
                 wall_elapsed = time.time() - call_entry_time
                 if elapsed_total >= max_secs:
@@ -1152,14 +1354,7 @@ class FeedbackGateServer:
         if not cached_eh_pid:
             return False
         
-        eh_alive = False
-        try:
-            os.kill(cached_eh_pid, 0)
-            eh_alive = True
-        except (OSError, ProcessLookupError):
-            pass
-        
-        if eh_alive:
+        if self._is_process_alive(cached_eh_pid):
             return False
         
         logger.info(f"🔄 RECOVERY: EH {cached_eh_pid} is dead for trigger {trigger_id} — rewriting trigger file")
@@ -1208,7 +1403,7 @@ class FeedbackGateServer:
         try:
             for target in [per_trigger_file, pid_trigger_file, legacy_trigger_file]:
                 tmp = target.with_suffix('.json.tmp')
-                tmp.write_text(trigger_json)
+                tmp.write_text(trigger_json, encoding='utf-8')
                 tmp.replace(target)
             logger.info(f"🔄 RECOVERY: trigger file rewritten for {trigger_id} (ws={ws}, eh_pid=cleared)")
             _log_event("TRIGGER_RECOVERY", f"trigger={trigger_id} dead_eh={cached_eh_pid} ws={ws}")
@@ -1230,7 +1425,7 @@ class FeedbackGateServer:
         while time.time() - start_time < timeout:
             try:
                 if ack_file.exists():
-                    data = json.loads(ack_file.read_text())
+                    data = json.loads(ack_file.read_text(encoding='utf-8'))
                     ack_status = data.get("acknowledged", False)
                     
                     try:
@@ -1264,7 +1459,10 @@ class FeedbackGateServer:
         logger.info(f"🔍 Trigger ID: {trigger_id}")
         
         start_time = time.time()
-        check_interval = 0.25
+        keepalive, _, progress_interval = self._get_keepalive_options()
+        channel = self._get_progress_channel() if keepalive else None
+        check_interval = min(0.25, progress_interval) if channel else 0.25
+        last_progress = start_time - progress_interval
         # W4: after a window reload/restart the claiming EH is replaced by a new
         # PID that never saw the trigger file. The recovery rewrite used to run
         # only at heartbeat boundaries (up to wait_secs apart — minutes), leaving
@@ -1274,6 +1472,8 @@ class FeedbackGateServer:
         
         while time.time() - start_time < timeout:
             try:
+                if trigger_id not in self._active_triggers:
+                    return None
                 if primary_response.exists():
                     user_input = self._read_and_consume_response(primary_response)
                     if user_input:
@@ -1290,6 +1490,20 @@ class FeedbackGateServer:
                     else:
                         logger.warning(f"⚠️ Empty or unreadable response file for trigger {trigger_id}")
                 
+                if channel and time.time() - last_progress >= progress_interval:
+                    session, token = channel
+                    try:
+                        await asyncio.wait_for(session.send_progress_notification(
+                            progress_token=token, progress=time.time() - start_time,
+                            message='Waiting for your reply in Feedback Gate'), timeout=5)
+                        last_progress = time.time()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        self._progress_disabled = True
+                        logger.warning(f'Progress keepalive unavailable; renewing with a short wait: {error}')
+                        return None
+
                 if time.time() - _last_recovery_probe >= 10:
                     _last_recovery_probe = time.time()
                     _tinfo = self._active_triggers.get(trigger_id)
@@ -1329,7 +1543,7 @@ class FeedbackGateServer:
                 routing_file = self._find_routing_file()
                 if routing_file and routing_file.exists():
                     try:
-                        routing_data = json.loads(routing_file.read_text())
+                        routing_data = json.loads(routing_file.read_text(encoding='utf-8'))
                         fg_chat_id = routing_data.get("chat_id", "")
                         fg_platform = routing_data.get("platform", "") or fg_platform
                         fg_session = routing_data.get("session", "") or fg_session
@@ -1355,7 +1569,9 @@ class FeedbackGateServer:
             _target_eh_pid = self._session_to_eh_pid.get(_sid) if _sid else None
             # If workspace changed from what was cached, the cached eh_pid may
             # point to the wrong window — clear it to avoid mis-routing.
-            if _target_eh_pid and _call_workspace and _cached_workspace and _call_workspace != _cached_workspace:
+            if (_target_eh_pid and _call_workspace and _cached_workspace
+                    and os.path.normcase(os.path.normpath(_call_workspace))
+                    != os.path.normcase(os.path.normpath(_cached_workspace))):
                 logger.info(f"🔄 Workspace changed for session {_sid[:8]}...: {_cached_workspace} → {_call_workspace}, clearing cached eh_pid {_target_eh_pid}")
                 _target_eh_pid = None
             
@@ -1386,7 +1602,7 @@ class FeedbackGateServer:
                 targets.insert(0, per_trigger_file)
             for target in targets:
                 tmp = target.with_suffix('.json.tmp')
-                tmp.write_text(trigger_json)
+                tmp.write_text(trigger_json, encoding='utf-8')
                 tmp.replace(target)
             
             logger.info(f"🔥 Trigger created: {per_trigger_file or pid_trigger_file} ({file_size} bytes)")
@@ -1536,4 +1752,4 @@ if __name__ == "__main__":
     except Exception as e:
         _log_event("SERVER_STOP", f"reason=crash error={e}")
         logger.error(f"❌ Server crashed: {e}")
-        sys.exit(1) 
+        sys.exit(1)

@@ -65,6 +65,8 @@ The script auto-completes: Python venv setup, dependency installation, MCP confi
 
 Reload Cursor window after installation to start using.
 
+On Windows, run the installer in **Git Bash** with native Python 3.10+ (on PATH or available through `py -3`) and Node.js/npm installed. The installer uses `venv/Scripts/python.exe` and writes native Windows paths to the MCP configuration. Add the `cursor` CLI to PATH for automatic extension installation, or use **Ctrl+Shift+P → Extensions: Install from VSIX**. Re-run `bash install.sh` to update a Windows installation.
+
 ## Configuration
 
 ### Display Location
@@ -89,13 +91,17 @@ The install script auto-deploys `FeedbackGate.mdc` to `~/.cursor/rules/`, which 
 
 ## Advanced Configuration
 
-Create `~/.cursor/feedback-gate-config.json` to customize heartbeat behavior (takes effect immediately, no restart needed):
+Create `~/.cursor/feedback-gate-config.json` to customize waiting (read at the start of each wait, no restart needed):
 
 ```json
 {
-  "heartbeat_mode": "user_response",
+  "heartbeat_mode": "waiting",
   "heartbeat_reply": "current time",
-  "wait_seconds": 900
+  "wait_seconds": 90,
+  "max_total_seconds": 86400,
+  "progress_keepalive": true,
+  "persistent_wait_seconds": 3300,
+  "progress_interval_seconds": 20
 }
 ```
 
@@ -103,22 +109,28 @@ Create `~/.cursor/feedback-gate-config.json` to customize heartbeat behavior (ta
 |-----------|---------|-------------|
 | `heartbeat_mode` | `"waiting"` | `waiting`: returns `[WAITING]` on timeout, Agent re-calls to continue waiting; `user_response`: fakes a user reply on timeout |
 | `heartbeat_reply` | `"当前时间"` | Auto-reply content in `user_response` mode (`"当前时间"` is replaced with actual timestamp) |
-| `wait_seconds` | `300` | Timeout in seconds per MCP call |
-| `max_total_seconds` | `3600` | Max total wait in seconds (cumulative across heartbeats); returns TIMEOUT and cleans up when exceeded |
+| `wait_seconds` | `90` | IDE renewal interval when the client provides no progress token; CLI remains at 50 seconds |
+| `progress_keepalive` | `true` | Keep a progress-capable MCP call pending while waiting for feedback |
+| `persistent_wait_seconds` | `3300` | Keep one IDE request pending for up to 55 minutes before renewal |
+| `progress_interval_seconds` | `20` | MCP progress notification interval while waiting |
+| `max_total_seconds` | `86400` | Max cumulative wait (24 hours), matching the IDE trigger expiry; returns TIMEOUT and cleans up when exceeded |
 
 **Why these defaults:**
 
-- **`wait_seconds: 300`** (5 min): Cursor IDE has a timeout limit on MCP tool calls — waiting too long may cause Cursor to auto-terminate the call. 300 seconds means a heartbeat every 5 minutes to prevent timeout. Originally 600s, tuned down to 300s based on real usage. **Don't set too short** (< 60s may be flagged as abnormal); **don't set too long** (> 3300s risks hitting Cursor's hard timeout). Recommended range: **120-600 seconds**.
-- **`max_total_seconds: 3600`** (1 hour): Aligned with Cursor's MCP hard timeout. After 1 hour with no user response, the user has likely left — returns TIMEOUT and releases resources. Originally 86400s (24h), reduced after finding that excessively long waits left Agents hanging. **Note: Heartbeat mechanism may cause extra request consumption.** Each time the Agent re-calls `feedback_gate_chat` after a heartbeat timeout, it may count as a request in some cases (exact behavior varies by Cursor version). If you notice abnormal quota usage, consider increasing `wait_seconds` (e.g. 600s) at the cost of slower response to user input.
+- **Persistent waits and progress**: When Cursor supplies a progress token, send protocol progress every 20 seconds while keeping the same MCP request pending. Renew after at most 55 minutes, before the client's one-hour total call limit. Clients without a progress token use the 90-second renewal path.
+- **`max_total_seconds: 86400`** (24 hours): Limits cumulative waiting across heartbeat calls, matching the IDE trigger's 24-hour expiry. When exceeded, the server returns TIMEOUT and releases the trigger. Heartbeat re-entry may count as additional requests in some Cursor versions.
 - **`heartbeat_mode: "waiting"`**: Recommended. Agent knows the user hasn't replied yet and immediately re-calls to continue waiting. In `user_response` mode, the Agent treats the heartbeat as actual user input, which may trigger unnecessary actions.
 
-Also supports environment variables: `FEEDBACK_GATE_IDE_WAIT_SECONDS`, `FEEDBACK_GATE_HEARTBEAT_MODE`, `FEEDBACK_GATE_HEARTBEAT_REPLY`. Config file takes precedence over environment variables.
+Installation and updates add `beforeMCPExecution` and `stop` hooks to `~/.cursor/hooks.json`, preserving other hooks. They bind only conversations that actually invoke Feedback Gate. If the model finishes while feedback is pending, the stop hook resumes the same wait with the same `session_id`. Answered, expired, and explicitly stopped conversations are not resumed. An already-finished conversation needs one manual continuation before its next tool call establishes the binding.
+
+Also supports environment variables: `FEEDBACK_GATE_IDE_WAIT_SECONDS`, `FEEDBACK_GATE_HEARTBEAT_MODE`, `FEEDBACK_GATE_HEARTBEAT_REPLY`. Set `FEEDBACK_GATE_PROGRESS_KEEPALIVE=0` to use short renewals. Configuration is re-read on the next call.
 
 ## Project Structure
 
 ```
 cursor-feedback-gate/
 ├── feedback_gate_mcp.py      MCP server (with smart heartbeat)
+├── feedback_gate_lifecycle.py  Pending wait state and Cursor continuation hooks
 ├── cursor-extension/
 │   ├── extension.js           Cursor extension entry point
 │   ├── queue-manager.js       Message queue management

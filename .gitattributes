@@ -1,0 +1,2 @@
+# Git Bash needs LF shell scripts even when core.autocrlf is enabled.
+*.sh text eol=lf

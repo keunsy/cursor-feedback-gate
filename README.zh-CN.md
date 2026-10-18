@@ -65,6 +65,8 @@ cd cursor-feedback-gate
 
 安装后 Reload Cursor 窗口即可使用。
 
+Windows 用户请在 **Git Bash** 中运行安装脚本，并安装原生 Python 3.10+（加入 PATH 或可通过 `py -3` 调用）及 Node.js/npm。安装脚本会使用 `venv/Scripts/python.exe`，并将 Windows 原生路径写入 MCP 配置。将 `cursor` 命令加入 PATH 可自动安装扩展，也可以用 **Ctrl+Shift+P → Extensions: Install from VSIX** 手动安装。Windows 更新可重新运行 `bash install.sh`。
+
 ## 配置
 
 ### 显示位置
@@ -89,13 +91,17 @@ Agent 触发时自动跳转到配置的默认位置。如果默认位置不可�
 
 ## 高级配置
 
-创建 `~/.cursor/feedback-gate-config.json` 自定义心跳行为（实时生效，无需重启）：
+创建 `~/.cursor/feedback-gate-config.json` 自定义等待行为（每轮等待开始时读取，无需重启）：
 
 ```json
 {
-  "heartbeat_mode": "user_response",
+  "heartbeat_mode": "waiting",
   "heartbeat_reply": "当前时间",
-  "wait_seconds": 900
+  "wait_seconds": 90,
+  "max_total_seconds": 86400,
+  "progress_keepalive": true,
+  "persistent_wait_seconds": 3300,
+  "progress_interval_seconds": 20
 }
 ```
 
@@ -103,22 +109,28 @@ Agent 触发时自动跳转到配置的默认位置。如果默认位置不可�
 |------|--------|------|
 | `heartbeat_mode` | `"waiting"` | `waiting`: 超时后返回 `[WAITING]`，Agent 重新调用继续等待；`user_response`: 超时后伪装为用户回复，Agent 以为用户回复了 |
 | `heartbeat_reply` | `"当前时间"` | `user_response` 模式下的自动回复内容（`"当前时间"` 会被替换为实际时间戳） |
-| `wait_seconds` | `300` | 单次 MCP 调用的等待超时秒数 |
-| `max_total_seconds` | `3600` | 最大总等待秒数（跨心跳累计），超过后返回 TIMEOUT 并清理触发器 |
+| `wait_seconds` | `90` | 客户端不支持进度通知时的 IDE 续期间隔；CLI 仍使用 50 秒 |
+| `progress_keepalive` | `true` | 在支持进度通知的 MCP 调用内持续等待用户反馈 |
+| `persistent_wait_seconds` | `3300` | 支持进度通知时，同一个 IDE 请求持续等待的秒数；最多 55 分钟后续期 |
+| `progress_interval_seconds` | `20` | 等待期间发送 MCP 进度通知的间隔，避免客户端空闲超时 |
+| `max_total_seconds` | `86400` | 最大总等待秒数（24 小时，跨心跳累计）；与 Gate 触发器的 24 小时过期时间一致 |
 
 **默认值选择依据：**
 
-- **`wait_seconds: 300`**（5 分钟）：Cursor IDE 对单次 MCP 工具调用有超时限制，等待太久可能被 Cursor 自动结束。设为 300 秒意味着每 5 分钟主动返回一次心跳，防止被判定超时。最初默认 600 秒，经实际使用调优为 300 秒。**不建议设得太短**（如 < 60 秒），过于频繁的心跳返回-重新调用循环可能被 Cursor 视为异常行为；**也不建议设得太长**（如 > 3300 秒），接近 Cursor 硬超时限制可能导致对话被强制中断。推荐范围 **120-600 秒**。
-- **`max_total_seconds: 3600`**（1 小时）：与 Cursor 的 MCP 硬超时对齐。超过 1 小时无用户响应，大概率是用户已离开，此时返回 TIMEOUT 并释放资源。最初默认 86400 秒（24 小时），实际使用中发现过长的等待会导致 Agent 长期挂起占用资源，调优为 1 小时。**注意：心跳机制可能导致额外的请求消耗。** 心跳超时后 Agent 会重新调用 `feedback_gate_chat`，这在某些情况下可能被 Cursor 计为一次请求（具体机制因 Cursor 版本而异，并非每次都会消耗）。如果你发现请求额度消耗异常，可以适当增大 `wait_seconds`（如 600 秒），代价是用户输入后的响应延迟会增加。
+- **持续等待与进度保活**：Cursor 提供进度 token 时，每 20 秒发送协议进度通知，在同一个 MCP 请求内等待回复。最多 55 分钟后返回一次 `[WAITING]`，在客户端的 1 小时总调用限制前续期。不提供进度 token 的客户端沿用 90 秒短续期。
+- **`max_total_seconds: 86400`**（24 小时）：限制跨多次心跳累计等待时间，与 IDE 触发器的 24 小时过期时间一致。超过后返回 TIMEOUT 并释放资源。心跳后 Agent 会重新调用 `feedback_gate_chat`；这在某些 Cursor 版本中可能增加请求消耗。
 - **`heartbeat_mode: "waiting"`**：推荐默认值。Agent 收到 `[WAITING]` 后知道用户还没回复，会立即重新调用继续等待。`user_response` 模式下 Agent 会认为收到了用户的新输入并进行处理，可能产生不必要的操作。
 
-也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。配置文件优先级高于环境变量。
+安装和更新会在 `~/.cursor/hooks.json` 中添加 `beforeMCPExecution` 和 `stop` 钩子，并保留已有钩子。它只绑定实际调用过 Feedback Gate 的对话；模型在等待中自行结束时，会用同一 `session_id` 续接原等待。回复已投递、超过累计期限或用户主动停止时，不会自动续接。已结束的旧对话需要手动继续一次，之后的新调用才能建立绑定。
+
+也支持环境变量：`FEEDBACK_GATE_IDE_WAIT_SECONDS`、`FEEDBACK_GATE_HEARTBEAT_MODE`、`FEEDBACK_GATE_HEARTBEAT_REPLY`。`FEEDBACK_GATE_PROGRESS_KEEPALIVE=0` 可关闭持续等待并退回短续期。配置在下一次调用时重新读取。
 
 ## 项目结构
 
 ```
 cursor-feedback-gate/
 ├── feedback_gate_mcp.py      MCP 服务器（含智能心跳）
+├── feedback_gate_lifecycle.py  等待状态记录与 Cursor 对话续接钩子
 ├── cursor-extension/
 │   ├── extension.js           Cursor 扩展主入口
 │   ├── queue-manager.js       消息队列管理

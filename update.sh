@@ -73,18 +73,25 @@ fi
 # --- 更新 MCP Python 文件 ---
 log "更新 MCP 服务..."
 cp "$SCRIPT_DIR/feedback_gate_mcp.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/feedback_gate_lifecycle.py" "$INSTALL_DIR/"
 ok "MCP 服务已更新"
 
 # --- 更新 Python 依赖（如果需要） ---
 if [[ -d "$INSTALL_DIR/venv" ]]; then
+    if [[ -x "$INSTALL_DIR/venv/Scripts/python.exe" ]]; then
+        VENV_PY="$INSTALL_DIR/venv/Scripts/python.exe"
+    else
+        VENV_PY="$INSTALL_DIR/venv/bin/python"
+    fi
     log "检查 Python 依赖..."
     PIP_LOG=$(mktemp)
-    if "$INSTALL_DIR/venv/bin/pip" install -q "mcp>=1.9.2,<2.0.0" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
+    if "$VENV_PY" -m pip install -q "mcp>=1.9.2,<2.0.0" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
         ok "Python 依赖已更新"
     else
         warn "Python 依赖更新失败（不影响已安装版本）"
     fi
     rm -f "$PIP_LOG"
+    "$VENV_PY" "$INSTALL_DIR/feedback_gate_lifecycle.py" --install-hooks
 fi
 
 # --- 打包并安装 Cursor 扩展 ---

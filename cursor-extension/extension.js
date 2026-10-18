@@ -1580,14 +1580,27 @@ function _getMyWorkspacePaths() {
     } catch { return []; }
 }
 
+function _normalizeWorkspacePath(value) {
+    if (typeof value !== 'string') return '';
+    let normalized = value.trim();
+    if (process.platform === 'win32') {
+        normalized = normalized.replace(/\\/g, '/').toLowerCase();
+    }
+    return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
+}
+
 function _workspacePathsMatch(mcpWorkspaceFolders, myWorkspaces) {
     if (!mcpWorkspaceFolders || myWorkspaces.length === 0) return false;
-    const mcpPaths = mcpWorkspaceFolders.split(',').filter(Boolean);
-    for (const mws of myWorkspaces) {
+    const mcpPaths = mcpWorkspaceFolders.split(',').map(_normalizeWorkspacePath).filter(Boolean);
+    for (const workspace of myWorkspaces) {
+        const mws = _normalizeWorkspacePath(workspace);
+        if (!mws) continue;
         for (const mcp of mcpPaths) {
             // Exact match or parent/child relationship (MCP cwd may be
             // the workspace root itself, or a subdirectory).
-            if (mws === mcp || mcp.startsWith(mws + '/') || mws.startsWith(mcp + '/')) return true;
+            const wsPrefix = mws.endsWith('/') ? mws : mws + '/';
+            const mcpPrefix = mcp.endsWith('/') ? mcp : mcp + '/';
+            if (mws === mcp || mcp.startsWith(wsPrefix) || mws.startsWith(mcpPrefix)) return true;
         }
     }
     return false;
@@ -3503,4 +3516,4 @@ function deactivate() {
 module.exports = {
     activate,
     deactivate
-}; 
+};

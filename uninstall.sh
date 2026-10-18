@@ -23,6 +23,15 @@ fi
 INSTALL_DIR="$HOME/cursor-extensions/feedback-gate"
 MCP_FILE="$HOME/.cursor/mcp.json"
 
+if [[ -f "$INSTALL_DIR/feedback_gate_lifecycle.py" ]]; then
+    for hook_python in "$INSTALL_DIR/venv/Scripts/python.exe" "$INSTALL_DIR/venv/bin/python"; do
+        if [[ -x "$hook_python" ]]; then
+            "$hook_python" "$INSTALL_DIR/feedback_gate_lifecycle.py" --uninstall-hooks
+            break
+        fi
+    done
+fi
+
 # --- 删除安装目录 ---
 if [[ -d "$INSTALL_DIR" ]]; then
     rm -rf "$INSTALL_DIR"

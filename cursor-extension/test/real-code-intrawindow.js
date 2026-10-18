@@ -22,11 +22,12 @@
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
+const { getTempPath } = require('../utils');
 
 const EXT_DIR = path.join(__dirname, '..');
 const SEAM_FILE = path.join(EXT_DIR, 'debug_realcode_seam.js'); // matches .gitignore debug_*
 const VSCODE_STUB_DIR = path.join(EXT_DIR, 'node_modules', 'vscode');
-const TEST_WS = `/tmp/fg-realcode-${process.pid}`;
+const TEST_WS = getTempPath(`fg-realcode-${process.pid}`);
 
 let passed = 0;
 let failed = 0;
@@ -138,7 +139,7 @@ const createdTmpFiles = [];
 
 function queueFileName() {
     const wsId = TEST_WS.replace(/[^a-zA-Z0-9]/g, '_').slice(-40);
-    return `/tmp/feedback_gate_queue_${wsId}_pid${process.pid}.json`;
+    return getTempPath(`feedback_gate_queue_${wsId}_pid${process.pid}.json`);
 }
 
 try {
@@ -236,13 +237,13 @@ try {
     scenario('RC-7 (P3-1b): the drain guard refuses a foreign item planted in B\'s bucket', () => {
         const mark = logs.length;
         // a stale response file from an earlier run must not decide this assertion
-        try { fs.unlinkSync('/tmp/feedback_gate_response_rc-t-b1.json'); } catch {}
+        try { fs.unlinkSync(getTempPath('feedback_gate_response_rc-t-b1.json')); } catch {}
         seam.enqueueMessage('误投到 B 的 A 消息', [], [], { sessionKey: B.key, sessionId: 'rc-A' });
         assert.strictEqual(seam.getPendingQueueCount(B.key), 1);
         seam.processQueueForPendingTrigger(true, B.key);
         assert.strictEqual(seam.getPendingQueueCount(B.key), 1, 'rejected and requeued, not consumed');
         assert.ok(sawLog('QUEUE_SESSION_MISMATCH (drain)', mark), 'drain guard logged the mismatch');
-        assert.strictEqual(fs.existsSync('/tmp/feedback_gate_response_rc-t-b1.json'), false,
+        assert.strictEqual(fs.existsSync(getTempPath('feedback_gate_response_rc-t-b1.json')), false,
             'no response was written for B\'s trigger');
         queueMod.removeItemsForSession(B.key);
         assert.strictEqual(seam.getPendingQueueCount(B.key), 0);
@@ -250,7 +251,7 @@ try {
 
     scenario('RC-8: A\'s own trigger consumes A\'s own reply', () => {
         const mark = logs.length;
-        const respFile = '/tmp/feedback_gate_response_rc-t-a2.json';
+        const respFile = getTempPath('feedback_gate_response_rc-t-a2.json');
         try { fs.unlinkSync(respFile); } catch {} // never assert on a stale artefact
         seam.setCurrentTriggerData({ trigger_id: 'rc-t-a2', session_id: 'rc-A', message: 'A 的第二个问题' }, 5952);
         seam.processQueueForPendingTrigger(true, A.key);
@@ -325,10 +326,10 @@ try {
     if (stopCapture) stopCapture();
     for (const f of createdTmpFiles) { try { fs.unlinkSync(f); } catch {} }
     for (const tid of ['rc-t-u', 'rc-t-a1', 'rc-t-a2', 'rc-t-b1']) {
-        try { fs.unlinkSync(`/tmp/feedback_gate_response_${tid}.json`); } catch {}
+        try { fs.unlinkSync(getTempPath(`feedback_gate_response_${tid}.json`)); } catch {}
     }
     for (const sid of ['rc-U', 'rc-Z', 'rc-A', 'rc-B']) {
-        try { fs.unlinkSync(`/tmp/feedback_gate_lease_${sid}.json`); } catch {}
+        try { fs.unlinkSync(getTempPath(`feedback_gate_lease_${sid}.json`)); } catch {}
     }
     try { fs.unlinkSync(SEAM_FILE); } catch {}
     if (stubWasAbsent) { try { fs.rmSync(VSCODE_STUB_DIR, { recursive: true, force: true }); } catch {} }

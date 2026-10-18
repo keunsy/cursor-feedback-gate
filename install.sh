@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Feedback Gate - 一键安装脚本
-# 支持 macOS / Linux
+# 支持 macOS / Linux / Windows (Git Bash)
 
 set -e
 
@@ -24,8 +24,10 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS="linux"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macos"
+elif [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "cygwin"* || "$OSTYPE" == "win32"* ]]; then
+    OS="windows"
 else
-    err "不支持的操作系统: $OSTYPE（仅支持 macOS 和 Linux）"
+    err "不支持的操作系统: $OSTYPE（支持 macOS、Linux 和 Windows Git Bash）"
     exit 1
 fi
 ok "操作系统: $OS"
@@ -34,12 +36,20 @@ ok "操作系统: $OS"
 PYTHON_CMD=""
 
 find_suitable_python() {
-    for cmd in python3.13 python3.12 python3.11 python3.10 python3; do
+    local candidates=(python3.13 python3.12 python3.11 python3.10 python3 python)
+    if [[ "$OS" == "windows" ]] && command -v py &> /dev/null; then
+        local launcher_python
+        launcher_python=$(PYTHONIOENCODING=utf-8 py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')
+        if [[ -n "$launcher_python" ]]; then
+            if command -v cygpath &> /dev/null; then
+                launcher_python=$(cygpath -u "$launcher_python")
+            fi
+            candidates+=("$launcher_python")
+        fi
+    fi
+    for cmd in "${candidates[@]}"; do
         if command -v "$cmd" &> /dev/null; then
-            local ver_major ver_minor
-            ver_major=$($cmd -c 'import sys; print(sys.version_info.major)' 2>/dev/null)
-            ver_minor=$($cmd -c 'import sys; print(sys.version_info.minor)' 2>/dev/null)
-            if [[ "$ver_major" -eq 3 ]] && [[ "$ver_minor" -ge 10 ]]; then
+            if "$cmd" -c 'import os, sys; assert sys.version_info >= (3, 10); assert sys.argv[1] != "windows" or os.name == "nt"' "$OS" 2>/dev/null; then
                 PYTHON_CMD="$cmd"
                 return 0
             fi
@@ -57,13 +67,15 @@ if ! find_suitable_python; then
     echo -e "  ${C_YELLOW}请安装 Python 3.10+:${C_NC}"
     if [[ "$OSTYPE" == "darwin"* ]]; then
         echo "    brew install python@3.12"
+    elif [[ "$OS" == "windows" ]]; then
+        echo "    安装原生 Windows Python 3.10+，启用 Add Python to PATH 或 py 启动器"
     else
         echo "    sudo apt-get install python3.12 python3.12-venv"
         echo "    或使用 pyenv: pyenv install 3.12 && pyenv global 3.12"
     fi
     exit 1
 fi
-ok "Python: $($PYTHON_CMD --version) [$(command -v $PYTHON_CMD)]"
+ok "Python: $("$PYTHON_CMD" --version) [$(command -v "$PYTHON_CMD")]"
 
 # --- 创建安装目录 ---
 INSTALL_DIR="$HOME/cursor-extensions/feedback-gate"
@@ -71,12 +83,13 @@ log "安装到 $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 
 cp "$SCRIPT_DIR/feedback_gate_mcp.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/feedback_gate_lifecycle.py" "$INSTALL_DIR/"
 
 # --- Python 虚拟环境 ---
 log "配置 Python 虚拟环境..."
 if [[ "$OS" == "linux" ]]; then
-    if ! $PYTHON_CMD -m venv --help >/dev/null 2>&1; then
-        PY_MINOR_VER=$($PYTHON_CMD -c 'import sys; print(sys.version_info.minor)')
+    if ! "$PYTHON_CMD" -m venv --help >/dev/null 2>&1; then
+        PY_MINOR_VER=$("$PYTHON_CMD" -c 'import sys; print(sys.version_info.minor)')
         if command -v apt-get &> /dev/null; then
             sudo apt-get install -y "python3.${PY_MINOR_VER}-venv" 2>/dev/null || \
                 sudo apt-get install -y python3-venv
@@ -90,8 +103,12 @@ if [[ "$OS" == "linux" ]]; then
     fi
 fi
 
-if [[ -d "$INSTALL_DIR/venv" ]]; then
+if [[ "$OS" == "windows" ]]; then
+    VENV_PY="$INSTALL_DIR/venv/Scripts/python.exe"
+else
     VENV_PY="$INSTALL_DIR/venv/bin/python"
+fi
+if [[ -d "$INSTALL_DIR/venv" ]]; then
     if [[ ! -x "$VENV_PY" ]] || ! "$VENV_PY" -c 'import sys; assert sys.version_info >= (3,10)' 2>/dev/null; then
         warn "旧虚拟环境 Python 版本不兼容，重建..."
         rm -rf "$INSTALL_DIR/venv"
@@ -100,23 +117,21 @@ fi
 
 if [[ ! -d "$INSTALL_DIR/venv" ]]; then
     log "使用 $PYTHON_CMD 创建虚拟环境..."
-    $PYTHON_CMD -m venv "$INSTALL_DIR/venv"
+    "$PYTHON_CMD" -m venv "$INSTALL_DIR/venv"
 fi
 
-source "$INSTALL_DIR/venv/bin/activate"
-
-pip install --no-user --upgrade pip -q 2>/dev/null
+"$VENV_PY" -m pip install --no-user --upgrade pip -q 2>/dev/null
 
 log "安装 Python 依赖（首次安装需下载约 30MB）..."
 PIP_LOG=$(mktemp)
-if ! pip install --no-user -q "mcp>=1.9.2,<2.0.0" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
+if ! "$VENV_PY" -m pip install --no-user -q "mcp>=1.9.2,<2.0.0" "Pillow>=10.0.0" "typing-extensions>=4.14.0" 2>"$PIP_LOG"; then
     cat "$PIP_LOG"
     err "Python 依赖安装失败"
     echo ""
     echo -e "  ${C_YELLOW}调试信息:${C_NC}"
-    echo "    系统 Python: $($PYTHON_CMD --version) [$(command -v $PYTHON_CMD)]"
-    echo "    venv Python: $(python --version) [$(which python)]"
-    echo "    pip: $(pip --version)"
+    echo "    系统 Python: $("$PYTHON_CMD" --version) [$(command -v "$PYTHON_CMD")]"
+    echo "    venv Python: $("$VENV_PY" --version) [$VENV_PY]"
+    echo "    pip: $("$VENV_PY" -m pip --version)"
     echo ""
     echo -e "  ${C_YELLOW}常见原因:${C_NC}"
     echo "    1. venv 内 Python < 3.10（删除 $INSTALL_DIR/venv 后重试）"
@@ -126,12 +141,10 @@ if ! pip install --no-user -q "mcp>=1.9.2,<2.0.0" "Pillow>=10.0.0" "typing-exten
     echo "    rm -rf $INSTALL_DIR/venv"
     echo "    然后重新运行 ./install.sh"
     rm -f "$PIP_LOG"
-    deactivate
     exit 1
 fi
 rm -f "$PIP_LOG"
 
-deactivate
 ok "Python 环境就绪"
 
 # --- MCP 配置 ---
@@ -144,34 +157,23 @@ if [[ -f "$CURSOR_MCP_FILE" ]]; then
     warn "已备份现有 MCP 配置"
 fi
 
-$PYTHON_CMD -c "
-import json, os
-
-config_file = '$CURSOR_MCP_FILE'
-install_dir = '$INSTALL_DIR'
-
-servers = {}
-if os.path.exists(config_file):
-    try:
-        with open(config_file, 'r') as f:
-            servers = json.load(f).get('mcpServers', {})
-    except:
-        pass
-
-servers['feedback-gate'] = {
-    'command': os.path.join(install_dir, 'venv/bin/python'),
-    'args': [os.path.join(install_dir, 'feedback_gate_mcp.py')],
-    'env': {
-        'PYTHONPATH': install_dir,
-        'PYTHONUNBUFFERED': '1',
-        'FEEDBACK_GATE_MODE': 'cursor_integration'
-    }
-}
-
-with open(config_file, 'w') as f:
-    json.dump({'mcpServers': servers}, f, indent=2)
-"
+CONFIG_SCRIPT="$SCRIPT_DIR/scripts/configure_mcp.py"
+MCP_CONFIG_ARG="$CURSOR_MCP_FILE"
+INSTALL_DIR_ARG="$INSTALL_DIR"
+if [[ "$OS" == "windows" ]] && command -v cygpath &> /dev/null; then
+    CONFIG_SCRIPT=$(cygpath -w "$CONFIG_SCRIPT")
+    MCP_CONFIG_ARG=$(cygpath -w "$MCP_CONFIG_ARG")
+    INSTALL_DIR_ARG=$(cygpath -w "$INSTALL_DIR_ARG")
+fi
+"$VENV_PY" "$CONFIG_SCRIPT" "$MCP_CONFIG_ARG" "$INSTALL_DIR_ARG"
 ok "MCP 配置已更新: $CURSOR_MCP_FILE"
+
+LIFECYCLE_SCRIPT="$INSTALL_DIR/feedback_gate_lifecycle.py"
+if [[ "$OS" == "windows" ]] && command -v cygpath &> /dev/null; then
+    LIFECYCLE_SCRIPT=$(cygpath -w "$LIFECYCLE_SCRIPT")
+fi
+"$VENV_PY" "$LIFECYCLE_SCRIPT" --install-hooks
+ok "Feedback Gate 等待续接钩子已安装（保留其他 hooks）"
 
 # --- 构建并安装 Cursor 扩展 ---
 log "构建扩展..."
@@ -194,6 +196,11 @@ if [[ -n "$VSIX_FILE" ]]; then
     log "安装 Cursor 扩展..."
     cp "$VSIX_FILE" "$INSTALL_DIR/"
 
+    VSIX_INSTALL_PATH="$VSIX_FILE"
+    if [[ "$OS" == "windows" ]] && command -v cygpath &> /dev/null; then
+        VSIX_INSTALL_PATH=$(cygpath -w "$VSIX_FILE")
+    fi
+
     INSTALLED=false
     if [[ "$OS" == "macos" ]]; then
         CURSOR_BIN="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
@@ -201,7 +208,7 @@ if [[ -n "$VSIX_FILE" ]]; then
         CURSOR_BIN=$(command -v cursor 2>/dev/null || echo "")
     fi
     if [[ -n "$CURSOR_BIN" && -x "$CURSOR_BIN" ]]; then
-        if "$CURSOR_BIN" --install-extension "$VSIX_FILE" --force >/dev/null 2>&1; then
+        if "$CURSOR_BIN" --install-extension "$VSIX_INSTALL_PATH" --force >/dev/null 2>&1; then
             ok "扩展安装成功"
             INSTALLED=true
         fi
